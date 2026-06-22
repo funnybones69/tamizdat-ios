@@ -1,0 +1,143 @@
+name: samizdat-ios
+
+options:
+  bundleIdPrefix: com.anarki
+  deploymentTarget:
+    iOS: "17.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "1"
+    IPA_ARTIFACT_NAME: "Tamizdat-local.ipa"
+    DEVELOPMENT_TEAM: DRMTP6V372
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    SUPPORTS_MACCATALYST: NO
+
+targets:
+  # ── Main application ────────────────────────────────────────────────────
+  samizdat-ios:
+    type: application
+    platform: iOS
+    sources:
+      - path: samizdat-ios
+        excludes:
+          - "*.entitlements"
+    dependencies:
+      - target: samizdat-tunnel
+        embed: true
+        codeSign: true
+      - framework: Frameworks/SamizdatClient.xcframework
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anarki.samizdat-test
+        PRODUCT_NAME: SamizdatTest
+        INFOPLIST_FILE: samizdat-ios/Info.plist
+        CODE_SIGN_ENTITLEMENTS: samizdat-ios/samizdat-ios.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Samizdat Test AdHoc"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_PREVIEWS: YES
+        GENERATE_INFOPLIST_FILE: NO
+        FRAMEWORK_SEARCH_PATHS:
+          - $(inherited)
+          - $(PROJECT_DIR)/Frameworks
+
+  # ── PacketTunnel network-extension target ───────────────────────────────
+  # Path 3 final: extension carries hev (lwIP tun2socks, ~5-10 MB RSS)
+  # AND SamizdatClient.xcframework (Go runtime + samizdat H2 client +
+  # socksstub SOCKS5 bridge). hev forwards every flow to a
+  # 127.0.0.1:18443 SOCKS5 listener that the SocksStub Go code runs in
+  # this same process — eliminating the cross-process / app-suspend
+  # problem that an earlier "Go in main app" architecture had on iOS.
+  # Without gVisor (replaced by hev's lwIP), expected extension RSS is
+  # ~25-30 MB sustained, well under the iOS 50 MB cap.
+  samizdat-tunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: samizdat-tunnel
+        excludes:
+          - "*.entitlements"
+          - "Info.plist"
+          - "Bridging-Header.h"
+      # IPA-P: share EndpointMode + SamizdatURLCodec with the extension
+      # so the extension can read the user's primary/backup choice from
+      # App Group UserDefaults at startTunnel time and split the stored
+      # combined URL into per-endpoint blobs.
+      - path: samizdat-ios/EndpointMode.swift
+      # IPA-Q: WhitelistStatusStore is the same App Group UserDefaults
+      # bridge — extension writes the detector verdict, main app polls
+      # for the status badge.
+      - path: samizdat-ios/WhitelistStatus.swift
+      # IPA-S: NotificationPreferences shared so the extension can
+      # check the user-set enabled flag before posting a local
+      # notification on whitelist on/off transitions.
+      - path: samizdat-ios/NotificationPreferences.swift
+      # IPA-D22: PoolVariantPreferences deleted — V1 is hardcoded in Go
+      # (mobile/socksstub) and never exposed in the iOS UI. The
+      # extension still calls `SocksstubSetPoolVariant("v1")` directly
+      # to keep the Go bridge wired with the same value, but no Swift
+      # storage is involved any more.
+      # IPA-D20 (Phase C iOS-notify, 2026-05-11): NotificationPayload
+      # shape + App Group / Darwin constants shared between app and
+      # extension. Extension encodes after a server callback, app
+      # decodes and binds to a SwiftUI alert.
+      - path: samizdat-ios/NotificationPayload.swift
+      # IPA-D21: PingURLPreferences shared so the extension can read
+      # the user-set ping probe URL from App Group UserDefaults at
+      # startTunnel and on the live "refreshPingURL" provider
+      # message. Default points at gstatic.com/generate_204.
+      - path: samizdat-ios/PingURLPreferences.swift
+      # IPA-D23: WhitelistProbePreferences shared so the extension can
+      # read the user-configured testHost + whitelistHost values for
+      # the new ICMP-based WhitelistDetector. App Group UserDefaults
+      # source of truth; live updates land via the
+      # "refreshWhitelistProbes" provider message.
+      - path: samizdat-ios/WhitelistProbePreferences.swift
+      # Comparative TCP+TLS probe wrapper shared by the main app and
+      # extension. The Go primitive lives in SamizdatClient.xcframework;
+      # Swift owns scheduling, interface selection, and hysteresis.
+      - path: samizdat-ios/WhitelistProbeEngine.swift
+      # IPA-D30: ICMPPinger relocated from samizdat-tunnel/ to
+      # samizdat-ios/ so the main app's WhitelistMonitor can use the
+      # same unprivileged SOCK_DGRAM ICMP echo as the extension's
+      # WhitelistDetector — semantics now match operator's native
+      # ping tool (TCP-connect probes were too permissive and missed
+      # real ICMP-level whitelist mode).
+      - path: samizdat-ios/ICMPPinger.swift
+      # IPA-D65b: VK TURN credential cache (read-side only — the
+      # extension reads `TURNCredsStore.shared.isFresh` in its status
+      # RPC). The write side lives in the main app (WKWebView captcha
+      # solver + 5-step VK API client) and is intentionally NOT
+      # compiled into the extension.
+      - path: samizdat-ios/TURNCredsStore.swift
+    dependencies:
+      - framework: Frameworks/HevSocks5Tunnel.xcframework
+        embed: true
+        codeSign: true
+      - framework: Frameworks/SamizdatClient.xcframework
+        embed: true
+        codeSign: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anarki.samizdat-test.tunnel
+        PRODUCT_NAME: SamizdatTunnel
+        INFOPLIST_FILE: samizdat-tunnel/Info.plist
+        CODE_SIGN_ENTITLEMENTS: samizdat-tunnel/samizdat-tunnel.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Apple Distribution"
+        PROVISIONING_PROFILE_SPECIFIER: "Samizdat Tunnel AdHoc"
+        GENERATE_INFOPLIST_FILE: NO
+        SKIP_INSTALL: YES
+        ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: NO
+        SWIFT_OBJC_BRIDGING_HEADER: samizdat-tunnel/Bridging-Header.h

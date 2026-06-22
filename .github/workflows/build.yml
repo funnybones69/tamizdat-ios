@@ -1,0 +1,203 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main, "feat/**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: gomobile + xcodebuild → IPA
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    env:
+      SCHEME: samizdat-ios
+      CONFIGURATION: Release
+      ARCHIVE_PATH: ${{ github.workspace }}/build/samizdat-ios.xcarchive
+      EXPORT_PATH: ${{ github.workspace }}/build/export
+      FRAMEWORK_OUT: ${{ github.workspace }}/Frameworks/SamizdatClient.xcframework
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: mobile/go.mod
+          cache-dependency-path: mobile/go.sum
+
+      - name: Install gomobile
+        run: |
+          X_MOBILE_VERSION="$(go -C mobile list -m -f '{{.Version}}' golang.org/x/mobile)"
+          go install "golang.org/x/mobile/cmd/gomobile@${X_MOBILE_VERSION}"
+          go install "golang.org/x/mobile/cmd/gobind@${X_MOBILE_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: gomobile init
+        run: gomobile init
+
+      - name: gomobile bind → SamizdatClient.xcframework (samizdat + socksstub)
+        working-directory: mobile
+        run: |
+          mkdir -p "${{ env.FRAMEWORK_OUT }}/.."
+          # Bundle BOTH packages into one xcframework. Path 3 puts the
+          # SocksStub listener in the main-app process; the existing
+          # samizdat package retains its config-parser API for the UI.
+          gomobile bind -v \
+            -target=ios,iossimulator \
+            -iosversion=17.0 \
+            -tags=with_low_memory \
+            -o "${{ env.FRAMEWORK_OUT }}" \
+            ./samizdat ./socksstub
+          ls -la "${{ env.FRAMEWORK_OUT }}"
+
+      - name: Build HevSocks5Tunnel.xcframework
+        run: |
+          chmod +x scripts/build-hev-xcframework.sh
+          OUT_DIR="${{ github.workspace }}/Frameworks" \
+          WORK_DIR="${{ github.workspace }}/build/hev-build" \
+          scripts/build-hev-xcframework.sh
+          ls -la Frameworks/HevSocks5Tunnel.xcframework
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Import signing certificate into temporary keychain
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/build_certificate.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          printf %s "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" -P "$P12_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+          security default-keychain -s "$KEYCHAIN_PATH"
+
+          echo "--- Available signing identities ---"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Install provisioning profiles (app + tunnel)
+        env:
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          BUILD_TUNNEL_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_TUNNEL_PROVISION_PROFILE_BASE64 }}
+        run: |
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+
+          APP="$PROFILES_DIR/samizdat_test_adhoc.mobileprovision"
+          printf %s "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > "$APP"
+
+          TUN="$PROFILES_DIR/samizdat_tunnel_adhoc.mobileprovision"
+          printf %s "$BUILD_TUNNEL_PROVISION_PROFILE_BASE64" | base64 --decode > "$TUN"
+
+          for p in "$APP" "$TUN"; do
+            echo "--- $p ---"
+            /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin \
+              <<< "$(security cms -D -i "$p")"
+            /usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' /dev/stdin \
+              <<< "$(security cms -D -i "$p")"
+          done
+
+      - name: Compute versioned IPA name
+        id: ipa_name
+        # Match the operator's milestone naming convention exactly and
+        # bake the same filename into Info.plist for the main-screen label.
+        run: |
+          SHORT_SHA=${GITHUB_SHA:0:7}
+          NAME="Tamizdat-0.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}-build-${GITHUB_RUN_NUMBER}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "Artifact will be: ${NAME}.ipa"
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          # Bake the GitHub Actions run number + short SHA into the bundle
+          # so the in-app version label changes every build (and tracks
+          # the source revision).
+          GIT_SHA=$(git rev-parse --short HEAD)
+          MARKETING="0.2.${GITHUB_RUN_NUMBER}-${GIT_SHA}"
+          BUILD_NUM="${GITHUB_RUN_NUMBER}"
+          IPA_ARTIFACT_NAME="${{ steps.ipa_name.outputs.name }}.ipa"
+          echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM IPA_ARTIFACT_NAME=$IPA_ARTIFACT_NAME"
+          xcodebuild archive \
+            -project samizdat-ios.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -archivePath "$ARCHIVE_PATH" \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM=DRMTP6V372 \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            MARKETING_VERSION="$MARKETING" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUM" \
+            IPA_ARTIFACT_NAME="$IPA_ARTIFACT_NAME" \
+            | xcpretty
+
+      - name: Export IPA
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist ExportOptions.plist \
+            | xcpretty
+
+      - name: Rename IPA
+        run: |
+          cd "$EXPORT_PATH"
+          ls -la
+          IPA=$(ls *.ipa | head -1)
+          mv "$IPA" samizdat-ios.ipa
+          ls -la
+
+      - name: Inspect signed IPA
+        run: |
+          cd "$EXPORT_PATH"
+          mkdir -p _inspect
+          unzip -oq samizdat-ios.ipa -d _inspect/
+          APP_DIR="$(find _inspect/Payload -maxdepth 1 -type d -name '*.app' -print -quit)"
+          TUNNEL_DIR="$(find "$APP_DIR/PlugIns" -maxdepth 1 -type d -name '*.appex' -print -quit)"
+          echo "--- Payload contents ---"
+          ls "$APP_DIR"
+          echo "--- App embedded profile ---"
+          security cms -D -i "$APP_DIR/embedded.mobileprovision" > _inspect/app-profile.plist
+          /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/app-profile.plist
+          echo "--- Tunnel embedded profile ---"
+          security cms -D -i "$TUNNEL_DIR/embedded.mobileprovision" > _inspect/tunnel-profile.plist
+          /usr/libexec/PlistBuddy -c 'Print :Name' _inspect/tunnel-profile.plist
+          rm -rf _inspect
+
+      - name: Copy versioned IPA filename
+        run: |
+          NAME="${{ steps.ipa_name.outputs.name }}"
+          cp "${{ env.EXPORT_PATH }}/samizdat-ios.ipa" "${{ env.EXPORT_PATH }}/${NAME}.ipa"
+          ls -la "${{ env.EXPORT_PATH }}/${NAME}.ipa"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ipa_name.outputs.name }}
+          path: ${{ env.EXPORT_PATH }}/${{ steps.ipa_name.outputs.name }}.ipa
+          if-no-files-found: error
+          retention-days: 30
