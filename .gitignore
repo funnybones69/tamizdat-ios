@@ -23,9 +23,13 @@ samizdat-ios.xcodeproj/
 
 # Secrets (never commit)
 *.p12
+*.pfx
 *.mobileprovision
 *.cer
 *.key
+*.pem
+*.p8
+ios-signing/
 .secret_*
 ipa/
 
