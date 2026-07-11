@@ -3,11 +3,11 @@ import UIKit
 import WebKit
 import OSLog
 
-/// Hidden-WKWebView VK Smart Captcha solver. Port of the Android donor
-/// `CaptchaWebViewManager.kt` (~600 LoC) from
-/// `amurcanov/proxy-turn-vk-android`.
+/// Hidden-WKWebView VK Smart Verification challenge handler. Port of the Android donor
+/// `WebKit verification manager.kt` (~600 LoC) from
+/// `amurcanov/network adapter-turn-vk-android`.
 ///
-/// WHY a real WKWebView: the server-side reverse-JS solver hits VK with
+/// WHY a real WKWebView: the server-side reverse-JS handler hits VK with
 /// a synthesized HTTP/2 fingerprint that VK detects and rejects with
 /// `status: "BOT"`. A real WebKit instance has a genuine
 /// TLS+ALPN+h2-frame fingerprint that VK does not flag. The Android
@@ -18,12 +18,12 @@ import OSLog
 /// to UI hierarchy):
 ///   1. Build configuration with a randomized viewport / Chrome build
 ///      so two consecutive solves don't share an obvious fingerprint.
-///   2. Install the shared `CaptchaJSInterceptor` script + the
-///      `tamizdatCaptcha` script-message handler.
+///   2. Install the shared `Verification challengeJSInterceptor` script + the
+///      `tamizdatVerification challenge` script-message handler.
 ///   3. Load `redirect_uri`, wait 2.5-3.5 s ("human read delay").
 ///   4. Locate `label.vkc__Checkbox-module__Checkbox`, get its rect.
 ///      If a slider is shown instead → throw `.sliderRequired` so the
-///      caller can fall back to `ManualCaptchaSheet`.
+///      caller can fall back to the manual verification sheet.
 ///   5. Simulate a touch by dispatching `touchstart`/`touchend` from
 ///      JS at a randomized point inside the label. iOS WKWebView does
 ///      not expose UITouch synthesis (Apple's private API on Android
@@ -40,16 +40,16 @@ import OSLog
 /// outcome — leaking a WKWebView would keep an SQLite handle + ~5 MB
 /// of process state alive.
 ///
-/// Logging: `os.Logger` subsystem `com.anarki.samizdat-test.captcha`.
+/// Logging: `os.Logger` subsystem `com.anarki.samizdat-test.verification challenge`.
 
-/// Errors thrown by `CaptchaWebViewManager.solveCaptcha`.
+/// Errors thrown by `WebKit verification manager.solveVerification challenge`.
 enum CaptchaError: Error, LocalizedError {
     /// VK presented a slider/kaleidoscope page instead of the checkbox.
-    /// Caller falls back to `ManualCaptchaSheet`.
+    /// Caller falls back to the manual verification sheet.
     case sliderRequired
     /// 45 s overall timeout — page wedged or VK never responded.
     case timeout
-    /// VK API returned a JSON error block in the captcha response.
+    /// VK API returned a JSON error block in the verification challenge response.
     case vkError(message: String)
     /// Caller cancelled the task or process is shutting down.
     case cancelled
@@ -111,18 +111,18 @@ actor CaptchaWebViewManager {
 
     // ─── Public API ─────────────────────────────────────────────────
 
-    /// Solve one VK captcha challenge.
+    /// Solve one VK verification challenge challenge.
     ///
     /// - Parameters:
     ///   - redirectURI: the `redirect_uri` from the VK error payload.
     ///   - sessionToken: the `session_token` query value (not used by
-    ///                   the WebView solver itself — VK reads it from
+    ///                   the WebView handler itself — VK reads it from
     ///                   the page URL — kept for symmetry with the Go
     ///                   reference and for future logging).
     ///   - onStep: optional callback for "page loaded", "click",
     ///             "waiting" status text. Caller routes to UI.
     /// - Returns: `success_token` issued by VK.
-    /// - Throws: `CaptchaError`.
+    /// - Throws: verification error.
     func solveCaptcha(redirectURI: URL,
                       sessionToken: String,
                       onStep: ((String) -> Void)? = nil) async throws -> String {
@@ -192,8 +192,8 @@ actor CaptchaWebViewManager {
 
 // MARK: – SolveSession (per-solve state, MainActor-bound)
 
-/// One captcha solve. Lives on the main actor; owns the WKWebView,
-/// the message handler proxy, and the continuation that resolves to
+/// One verification step. Lives on the main actor; owns the WKWebView,
+/// the message handler network adapter, and the continuation that resolves to
 /// the success token. The session destroys itself on completion via
 /// `defer` so the WKWebView never outlives the solve.
 @MainActor
@@ -204,12 +204,12 @@ private final class SolveSession {
     private var continuation: CheckedContinuation<String, Error>?
     private var continuationDone: Bool = false
 
-    /// Strong ref to the message handler proxy so it lives as long as
+    /// Strong ref to the message handler network adapter so it lives as long as
     /// the WKUserContentController retains it (WKContentController only
     /// holds the handler weakly through its name registration).
     private var messageProxy: ScriptMessageProxy?
 
-    /// Strong ref to the navigation delegate proxy — WKWebView only
+    /// Strong ref to the navigation delegate network adapter — WKWebView only
     /// weak-refs `navigationDelegate`, so we own it here.
     private var navigationProxy: NavigationProxy?
 
@@ -221,7 +221,7 @@ private final class SolveSession {
     }
 
     /// Drives one solve. Resolves to the `success_token` or throws
-    /// `CaptchaError`. Always tears down the WKWebView before
+    /// verification error. Always tears down the WKWebView before
     /// returning.
     func run(redirectURI: URL, onStep: ((String) -> Void)?) async throws -> String {
         defer { teardown() }
@@ -235,7 +235,7 @@ private final class SolveSession {
         TURNLog.info("captcha", "fingerprint: Chrome/\(chrome), viewport \(Int(vw))x\(Int(vh))")
 
         // Wire WKWebView config: data store is non-persistent so the
-        // captcha solve leaves no cookies / storage on the device, and
+        // verification step leaves no cookies / storage on the device, and
         // each fresh solve starts cold.
         let config = WKWebViewConfiguration()
         config.websiteDataStore = WKWebsiteDataStore.nonPersistent()
@@ -259,7 +259,7 @@ private final class SolveSession {
 
         // Build the hidden web view. frame = zero so even if some
         // accidental superview attach happens, nothing renders. The
-        // VK captcha page reads viewport from JS `window.innerWidth`,
+        // VK verification challenge page reads viewport from JS `window.innerWidth`,
         // which we set via a small `viewport` injection below — pixel
         // bounds of the actual WKWebView don't drive the page.
         let wv = WKWebView(frame: CGRect(x: 0, y: 0, width: vw, height: vh),
@@ -279,7 +279,7 @@ private final class SolveSession {
             self?.finish(with: .success(token))
         })
         wv.navigationDelegate = navProxy
-        // Hold the navigation proxy by binding its lifetime to the
+        // Hold the navigation network adapter by binding its lifetime to the
         // session; WKWebView only weak-refs its delegate.
         self.navigationProxy = navProxy
 
@@ -465,7 +465,7 @@ private final class SolveSession {
         // tap fires pointer + touch + mouse + click in a specific order
         // (Apple's WebKit synthesizes mouse events from touches unless
         // the page preventDefault's touchstart). Since we can't issue a
-        // real UITouch, we manually fire every layer VK's anti-bot might
+        // real UITouch, we manually fire every layer VK's integrity check might
         // be listening on:
         //   pointerdown → touchstart → touchend → pointerup
         //   → mousedown → mouseup → click
@@ -551,7 +551,7 @@ private final class SolveSession {
                         target.dispatchEvent(makePointerEv('pointerup', jx, jy));
                     }
                     // WebKit normally synthesizes mouse events from touch
-                    // unless touchstart was preventDefault'd. The captcha
+                    // unless touchstart was preventDefault'd. The verification challenge
                     // page is built on a checkbox label — it probably
                     // listens on click. We fire the full mouse stack to
                     // be safe.
@@ -622,7 +622,7 @@ private final class SolveSession {
                     self.finish(with: .failure(CaptchaError.sliderRequired))
                     return
                 case "success_ui":
-                    // The page claims success visually, but the TURN creds
+                    // The page claims success visually, but the TURN session params
                     // flow needs the actual success_token. Keep polling; if
                     // the interceptor/navigation hook still misses it, fall
                     // through to manual fallback below instead of wedging
@@ -689,7 +689,7 @@ private final class SolveSession {
 
         // Drop the message handler before the controller is released to
         // break the strong ref cycle WKContentController → handler ←—
-        // session via the proxy's closure.
+        // session via the network adapter's closure.
         if let wv = webView {
             wv.stopLoading()
             wv.loadHTMLString("<html></html>", baseURL: nil)
@@ -720,13 +720,13 @@ private final class SolveSession {
     }
 }
 
-// MARK: – WKScriptMessageHandler proxy
+// MARK: – WKScriptMessageHandler network adapter
 
 /// Stand-alone NSObject that forwards script-message events to a Swift
 /// closure. We can't make `SolveSession` itself the handler because
 /// `WKUserContentController.add(_:name:)` only retains the handler
 /// weakly — but `SolveSession`'s lifetime is also tied to one solve,
-/// so the proxy gives us a clean, deterministic ownership story.
+/// so the network adapter gives us a clean, deterministic ownership story.
 @MainActor
 private final class ScriptMessageProxy: NSObject, WKScriptMessageHandler {
     private let onEvent: (CaptchaJSInterceptor.Event) -> Void
@@ -744,7 +744,7 @@ private final class ScriptMessageProxy: NSObject, WKScriptMessageHandler {
     }
 }
 
-// MARK: – WKNavigationDelegate proxy
+// MARK: – WKNavigationDelegate network adapter
 
 @MainActor
 private final class NavigationProxy: NSObject, WKNavigationDelegate {

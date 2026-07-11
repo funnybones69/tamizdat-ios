@@ -112,12 +112,12 @@ targets:
       # same unprivileged SOCK_DGRAM ICMP echo as the extension's
       # WhitelistDetector — semantics now match operator's native
       # ping tool (TCP-connect probes were too permissive and missed
-      # real ICMP-level whitelist mode).
+      # real ICMP-level restricted-profile mode).
       - path: samizdat-ios/ICMPPinger.swift
-      # IPA-D65b: VK TURN credential cache (read-side only — the
-      # extension reads `TURNCredsStore.shared.isFresh` in its status
-      # RPC). The write side lives in the main app (WKWebView captcha
-      # solver + 5-step VK API client) and is intentionally NOT
+      # IPA-D65b: VK TURN session parameter cache (read-side only — the
+      # extension reads `TURNSession paramsStore.shared.isFresh` in its status
+      # RPC). The write side lives in the main app (WKWebView verification challenge
+      # handler + 5-step VK API client) and is intentionally NOT
       # compiled into the extension.
       - path: samizdat-ios/TURNCredsStore.swift
     dependencies:

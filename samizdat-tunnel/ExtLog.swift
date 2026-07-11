@@ -67,7 +67,7 @@ enum ExtLog {
 
     /// Internal entry point. Builds the formatted line, then calls the
     /// raw POSIX `open` / `write` / `fsync` / `close` sequence directly
-    /// — bypassing every Swift-level buffer.
+    /// — alternate pathing every Swift-level buffer.
     ///
     /// Failure modes are intentionally silent: if the container is not
     /// resolvable, or the open / write fails, we just drop the line.

@@ -7,7 +7,7 @@ import UserNotifications
 /// The old D65 detector used two ICMP pings. Current logic follows the
 /// allowlist research: compare foreign control domains against domestic
 /// allowlisted domains with TCP-connect + TLS-SNI probes. ICMP is not a
-/// deciding signal because RU whitelist mode can block ICMP independently of
+/// deciding signal because RU restricted-profile mode can block ICMP independently of
 /// web/TLS reachability.
 final class WhitelistDetector {
 

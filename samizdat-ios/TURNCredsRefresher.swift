@@ -3,22 +3,22 @@ import SwiftUI
 import BackgroundTasks
 import UserNotifications
 
-/// Drives VK TURN credential acquisition + caching on the main-app side.
+/// Drives VK TURN session parameter acquisition + caching on the main-app side.
 ///
-/// WHY this file is main-app-only: it owns `CaptchaWebViewManager`
+/// WHY this file is main-app-only: it owns the WebKit verification manager
 /// (WKWebView) and the SwiftUI plumbing for the manual fallback
-/// (`ManualCaptchaSheet`). The Network Extension cannot import WebKit
+/// (the manual verification sheet). The Network Extension cannot import WebKit
 /// — Apple disallows WKWebView in app extensions, and the build
-/// would fail. The pure-read side (`TURNCredsStore`,
-/// `VKTURNCredentials`, `VKCredsPreferences`) lives in
-/// `TURNCredsStore.swift` and IS shared with the extension target.
+/// would fail. The pure-read side (`TURNSession paramsStore`,
+/// `VKTURNSession parameters`, `VKSession paramsPreferences`) lives in
+/// `TURNSession paramsStore.swift` and IS shared with the extension target.
 ///
 /// Lifetimes:
 ///   - Single shared instance per process; survives scene transitions.
-///   - Builds a fresh `VKCredsClient` per refresh so each attempt owns
+///   - Builds a fresh `VKSession paramsClient` per refresh so each attempt owns
 ///     its own URLSession/cookie state.
 ///   - The slider-fallback flow is surfaced via `manualChallenge`,
-///     which `ContentView` binds to a `ManualCaptchaSheet`. When the
+///     which `ContentView` binds to a the manual verification sheet. When the
 ///     sheet finishes, the coordinator resumes its waiting
 ///     continuation with the user-supplied success_token.
 private enum TURNCredsRefreshWaitError: LocalizedError {
@@ -46,14 +46,14 @@ final class TURNCredsRefresher: ObservableObject {
     static let shared = TURNCredsRefresher()
 
     /// True while a refresh is in flight. Drives the "Resolving
-    /// captcha..." status indicator + dedupes concurrent triggers.
+    /// verification challenge..." status indicator + dedupes concurrent triggers.
     @Published private(set) var isRefreshing: Bool = false
 
     /// Last refresh outcome — nil until the first attempt lands.
     /// Surfaced for UI / log display.
     @Published private(set) var lastError: String?
 
-    /// When non-nil, a `ManualCaptchaSheet` should be presented so
+    /// When non-nil, a the manual verification sheet should be presented so
     /// the user can solve the slider. The sheet calls `resolveManual`
     /// / `cancelManual` to drive the refresh forward.
     @Published var manualChallenge: ManualChallenge?
@@ -63,17 +63,17 @@ final class TURNCredsRefresher: ObservableObject {
     /// quick succession.
     private var inFlight: Task<Void, Never>?
 
-    /// Last successful App Group credentials write in this process.
+    /// Last successful App Group session parameters write in this process.
     /// Used to debounce accidental immediate `forceRefresh` replays.
     private var lastSaveAt: Date?
 
     /// Start time/generation for the current refresh singleflight.
-    /// Used to recover from captcha/WebKit hangs where the app remains
+    /// Used to recover from verification/WebKit hangs where the app remains
     /// `isRefreshing=true` and every explicit Save/Refresh gets skipped.
     private var refreshStartedAt: Date?
     private var refreshGeneration: Int = 0
 
-    /// Manual-fallback handoff: when the auto solver throws
+    /// Manual-fallback handoff: when the auto handler throws
     /// `.sliderRequired`, we open the sheet and `await` this
     /// continuation. The sheet calls `resolveManual(token:)` to
     /// resume with the token or `cancelManual()` to throw.
@@ -81,13 +81,13 @@ final class TURNCredsRefresher: ObservableObject {
 
     /// 5-minute foreground heartbeat. It is intentionally policy-gated:
     /// the timer calls `refreshIfNeeded(reason:)`, which returns before
-    /// touching VK unless Whitelist+TURN is the effective path.
+    /// touching VK unless Restricted+Relay is the effective path.
     private var heartbeatTimer: Timer?
 
     /// Number of refresh attempts that have failed in a row. Reset on
     /// success. When it hits `failureNotificationThreshold` we
     /// schedule a local notification so the user knows to open the
-    /// app and solve a captcha manually.
+    /// app and solve a verification manually.
     private var consecutiveFailures: Int = 0
 
     /// BG task identifier — MUST match the one registered in
@@ -110,10 +110,10 @@ final class TURNCredsRefresher: ObservableObject {
         let sessionToken: String
     }
 
-    /// True when maintaining VK TURN credentials is useful right now.
-    /// We do NOT rotate creds just because VK TURN is configured: VK captcha
-    /// sessions are expensive and noisy. Keep creds fresh only while the
-    /// effective endpoint is Whitelist+TURN.
+    /// True when maintaining VK TURN session parameters is useful right now.
+    /// We do NOT rotate session params just because VK TURN is configured: VK verification challenge
+    /// sessions are expensive and noisy. Keep session params fresh only while the
+    /// effective endpoint is Restricted+Relay.
     nonisolated static func shouldMaintainTurnCredentialsNow() -> Bool {
         guard WhitelistMode.current == .vkTurn else { return false }
         switch EndpointModeStore.current {
@@ -144,7 +144,7 @@ final class TURNCredsRefresher: ObservableObject {
     }
 
     /// Fire-and-forget maintenance refresh. Idempotent and policy-gated: if
-    /// the user is not currently using Whitelist+TURN, this returns without
+    /// the user is not currently using Restricted+Relay, this returns without
     /// touching VK. Exception: `forceRefresh(reason:)` is still available for
     /// user-visible on-demand actions such as Connect or notification-open.
     func refreshIfNeeded(reason: String = "auto") {
@@ -198,10 +198,10 @@ final class TURNCredsRefresher: ObservableObject {
         startRefresh()
     }
 
-    /// Connect-time gate: if Whitelist+TURN is about to start and cached
-    /// creds are stale/missing, do not bring up the PacketTunnel with known-
-    /// bad creds. Start/reuse the refresh flow, let SwiftUI present manual
-    /// captcha if VK asks for it, and return only once App Group creds are
+    /// Connect-time gate: if Restricted+Relay is about to start and cached
+    /// session params are stale/missing, do not bring up the PacketTunnel with known-
+    /// bad session params. Start/reuse the refresh flow, let SwiftUI present manual
+    /// verification challenge if VK asks for it, and return only once App Group session params are
     /// fresh enough for the extension to attach TURN.
     func ensureFreshForConnect(reason: String = "connectVKTurn",
                                timeout: TimeInterval = 190) async throws {
@@ -238,7 +238,7 @@ final class TURNCredsRefresher: ObservableObject {
         TURNLog.info("turncreds", "connect preflight ok — fresh VK TURN creds ready")
     }
 
-    /// Called by `ManualCaptchaSheet.onSuccess` — hands the user-
+    /// Called by `manual verification sheet.onSuccess` — hands the user-
     /// solved token back to the in-flight refresh task.
     func resolveManual(token: String) {
         TURNLog.info("turncreds", "manual token resolved (length=\(token.count))")
@@ -248,7 +248,7 @@ final class TURNCredsRefresher: ObservableObject {
         manualContinuation = nil
     }
 
-    /// Called by `ManualCaptchaSheet.onCancel` — aborts the refresh.
+    /// Called by `manual verification sheet.onCancel` — aborts the refresh.
     func cancelManual() {
         TURNLog.warn("turncreds", "manual captcha cancelled by user")
         manualChallenge = nil
@@ -263,17 +263,17 @@ final class TURNCredsRefresher: ObservableObject {
     /// seconds, the Task is cancelled so `isRefreshing` flips back to
     /// false and the next Save attempt isn't dead in the water.
     /// Sized generously: per-request timeout is 20s, max 5 retries +
-    /// up to 45s captcha solve = ~145s worst case. 180s gives slack.
+    /// up to 45s verification step = ~145s worst case. 180s gives slack.
     private static let watchdogTimeout: TimeInterval = 180
 
     /// Human-initiated force refresh may replace a wedged in-flight
     /// attempt after this age. Shorter active attempts remain deduped so
-    /// repeated Settings saves do not burn VK captcha sessions.
+    /// repeated Settings saves do not burn VK verification sessions.
     private static let forceRestartStaleRefreshAfter: TimeInterval = 60
 
     /// Belt-and-suspenders guard: after a successful save, any
     /// `forceRefresh` replay within this window is programmatic noise
-    /// (not a human tap) and would burn another VK captcha session.
+    /// (not a human tap) and would burn another VK verification challenge session.
     private static let forceRefreshDebounceAfterSave: TimeInterval = 2
 
     private var millisecondsSinceLastSave: Int? {
@@ -309,7 +309,7 @@ final class TURNCredsRefresher: ObservableObject {
                 TURNLog.info("turncreds", "config built (hash=\(hashPrefix)...)")
                 let client = VKCredsClient(config: config,
                                             captchaSolver: ChainedCaptchaSolver(refresher: self))
-                // Race fetchCredentials against a watchdog so a wedged
+                // Race fetchSession parameters against a watchdog so a wedged
                 // network call or stuck WKWebView can't lock the
                 // refresher into `isRefreshing=true` forever.
                 let creds = try await withThrowingTaskGroup(of: VKTURNCredentials.self) { group in
@@ -336,7 +336,7 @@ final class TURNCredsRefresher: ObservableObject {
                 // Push the fresh snapshot into the in-process Go VK
                 // TURN runner so the next worker-group rotation uses
                 // them — without this hop the runner kept reading the
-                // creds it took at startup and started 401-ing once
+                // session params it took at startup and started 401-ing once
                 // the original 3600 s lifetime elapsed.
                 //
                 // The runner lives in the extension process, not the
@@ -421,7 +421,7 @@ final class TURNCredsRefresher: ObservableObject {
     private static let failureNotificationThreshold = 3
 
     /// 5-minute foreground heartbeat cadence. Drives `refreshIfNeeded`,
-    /// which itself is a no-op when creds are fresh.
+    /// which itself is a no-op when session params are fresh.
     private static let heartbeatInterval: TimeInterval = 300
 
     /// Target spacing between BG refreshes — iOS treats this as a
@@ -459,7 +459,7 @@ final class TURNCredsRefresher: ObservableObject {
 
     /// Schedule the next BG App Refresh request. Called after every
     /// successful refresh AND from App.swift on launch (so the very
-    /// first request is on the books before any creds exist).
+    /// first request is on the books before any session params exist).
     /// Failure (no entitlement, simulator) is logged and swallowed —
     /// we never want to crash the launch path because of BG plumbing.
     ///
@@ -545,13 +545,13 @@ final class TURNCredsRefresher: ObservableObject {
     }
 
     /// Spawn a manual challenge and suspend until the user resolves
-    /// (or cancels). Called by `ChainedCaptchaSolver` below when the
-    /// auto solver bails with `.sliderRequired`.
+    /// (or cancels). Called by `ChainedVerification challengeHandler` below when the
+    /// auto handler bails with `.sliderRequired`.
     fileprivate func awaitManual(redirectURI: URL, sessionToken: String) async throws -> String {
         TURNLog.info("turncreds", "manual captcha requested (host=\(redirectURI.host ?? "<unknown>"))")
         // Fire the iOS notification so the user knows to open the app
         // even if it's in the background. Operator requirement: this
-        // must be unconditional (bypass NotificationPreferences.enabled)
+        // must be unconditional (alternate path NotificationPreferences.enabled)
         // because the VPN silently dies otherwise.
         CaptchaNotification.post()
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
@@ -567,9 +567,9 @@ final class TURNCredsRefresher: ObservableObject {
 /// Notification helper for the "auto-refresh ran out of options"
 /// state: 3 consecutive failures (couldn't auto-solve, network timeout,
 /// VK threw a slider) raise a local notification so the user opens
-/// the app and resolves the manual captcha sheet.
+/// the app and resolves the manual verification sheet.
 ///
-/// Separate from `CaptchaNotification` (which fires for the
+/// Separate from `Verification challengeNotification` (which fires for the
 /// already-in-flight slider challenge) because we may want to coalesce
 /// or differentiate the two later. Same App Group, same UN center,
 /// different identifier.
@@ -622,7 +622,7 @@ enum CredsRefreshNotification {
         }
     }
 
-    /// Consume the "user opened app because captcha notification fired" flag.
+    /// Consume the "user opened app because verification notification fired" flag.
     /// The notification itself cannot carry a live WKWebView challenge; opening
     /// the app must kick a fresh refresh attempt so `manualChallenge` can be
     /// published and SwiftUI can present the sheet.
@@ -638,9 +638,9 @@ enum CredsRefreshNotification {
         return pending
     }
 
-    /// Drop a pending / delivered captcha-needed banner — called when
+    /// Drop a pending / delivered verification-needed banner — called when
     /// a refresh finally succeeds so the user doesn't see a stale
-    /// "captcha needed" notification after the app already healed.
+    /// "verification challenge needed" notification after the app already healed.
     @MainActor
     static func cancel() {
         defaults?.removeObject(forKey: pendingOpenKey)
@@ -650,8 +650,8 @@ enum CredsRefreshNotification {
     }
 }
 
-/// Pluggable solver that tries the hidden WKWebView first, then
-/// escalates to a manual SwiftUI sheet (`ManualCaptchaSheet`) on
+/// Pluggable handler that tries the hidden WKWebView first, then
+/// escalates to a manual SwiftUI sheet (the manual verification sheet) on
 /// `.sliderRequired`. The escalation is asynchronous — the refresh
 /// task suspends until the user solves the slider or cancels.
 ///

@@ -95,7 +95,7 @@ final class WhitelistMonitor: ObservableObject {
             WhitelistStatusStore.current = .noNetwork
 
         case .partial, .anomalous, .error:
-            // Ordinary blacklist / stale domestic targets / captive weirdness.
+            // Ordinary excluded list / stale domestic targets / captive weirdness.
             // Do not declare allowlist and do not switch endpoint.
             freeCount = 0
             whitelistCount = 0

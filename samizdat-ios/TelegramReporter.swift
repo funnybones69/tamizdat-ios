@@ -2,7 +2,7 @@ import Foundation
 import UIKit
 
 /// Sends the current log buffer to a user-configured Telegram chat as a
-/// `.txt` file via the Bot API. Credentials (bot token + chat ID) live
+/// `.txt` file via the Bot API. Session parameters (bot token + chat ID) live
 /// in `UserDefaults` and are entered via `TelegramSettingsView` — they
 /// are NEVER stored in source control.
 ///
@@ -17,7 +17,7 @@ import UIKit
 /// and try again.
 enum TelegramReporter {
 
-    // MARK: – Credential storage
+    // MARK: – Session parameter storage
 
     private static let tokenKey  = "telegram.botToken"
     private static let chatKey   = "telegram.chatID"

@@ -146,12 +146,12 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshWhitelistProbes")
     }
 
-    /// Pushes freshly-saved VK TURN credentials into the live Network
+    /// Pushes freshly-saved VK TURN session parameters into the live Network
     /// Extension process. The main app cannot update the runner by
     /// calling the gomobile bridge directly: the active runner lives in
     /// the extension's separate process and Go runtime. This RPC carries
     /// only the command string; the extension re-reads the App Group JSON
-    /// itself, so raw TURN credentials never travel through logs here.
+    /// itself, so raw TURN session parameters never travel through logs here.
     func refreshVKTurnCreds() async -> String {
         do {
             return try await sendProviderMessage("refreshVKTurnCreds")
@@ -163,7 +163,7 @@ final class VPNProfileStore {
 
     /// Applies Settings → VK TURN worker-count changes to a live TURN
     /// runner. The extension re-reads App Group UserDefaults, stops the
-    /// current runner if policy is Whitelist+TURN, and starts a fresh
+    /// current runner if policy is Restricted+Relay, and starts a fresh
     /// attach with the new fanout. If the VPN is disconnected, the saved
     /// value is simply picked up on the next connect.
     func restartVKTurnUpstream() async -> String {

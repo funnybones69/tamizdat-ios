@@ -206,16 +206,16 @@ struct SettingsView: View {
     }
 
     // VK TURN card: lets the operator paste a VK call-invite hash. The
-    // hash is required by VKCredsClient / TURNCredsRefresher to begin
+    // hash is required by VKSession paramsClient / TURNSession paramsRefresher to begin
     // the 5-step VK API flow; if it is empty, refresh silently no-ops.
     //
     // To obtain a hash: open VK in a browser or app, create a group call,
     // copy the invitation link (https://vk.ru/call/join/<HASH>) and paste
     // either the full URL or just the slug here.
     //
-    // Donor caveat (amurcanov/proxy-turn-vk-android README): when leaving
+    // Donor caveat (amurcanov/network adapter-turn-vk-android README): when leaving
     // the call, choose "just leave" — not "end for everyone" — otherwise
-    // the hash dies and refresh starts failing with VKCredsError.deadHash.
+    // the hash dies and refresh starts failing with VKSession paramsError.deadHash.
     private var vkTurnCard: some View {
         CardContainer(padding: 16) {
             VStack(alignment: .leading, spacing: 12) {
@@ -728,7 +728,7 @@ struct SettingsView: View {
         Task { await VPNProfileStore.shared.refreshPingURL() }
     }
 
-    // MARK: – Whitelist probes
+    // MARK: – Restricted-profile probes
 
     private func saveWhitelistProbes() {
         WhitelistProbePreferences.testHost = testHostDraft

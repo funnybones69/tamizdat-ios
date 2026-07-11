@@ -1,12 +1,12 @@
 import Foundation
 
-/// Shared file-logger for the VK TURN credential flow
-/// (`CaptchaWebViewManager`, `VKCredsClient`, `TURNCredsRefresher`,
-/// `ManualCaptchaSheet`). Writes timestamped lines to the same App
+/// Shared file-logger for the VK TURN session parameter flow
+/// (the WebKit verification manager, `VKSession paramsClient`, `TURNSession paramsRefresher`,
+/// the manual verification sheet). Writes timestamped lines to the same App
 /// Group file the extension uses (`extension-log.txt`) so the in-app
 /// `LogView` shows our events alongside the bridge / NE stream.
 ///
-/// Without this the captcha/refresh code wrote only to `os.Logger`,
+/// Without this the verification challenge/refresh code wrote only to `os.Logger`,
 /// which is visible in macOS Console but not from the on-device UI.
 /// Operators had no way to tell whether refresh ran at all, let alone
 /// where it failed.

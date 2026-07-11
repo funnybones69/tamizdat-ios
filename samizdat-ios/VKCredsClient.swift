@@ -1,28 +1,28 @@
 import Foundation
 import OSLog
 
-/// Swift port of the donor `creds.go` 5-call VK API flow for acquiring
-/// TURN relay credentials. Built on `URLSession` with per-instance
-/// cookie storage so the captcha-acquired session does not pollute the
+/// Swift port of the donor `session params.go` 5-call VK API flow for acquiring
+/// TURN relay session parameters. Built on `URLSession` with per-instance
+/// cookie storage so the verification challenge-acquired session does not pollute the
 /// main app's shared cookie store.
 ///
 /// WHY a 5-call dance: VK's `vk.com/call/join/<hash>` flow needs three
 /// progressively-scoped anon-tokens, the OK-CDN session key, and only
 /// then the `joinConversationByLink` call returns the TURN realm
-/// credentials. We mirror the donor's exact sequence — diverging is a
+/// session parameters. We mirror the donor's exact sequence — diverging is a
 /// quick way to land in `bot_response` territory.
 ///
-/// Step map (mirrors `donor_creds.go::getVKCredsOnce`):
+/// Step map (mirrors `donor_session params.go::getVKSession paramsOnce`):
 ///   1. POST `login.vk.ru/?act=get_anonym_token` (client-id seeded)
 ///   2. POST `login.vk.ru/?act=get_anonym_token` (payload = step-1 token)
 ///   3. POST `api.vk.ru/method/calls.getAnonymousToken` (vk_join_link)
-///      — this is the step that can return VK error 14 (captcha). On
+///      — this is the step that can return VK error 14 (verification challenge). On
 ///        error 14 we hand the redirect_uri + session_token to the
-///        `VKCaptchaSolver` and retry with captcha_sid + success_token.
+///        `VKVerification challengeHandler` and retry with verification challenge_sid + success_token.
 ///   4. POST `calls.okcdn.ru/fb.do` → `auth.anonymLogin` (OK session)
 ///   5. POST `calls.okcdn.ru/fb.do` → `vchat.joinConversationByLink`
 ///      — response includes the `turn_server` block with username /
-///        credential / urls / lifetime.
+///        session parameter / urls / lifetime.
 ///
 /// Retry policy (mirror Go): up to `maxRetries` attempts with
 /// exponential backoff (1 s, 2 s, 4 s, 8 s, 16 s, capped at 30 s)
@@ -30,16 +30,16 @@ import OSLog
 /// backoff (5 s × attempt, capped at 60 s).
 ///
 /// Concurrency model: `actor` ensures one in-flight fetch per
-/// instance — caller can spam `fetchCredentials()` from multiple
+/// instance — caller can spam `fetchSession parameters()` from multiple
 /// scene-active events without spawning duplicate VK API roundtrips.
 
-/// Caller-supplied captcha solver. Pluggable so tests can stub it.
+/// Caller-supplied verification stepr. Pluggable so tests can stub it.
 protocol VKCaptchaSolver: Sendable {
     func solve(redirectURI: URL, sessionToken: String) async throws -> String
 }
 
-/// Production solver: drives the hidden WKWebView via
-/// `CaptchaWebViewManager`. Throws `CaptchaError.sliderRequired` to
+/// Production handler: drives the hidden WKWebView via
+/// the WebKit verification manager. Throws verification-required signal to
 /// signal that the caller should escalate to the manual sheet.
 struct WKWebViewCaptchaSolver: VKCaptchaSolver {
     func solve(redirectURI: URL, sessionToken: String) async throws -> String {
@@ -51,17 +51,17 @@ struct WKWebViewCaptchaSolver: VKCaptchaSolver {
 }
 
 /// One (ClientID, ClientSecret) pair for a VK anonymous app. The
-/// credential acquire flow runs against these as a list: when a step
+/// session parameter acquire flow runs against these as a list: when a step
 /// trips VK error_code 29 (rate-limit), the client advances to the
-/// next pair and retries — same behaviour as vk-turn-proxy's
-/// `vkCredentialsList` rotation.
+/// next pair and retries — same behaviour as vk-turn-network adapter's
+/// `vkSession parametersList` rotation.
 ///
 /// The five default entries are the public IDs shipped by donor
 /// applications (vk.com, mvk.com, vkvideo, ID auth). Treating them as
 /// a constant pool spreads rate-limit pressure across five separate
 /// VK quotas and lets us survive a temporary ban on any single app.
 ///
-/// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+/// Ported from cacggghp/vk-turn-network adapter (GPL-3.0), commit e8a9696
 /// (client/main.go:597-603).
 struct VKAppCredentials: Equatable {
     let clientID: String
@@ -74,10 +74,10 @@ struct VKAppCredentials: Equatable {
 struct VKCredsConfig {
     /// Ordered pool of VK app IDs / secrets to rotate through on
     /// rate-limit (VK error_code 29). The first entry is the
-    /// historical default; the rest are vk-turn-proxy's fallbacks.
+    /// historical default; the rest are vk-turn-network adapter's fallbacks.
     /// The client actor starts at index 0 and advances on rate-limit
-    /// responses; if every pair is exhausted, `fetchCredentials`
-    /// throws `VKCredsError.allAppIDsExhausted`.
+    /// responses; if every pair is exhausted, `fetchSession parameters`
+    /// throws `VKSession paramsError.allAppIDsExhausted`.
     ///
     /// Single-app callers (e.g. unit tests) can override with a
     /// one-element array.
@@ -94,7 +94,7 @@ struct VKCredsConfig {
     var callHash: String
     /// Optional secondary hash. If step 3 fails on the primary, the
     /// client retries the entire flow once against the secondary. Matches
-    /// `GetCredsWithFallback` in the donor.
+    /// `GetSession paramsWithFallback` in the donor.
     var secondaryHash: String?
     /// Per-device pseudo-unique ID used as `device_id` in the OK CDN
     /// session_data payload. UUID is fine; donor uses uuid.New().
@@ -113,11 +113,11 @@ struct VKCredsConfig {
     var perRequestTimeout: TimeInterval = 20
 
     /// Default VK app IDs the client rotates through on rate-limit.
-    /// Five public anonymous-app credentials lifted from
-    /// vk-turn-proxy (their `vkCredentialsList`). Order matches
+    /// Five public anonymous-app session parameters lifted from
+    /// vk-turn-network adapter (their `vkSession parametersList`). Order matches
     /// upstream so behaviour stays comparable.
     ///
-    /// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+    /// Ported from cacggghp/vk-turn-network adapter (GPL-3.0), commit e8a9696
     /// (client/main.go:597-603).
     static let defaultAppIDs: [VKAppCredentials] = [
         VKAppCredentials(clientID: "6287487",  clientSecret: "QbYic1K3lEV5kTGiqlq2"),   // VK_WEB_APP_ID
@@ -128,11 +128,11 @@ struct VKCredsConfig {
     ]
 }
 
-/// Errors thrown by `VKCredsClient.fetchCredentials()`.
+/// Errors thrown by `VKSession paramsClient.fetchSession parameters()`.
 enum VKCredsError: Error, LocalizedError {
     /// All retries exhausted; last error is wrapped.
     case retriesExhausted(lastError: Error)
-    /// The VK side returned an error block (other than captcha).
+    /// The VK side returned an error block (other than verification challenge).
     case vkError(step: String, payload: [String: Any])
     /// HTTP transport-level failure.
     case transport(step: String, underlying: Error)
@@ -140,9 +140,9 @@ enum VKCredsError: Error, LocalizedError {
     case malformedResponse(step: String, hint: String)
     /// The call hash is permanently dead — sentinel for VK code 9000.
     case deadHash
-    /// Captcha solver failed (slider required → caller falls back).
+    /// Verification challenge handler failed (slider required → caller falls back).
     case captchaFailed(underlying: Error)
-    /// All configured VK app IDs (`VKCredsConfig.vkAppIDs`) hit
+    /// All configured VK app IDs (`VKSession paramsConfig.vkAppIDs`) hit
     /// rate-limit responses in a row — every quota is exhausted and
     /// there is nothing left to rotate to. Caller MUST wait minutes,
     /// not seconds, before retrying.
@@ -175,7 +175,7 @@ enum VKCredsError: Error, LocalizedError {
     }
 }
 
-/// VK-side captcha error data we parse out of the error block on step 3.
+/// VK-side verification challenge error data we parse out of the error block on step 3.
 private struct VKCaptchaChallenge {
     let captchaSid: String
     let redirectURI: URL
@@ -184,7 +184,7 @@ private struct VKCaptchaChallenge {
     let captchaAttempt: String
 
     /// Decode a `{ "error": { ... } }` payload. Returns nil if the
-    /// block isn't a captcha challenge (error_code != 14 or fields
+    /// block isn't a verification challenge challenge (error_code != 14 or fields
     /// missing).
     static func decode(from errorBlock: [String: Any]) -> VKCaptchaChallenge? {
         let codeFloat = (errorBlock["error_code"] as? Double) ?? -1
@@ -227,23 +227,23 @@ private struct VKCaptchaChallenge {
 }
 
 /// Actor wrapping one VK API session. One actor = one cookie jar = one
-/// in-flight fetchCredentials.
+/// in-flight fetchSession parameters.
 actor VKCredsClient {
     private let config: VKCredsConfig
     private let captchaSolver: VKCaptchaSolver
     private let log = Logger(subsystem: "com.anarki.samizdat-test.captcha", category: "vkcreds")
 
     /// Per-instance URLSession backed by an isolated cookie jar — keeps
-    /// the captcha-bound session_token / VK cookies out of the main
+    /// the verification challenge-bound session_token / VK cookies out of the main
     /// app's shared cookie store.
     private let session: URLSession
 
     /// Index into `config.vkAppIDs`. Advances on VK error_code 29
     /// (rate-limit) and wraps to `allAppIDsExhausted` when every pair
-    /// has been tried. Reset between `fetchCredentials` calls would
+    /// has been tried. Reset between `fetchSession parameters` calls would
     /// make sense too, but VK rate-limits are app-id-scoped and last
     /// minutes — keeping the index across retries inside one
-    /// `runWithRetries` matches what vk-turn-proxy does.
+    /// `runWithRetries` matches what vk-turn-network adapter does.
     private var currentAppIDIndex: Int = 0
 
     /// Currently-active (clientID, clientSecret) pair. Falls back to
@@ -269,9 +269,9 @@ actor VKCredsClient {
     /// True when the given VK error block represents a rate-limit
     /// (error_code 29 OR an error_msg containing "rate limit" — VK
     /// occasionally reports the throttle as a text-only message).
-    /// Mirror of vk-turn-proxy's `error_code:29` substring check.
+    /// Mirror of vk-turn-network adapter's `error_code:29` substring check.
     ///
-    /// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+    /// Ported from cacggghp/vk-turn-network adapter (GPL-3.0), commit e8a9696
     /// (client/main.go:803).
     private static func isRateLimit(_ block: [String: Any]) -> Bool {
         let code = Int((block["error_code"] as? Double) ?? -1)
@@ -303,7 +303,7 @@ actor VKCredsClient {
 
     /// Run the 5-call dance up to `maxRetries` times against the
     /// configured `callHash` (and fall back once to `secondaryHash` if
-    /// the primary returns dead-hash). Returns fully-populated creds.
+    /// the primary returns dead-hash). Returns fully-populated session params.
     func fetchCredentials() async throws -> VKTURNCredentials {
         let hashPrefix = String(config.callHash.prefix(8))
         TURNLog.info("vkcreds", "fetchCredentials: starting (hash=\(hashPrefix)... appIDs=\(config.vkAppIDs.count))")
@@ -344,7 +344,7 @@ actor VKCredsClient {
                 // nothing more we can usefully try in the next few
                 // minutes.
                 //
-                // Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit
+                // Ported from cacggghp/vk-turn-network adapter (GPL-3.0), commit
                 // e8a9696 (client/main.go:803-805).
                 TURNLog.warn("vkcreds", "rate-limit at \(step) on app_id=\(appID) — rotating")
                 if !advanceAppID() {
@@ -375,7 +375,7 @@ actor VKCredsClient {
     }
 
     /// Exponential backoff with jitter, plus a flood-specific linear
-    /// schedule. Mirrors `getUniqueVKCreds` in `donor_creds.go`.
+    /// schedule. Mirrors `getUniqueVKSession params` in `donor_session params.go`.
     private static func backoff(for error: Error, attempt: Int) -> Double {
         let msg = (error as? LocalizedError)?.errorDescription ?? "\(error)"
         let lower = msg.lowercased()
@@ -429,9 +429,9 @@ actor VKCredsClient {
         let t3: String = try Self.requireString(r2, path: ["data", "access_token"], step: "2")
         TURNLog.info("vkcreds", "step 2 ok")
 
-        // Pre-auth warmup — VK's rate limiter and captcha gate are
+        // Pre-auth warmup — VK's rate limiter and verification challenge gate are
         // markedly more lenient against "browser-like" call sequences.
-        // vk-turn-proxy fires `calls.getCallPreview` between step 1
+        // vk-turn-network adapter fires `calls.getCallPreview` between step 1
         // and step 3 to look like a legitimate UI fetching the call
         // preview before joining. The body shape mirrors upstream;
         // failure is logged but never propagated — this is pure
@@ -439,7 +439,7 @@ actor VKCredsClient {
         // because a warmup throttle means step 3 is doomed and the
         // retry loop should rotate to the next app ID immediately.
         //
-        // Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
+        // Ported from cacggghp/vk-turn-network adapter (GPL-3.0), commit e8a9696
         // (client/main.go:897-901).
         TURNLog.info("vkcreds", "step 0.warmup: calls.getCallPreview")
         let warmupBody = "vk_join_link=https://vk.com/call/join/\(hash)&fields=photo_200&access_token=\(t1)"
@@ -453,7 +453,7 @@ actor VKCredsClient {
             TURNLog.warn("vkcreds", "step 0.warmup failed (network) — continuing")
         }
 
-        // Step 3 — getAnonymousToken; the captcha-prone step.
+        // Step 3 — getAnonymousToken; the verification challenge-prone step.
         TURNLog.info("vkcreds", "step 3: getAnonymousToken (captcha-prone)")
         let nameEnc = Self.urlEncoded(config.profileName)
         let step3Base = "vk_join_link=https://vk.com/call/join/\(hash)" +
@@ -487,7 +487,7 @@ actor VKCredsClient {
             } catch {
                 throw VKCredsError.captchaFailed(underlying: error)
             }
-            // Re-issue step 3 with the success_token + captcha_sid.
+            // Re-issue step 3 with the success_token + verification challenge_sid.
             TURNLog.info("vkcreds", "step 3-retry: reissuing with captcha solution")
             let attempt = challenge.captchaAttempt.isEmpty || challenge.captchaAttempt == "0"
                 ? "1" : challenge.captchaAttempt
@@ -692,7 +692,7 @@ actor VKCredsClient {
         // re-refresh — root cause was lifetime=0, expiresAt = acquiredAt,
         // needsRefresh always true → infinite refresh loop). Fall back to
         // 3600s (one hour) — the donor's empirical default and a safe
-        // floor: VK invalidates creds long before they actually go stale.
+        // floor: VK invalidates session params long before they actually go stale.
         let lifetime: TimeInterval = {
             if let life = block["lifetime"] as? Double, life > 0 {
                 TURNLog.info("vkcreds", "parsed lifetime=\(Int(life))s from response")

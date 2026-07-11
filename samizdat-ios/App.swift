@@ -12,9 +12,9 @@ struct SamizdatTestApp: App {
 
     /// IPA-D65b: scenePhase listener. The VK TURN refresher kicks off
     /// in the background when the app becomes active and the cached
-    /// creds are within `TURNCredsStore.refreshCushion` (15 min) of
+    /// session params are within `TURNSession paramsStore.refreshCushion` (15 min) of
     /// expiry. We deliberately do NOT block startup — the refresh is
-    /// a `Task { ... }` fire-and-forget. If creds are still fresh, the
+    /// a `Task { ... }` fire-and-forget. If session params are still fresh, the
     /// refresher returns immediately.
     @Environment(\.scenePhase) private var scenePhase
 
@@ -25,13 +25,13 @@ struct SamizdatTestApp: App {
         // to also register at launch).
         GeistFont.register()
 
-        // VK TURN credentials are now refreshed on demand. We still register
-        // the BG task so iOS can wake us while Whitelist+TURN is active, but
+        // VK TURN session parameters are now refreshed on demand. We still register
+        // the BG task so iOS can wake us while Restricted+Relay is active, but
         // all maintenance paths are policy-gated: Main/H2 or inactive TURN
-        // must not burn VK captcha sessions.
+        // must not burn VK verification sessions.
         // The BG identifier MUST match
         //   - `Info.plist::BGTaskSchedulerPermittedIdentifiers`
-        //   - `TURNCredsRefresher.backgroundTaskIdentifier`
+        //   - `TURNSession paramsRefresher.backgroundTaskIdentifier`
         // …or the register call throws at runtime.
         BGTaskScheduler.shared.register(
             forTaskWithIdentifier: TURNCredsRefresher.backgroundTaskIdentifier,
@@ -45,7 +45,7 @@ struct SamizdatTestApp: App {
         }
         // Only keep a BG request on the books while VK TURN is the effective
         // path. Otherwise iOS may wake the app just to hit VK and trigger a
-        // captcha the user did not ask for.
+        // verification challenge the user did not ask for.
         if TURNCredsRefresher.shouldMaintainTurnCredentialsNow() {
             TURNCredsRefresher.scheduleBackgroundRefresh()
         } else {

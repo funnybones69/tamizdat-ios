@@ -1,26 +1,26 @@
 import Foundation
 
-/// App Group-backed cache for VK TURN credentials acquired by the
-/// main-app WKWebView solver.
+/// App Group-backed cache for VK TURN session parameters acquired by the
+/// main-app WKWebView handler.
 ///
 /// WHY App Group UserDefaults: the Network Extension cannot run a
 /// WKWebView (Apple disallows; only the main app process can host
-/// WebKit), so the creds-acquire flow lives in the main app. The
-/// extension reads the cached creds at startTunnel and on each
+/// WebKit), so the session params-acquire flow lives in the main app. The
+/// extension reads the cached session params at startTunnel and on each
 /// status RPC. The cache is the canonical source of truth — the
 /// main app writes on every refresh, the extension only reads.
 ///
 /// Lifetime model:
-///   - `acquiredAt` is set when VK API returns creds.
+///   - `acquiredAt` is set when VK API returns session params.
 ///   - `lifetime` is the TTL VK announces (seconds; typically ~30 min).
 ///   - `expiresAt = acquiredAt + lifetime`.
-///   - `isFresh` ⇒ creds exist AND will still be alive 5 min from now.
-///   - `needsRefresh` ⇒ creds missing OR will expire within 5 min.
+///   - `isFresh` ⇒ session params exist AND will still be alive 5 min from now.
+///   - `needsRefresh` ⇒ session params missing OR will expire within 5 min.
 ///
-/// We refresh ~5 min ahead of expiry so the first failed creds-bound
-/// connection attempt has full creds for retry. A burst of refreshes
+/// We refresh ~5 min ahead of expiry so the first failed session params-bound
+/// connection attempt has full session params for retry. A burst of refreshes
 /// during a quick succession of scene-active events is naturally
-/// debounced by the actor in `VKCredsClient.fetchCredentials` (single
+/// debounced by the actor in `VKSession paramsClient.fetchSession parameters` (single
 /// flight).
 struct VKTURNCredentials: Codable, Equatable {
     /// TURN realm username — passed verbatim to libstun / libice.
@@ -37,11 +37,11 @@ struct VKTURNCredentials: Codable, Equatable {
     /// per-server transport) still deserialises. When nil, callers
     /// fall back to `turnURLs` + a default-UDP guess.
     let turnServers: [TurnServer]?
-    /// VK-advertised credential lifetime in seconds. Negative or zero
-    /// means VK didn't return a `lifetime` / `ttl`; we treat such creds
+    /// VK-advertised session parameter lifetime in seconds. Negative or zero
+    /// means VK didn't return a `lifetime` / `ttl`; we treat such session params
     /// as already needing refresh.
     let lifetime: TimeInterval
-    /// Wall-clock time the creds were acquired. Used to compute
+    /// Wall-clock time the session params were acquired. Used to compute
     /// `expiresAt` for client-side cache decisions.
     let acquiredAt: Date
 
@@ -77,7 +77,7 @@ struct VKTURNCredentials: Codable, Equatable {
         }
     }
 
-    /// Modern initialiser used by `VKCredsClient.parseTurnBlock`.
+    /// Modern initialiser used by `VKSession paramsClient.parseTurnBlock`.
     init(username: String,
          password: String,
          turnServers: [TurnServer],
@@ -193,8 +193,8 @@ final class TURNCredsStore {
     private static let storageKey = "tamizdat.vkTURNCreds.v2"
 
     /// Cushion before expiry that triggers a refresh. 15 min gives the
-    /// foreground 5-minute heartbeat (TURNCredsRefresher) four chances
-    /// at refresh before the creds actually expire — and gives the BG
+    /// foreground 5-minute heartbeat (TURNSession paramsRefresher) four chances
+    /// at refresh before the session params actually expire — and gives the BG
     /// task scheduler equally generous slack when iOS gates the
     /// background runner.
     ///
@@ -211,7 +211,7 @@ final class TURNCredsStore {
 
     private init() {}
 
-    /// Persisted creds (if any). Returns nil if the entry is missing
+    /// Persisted session params (if any). Returns nil if the entry is missing
     /// or the stored payload can't be decoded (e.g. schema drift).
     func load() -> VKTURNCredentials? {
         guard let data = defaults?.data(forKey: Self.storageKey) else { return nil }
@@ -224,7 +224,7 @@ final class TURNCredsStore {
         }
     }
 
-    /// Replace the current entry with `creds`. Atomic; the extension
+    /// Replace the current entry with `session params`. Atomic; the extension
     /// reads the new value on its next status RPC tick (≤ 500 ms).
     func save(_ creds: VKTURNCredentials) {
         guard let defaults else { return }
@@ -241,16 +241,16 @@ final class TURNCredsStore {
         }
         // Also mirror as a plain-string JSON under a fixed key the
         // Network Extension reads inline (extension can't import
-        // VKTURNCredentials so it can't decode the binary blob above).
-        // Wire shape matches what mobile/socksstub::parseVKTurnCredsJSON
+        // VKTURNSession parameters so it can't decode the binary blob above).
+        // Wire shape matches what mobile/socksstub::parseVKTurnSession paramsJSON
         // expects: {username, password, turn_servers, lifetime_sec}.
         defaults.set(vkCredsAsJSON(creds: creds), forKey: "tamizdat.vkTURNCredsJSON")
 
         // Mirror the acquisition timestamp as a standalone key so the
-        // extension can pre-flight-check creds age WITHOUT decoding
-        // the Codable blob (extension can't see VKTURNCredentials).
+        // extension can pre-flight-check session params age WITHOUT decoding
+        // the Codable blob (extension can't see VKTURNSession parameters).
         // Used by PacketTunnelProvider.attachVKTurnUpstream to refuse
-        // a 15-s VK Allocate timeout when creds are already past the
+        // a 15-s VK Allocate timeout when session params are already past the
         // safety margin.
         defaults.set(creds.acquiredAt, forKey: "tamizdat.vkTURNCredsAcquiredAt")
     }
@@ -261,7 +261,7 @@ final class TURNCredsStore {
     /// extension, and the standalone acquiredAt stamp) so a stale
     /// timestamp can never linger past a clear(). Also drops the legacy
     /// v1 binary key so a long-lived install that was bridged across
-    /// the schema bump can never resurface old creds.
+    /// the schema bump can never resurface old session params.
     func clear() {
         defaults?.removeObject(forKey: Self.storageKey)
         defaults?.removeObject(forKey: "tamizdat.vkTURNCreds.v1")
@@ -269,9 +269,9 @@ final class TURNCredsStore {
         defaults?.removeObject(forKey: "tamizdat.vkTURNCredsAcquiredAt")
     }
 
-    /// `true` iff creds exist and have at least `refreshCushion`
+    /// `true` iff session params exist and have at least `refreshCushion`
     /// seconds of remaining lifetime. Drives the green/grey TURN tile
-    /// in the main UI and the `hasTURNCreds` field in the status RPC.
+    /// in the main UI and the `hasTURNSession params` field in the status RPC.
     var isFresh: Bool {
         guard let c = load() else { return false }
         return c.expiresAt.timeIntervalSinceNow > Self.refreshCushion
@@ -305,10 +305,10 @@ extension JSONDecoder {
     }
 }
 
-// MARK: – VK creds runtime configuration (App Group preferences)
+// MARK: – VK session params runtime configuration (App Group preferences)
 
-/// Static helper that surfaces the VK creds knobs from App Group
-/// UserDefaults. Kept separate from `TURNCredsStore` so the refresh
+/// Static helper that surfaces the VK session params knobs from App Group
+/// UserDefaults. Kept separate from `TURNSession paramsStore` so the refresh
 /// coordinator can read these without entangling read/write paths.
 ///
 /// At this stage of the rollout we expect the call hash to come from
@@ -437,9 +437,9 @@ enum EndpointTurnMode: String, CaseIterable, Identifiable {
     }
 }
 
-// The main-app-only refresh coordinator (`TURNCredsRefresher`) lives
+// The main-app-only refresh coordinator (`TURNSession paramsRefresher`) lives
 // in a separate file so that this one can be compiled by both the
 // main app target AND the Network Extension target — the extension
-// only needs the read-side primitives (`VKTURNCredentials`,
-// `TURNCredsStore`, `VKCredsPreferences`) and must NOT pull in
-// WKWebView / SwiftUI dependencies. See `TURNCredsRefresher.swift`.
+// only needs the read-side primitives (`VKTURNSession parameters`,
+// `TURNSession paramsStore`, `VKSession paramsPreferences`) and must NOT pull in
+// WKWebView / SwiftUI dependencies. See `TURNSession paramsRefresher.swift`.

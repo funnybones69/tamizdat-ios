@@ -47,18 +47,18 @@ enum NotificationIDs {
     static let detectedID = "whitelist.detected"
     static let recoveredID = "whitelist.recovered"
 
-    // Phase 2G: VK Smart Captcha required a human. Posted whenever
-    // `TURNCredsRefresher.manualChallenge` flips from nil to non-nil
-    // (i.e. the auto-solver bailed because VK served a slider).
+    // Phase 2G: VK Smart Verification required a human. Posted whenever
+    // `TURNSession paramsRefresher.manualChallenge` flips from nil to non-nil
+    // (i.e. the auto-handler bailed because VK served a slider).
     // Deliberately NOT gated by NotificationPreferences.enabled — this
     // is on the critical path; without it the VPN silently dies when
     // VK rotates to a slider variant.
     static let captchaRequiredID = "captcha.required"
 }
 
-/// Convenience helpers for the captcha-required notification.
+/// Convenience helpers for the verification challenge-required notification.
 /// Separated from `NotificationPreferences` because that enum stores
-/// the master toggle (which captcha notifications deliberately bypass).
+/// the master toggle (which verification notifications deliberately alternate path).
 enum CaptchaNotification {
     /// Schedule the local notification immediately. iOS permission
     /// authorization is checked synchronously — if denied, this is a
@@ -84,7 +84,7 @@ enum CaptchaNotification {
         }
     }
 
-    /// Cancel an outstanding captcha-required prompt. Called when the
+    /// Cancel an outstanding verification challenge-required prompt. Called when the
     /// user resolves the challenge or cancels it.
     @MainActor
     static func cancel() {

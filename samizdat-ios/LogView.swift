@@ -315,7 +315,7 @@ struct LogView: View {
     }
 
     /// IPA-D25 fix3: tap "Share" → send the visible logs directly to the
-    /// configured Telegram bot, bypassing the iOS share sheet (which is
+    /// configured Telegram bot, alternate pathing the iOS share sheet (which is
     /// flaky for large text payloads / Telegram in particular). If the
     /// bot isn't configured yet, fall back to the iOS share sheet so the
     /// button still works.

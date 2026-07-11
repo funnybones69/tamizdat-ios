@@ -1,6 +1,6 @@
 import Foundation
 
-/// When the whitelist detector flips the tunnel onto the "whitelist"
+/// When the restricted-profile detector flips the tunnel onto the "whitelist"
 /// endpoint, this enum decides WHAT that endpoint actually is.
 ///
 ///   - `.h2Backup` — the long-standing behaviour: dial the secondary

@@ -3,7 +3,7 @@ import UIKit
 
 /// Form for entering the Telegram Bot API token + chat ID used by the
 /// "Telegram" button in LogView. Stored in `UserDefaults` (not Keychain
-/// — these are debug credentials, not user secrets, and we want them
+/// — these are debug session parameters, not user secrets, and we want them
 /// trivially clearable).
 struct TelegramSettingsView: View {
     @Environment(\.dismiss) private var dismiss

@@ -3,7 +3,7 @@ import Foundation
 /// IPA-D24/D25: probes "what is my public IP" every 60s via plain
 /// URLSession.shared so iOS routes through the system default route.
 /// When the tunnel is up, URLSession sees the tunnel → exit IP from
-/// our proxy server. When off, it goes through physical Wi-Fi /
+/// our network adapter server. When off, it goes through physical Wi-Fi /
 /// cellular → real ISP IP.
 ///
 /// Surfaces below the Ping chip on the Home screen as

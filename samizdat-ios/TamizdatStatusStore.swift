@@ -57,7 +57,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     /// IPA-D21: most recent probe succeeded.
     let pingOK: Bool
     /// IPA-D21: 2+ consecutive probe failures — triggers the yellow
-    /// "Proxy unreachable" shield on the main screen.
+    /// "Network adapter unreachable" shield on the main screen.
     let pingFailed: Bool
     /// IPA-D21: echo-back of the currently-configured probe URL
     /// (debugging aid; not rendered on the main screen).
@@ -89,7 +89,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     let turnRunning: Int
     let turnNetstackReady: Int
 
-    /// VK TURN relay credentials available from the server.
+    /// VK TURN relay session parameters available from the server.
     let hasTURNCreds: Bool
 
     static let offline = TamizdatStatusSnapshot(
@@ -203,15 +203,15 @@ final class TamizdatStatusStore: ObservableObject {
     private var timer: Timer?
 
     /// IPA-D65b: True while the main-app refresher is solving a VK
-    /// captcha (auto WKWebView or manual sheet). Drives a small
+    /// verification challenge (auto WKWebView or manual sheet). Drives a small
     /// "Решаем капчу..." indicator under the shield. Backed by a
-    /// `Combine`-style mirror of `TURNCredsRefresher.isRefreshing`.
+    /// `Combine`-style mirror of `TURNSession paramsRefresher.isRefreshing`.
     @Published private(set) var captchaIsActive: Bool = false
 
-    /// IPA-D65b: published mirror — true iff the cached VK TURN creds
+    /// IPA-D65b: published mirror — true iff the cached VK TURN session params
     /// in App Group UserDefaults are fresh enough to use without
     /// triggering a refresh. The extension surfaces the same bit via
-    /// the status RPC (`snapshot.hasTURNCreds`); this main-app-side
+    /// the status RPC (`snapshot.hasTURNSession params`); this main-app-side
     /// mirror lets `ContentView` repaint when the cache changes while
     /// the VPN is offline.
     @Published private(set) var turnCredsValid: Bool = TURNCredsStore.shared.isFresh
@@ -233,7 +233,7 @@ final class TamizdatStatusStore: ObservableObject {
     var realShape: String { snapshot.realShape }
 
     /// IPA-D21: true when the most-recent two ping probes failed. Drives
-    /// the yellow "Proxy unreachable" shield on the main screen.
+    /// the yellow "Network adapter unreachable" shield on the main screen.
     var pingHealthy: Bool { !snapshot.pingFailed }
 
     /// IPA-D21: single-line status under the shield.
@@ -288,7 +288,7 @@ final class TamizdatStatusStore: ObservableObject {
 
         // IPA-D65b: mirror the refresher's in-flight flag so any
         // observer of this store can render a "Решаем капчу..." chip
-        // without separately subscribing to `TURNCredsRefresher`.
+        // without separately subscribing to `TURNSession paramsRefresher`.
         let active = TURNCredsRefresher.shared.isRefreshing
         if captchaIsActive != active {
             captchaIsActive = active
@@ -328,7 +328,7 @@ final class TamizdatStatusStore: ObservableObject {
         if rxBytes != snap.rxBytes { rxBytes = snap.rxBytes }
         if txBytes != snap.txBytes { txBytes = snap.txBytes }
 
-        // VK TURN creds are written by the main app even when the VPN
+        // VK TURN session params are written by the main app even when the VPN
         // is offline, so mirror the local cache separately from the NE
         // status RPC and publish changes for the TURN stat tile.
         let freshTurnCreds = TURNCredsStore.shared.isFresh

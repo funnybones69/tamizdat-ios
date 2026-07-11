@@ -3,18 +3,18 @@ import SwiftUI
 import WebKit
 import OSLog
 
-/// SwiftUI sheet that surfaces the VK captcha to the user when the
-/// auto solver determined a slider/kaleidoscope is required. Port of
-/// the Android donor's `ManlCaptchaWebViewManager.kt` (~388 LoC).
+/// SwiftUI sheet that surfaces the VK verification challenge to the user when the
+/// auto handler determined a slider/kaleidoscope is required. Port of
+/// the Android donor's `ManlWebKit verification manager.kt` (~388 LoC).
 ///
 /// WHY a sheet, not a full screen: iOS users dislike modal takeovers
 /// for what is effectively a 5-second interaction. A `.sheet`-style
-/// half-modal keeps the rest of the app visible behind the captcha so
+/// half-modal keeps the rest of the app visible behind the verification challenge so
 /// users see context — they came from the connect button, they will
 /// return there once the slider is solved.
 ///
-/// The web view here is VISIBLE (unlike the auto solver) and uses the
-/// same `CaptchaJSInterceptor` so the success_token still bubbles up
+/// The web view here is VISIBLE (unlike the auto handler) and uses the
+/// same `Verification challengeJSInterceptor` so the success_token still bubbles up
 /// the same channel — we just don't synthesize touches. The user
 /// drags the slider, VK posts the result, the interceptor catches the
 /// JSON body, and we hand the token back to the caller via the
@@ -24,10 +24,10 @@ import OSLog
 struct ManualCaptchaSheet: View {
     /// VK redirect_uri to load.
     let redirectURI: URL
-    /// Captcha session token (kept for logging / future telemetry —
+    /// Verification challenge session token (kept for logging / future telemetry —
     /// VK reads it from the URL itself).
     let sessionToken: String
-    /// Called with the success_token once VK confirms the captcha.
+    /// Called with the success_token once VK confirms the verification challenge.
     let onSuccess: (String) -> Void
     /// Called if the user dismisses the sheet without solving.
     let onCancel: () -> Void
@@ -150,13 +150,13 @@ struct ManualCaptchaSheet: View {
 
 // MARK: – WKWebView wrapper
 
-/// `UIViewRepresentable` host for the visible captcha WKWebView. We
-/// can't reuse `CaptchaWebViewManager`'s session (that one is hidden
+/// `UIViewRepresentable` host for the visible verification challenge WKWebView. We
+/// can't reuse the WebKit verification manager's session (that one is hidden
 /// and auto-solves); this is its visible cousin.
 ///
-/// The same `CaptchaJSInterceptor.script` runs here — VK doesn't know
+/// The same `Verification challengeJSInterceptor.script` runs here — VK doesn't know
 /// or care whether it's the auto checkbox or the manual slider that
-/// fires `captchaNotRobot.check`. The interceptor catches either.
+/// fires `verification challengeNotRobot.check`. The interceptor catches either.
 private struct ManualCaptchaWebViewContainer: UIViewRepresentable {
     let redirectURI: URL
     let onPageLoaded: () -> Void
@@ -178,7 +178,7 @@ private struct ManualCaptchaWebViewContainer: UIViewRepresentable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         ))
-        // Hide VK's chrome around the captcha frame so the user sees a
+        // Hide VK's chrome around the verification challenge frame so the user sees a
         // clean modal — port of `hideElementsJSCode` from Android.
         userContent.addUserScript(WKUserScript(
             source: Self.hideChromeJS,
@@ -218,7 +218,7 @@ private struct ManualCaptchaWebViewContainer: UIViewRepresentable {
         uiView.uiDelegate = nil
     }
 
-    // Mobile UA so VK serves the touch-friendly captcha layout. Picked
+    // Mobile UA so VK serves the touch-friendly verification challenge layout. Picked
     // a recent Android Chrome string; iOS Safari works too, but Android
     // matches the donor and keeps the click-target sizes large.
     private static let mobileUserAgent: String =
@@ -226,7 +226,7 @@ private struct ManualCaptchaWebViewContainer: UIViewRepresentable {
         "Chrome/146.0.0.0 Mobile Safari/537.36"
 
     /// CSS overlay that hides VK's logo / overlay backdrops / link
-    /// chrome around the captcha card, so the user only sees the
+    /// chrome around the verification challenge card, so the user only sees the
     /// slider widget in our black modal. Port of `hideElementsJSCode`.
     private static let hideChromeJS: String = """
     (function() {
@@ -295,7 +295,7 @@ private struct ManualCaptchaWebViewContainer: UIViewRepresentable {
                      createWebViewWith configuration: WKWebViewConfiguration,
                      for navigationAction: WKNavigationAction,
                      windowFeatures: WKWindowFeatures) -> WKWebView? {
-            // VK sometimes completes manual captcha through target=_blank /
+            // VK sometimes completes manual verification through target=_blank /
             // window.open. WKWebView drops those navigations unless a
             // WKUIDelegate handles them, which looks like a frozen button.
             if navigationAction.targetFrame == nil {

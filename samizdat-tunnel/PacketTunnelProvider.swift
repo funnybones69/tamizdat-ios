@@ -9,7 +9,7 @@ import SamizdatClient
 
 /// Path 3 PacketTunnelProvider — pure C/lwIP via hev-socks5-tunnel, no Go
 /// runtime in the extension. The heavy lifting (Go SOCKS5 listener,
-/// optional samizdat proxy) lives in the main-app process where there is
+/// optional samizdat network adapter) lives in the main-app process where there is
 /// no jetsam memory cap. The extension's job in this design is reduced to
 /// just three things:
 ///
@@ -17,11 +17,11 @@ import SamizdatClient
 ///   2. find the utun file descriptor that NEPacketTunnelProvider just
 ///      opened for us (Apple does not pass it through the public API; we
 ///      enumerate fds and match the "com.apple.net.utun_control" socket
-///      pattern — same trick every shipping iOS proxy app uses);
+///      pattern — same trick every shipping iOS network adapter app uses);
 ///   3. call hev_socks5_tunnel_main_from_str(config, len, fd), which
 ///      blocks until hev_socks5_tunnel_quit().
 ///
-/// Memory profile observed on production iOS proxy clients (V2Box, FoXray,
+/// Memory profile observed on production iOS network adapter clients (V2Box, FoXray,
 /// Hiddify variants) running this exact pattern: 5-15 MB RSS sustained
 /// even at 100 Mbps, vs. our ~30-40 MB Go/gVisor stack that hit jetsam at
 /// 50 s. The savings come from: no Go runtime, no gVisor packet pools, no
@@ -119,7 +119,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     // IPA-Q: WhitelistDetector — periodic out-of-tunnel cascade probe
-    // that flips to backup when TSPU whitelist mode is detected and
+    // that flips to backup when TSPU restricted-profile mode is detected and
     // back to primary when it lifts.
     private var whitelistDetector: WhitelistDetector?
     private var lastPathSatisfied: Bool = true
@@ -129,7 +129,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var autoRewireBridge: AutoRewireBridge?
 
     // IPA-A1: PacketBridge removed. We're back on the original
-    // "Path 3" architecture (Pattern 1 in the iOS proxy taxonomy):
+    // "Path 3" architecture (Pattern 1 in the iOS network adapter taxonomy):
     // hev gets the raw utun file descriptor via KVO and reads/writes
     // packets directly in C. No Swift in the data path. Same setup
     // Shadowrocket / Surge / Tun2SocksKit use. Loss: per-flow
@@ -296,7 +296,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ExtLog.info("[vkturn] attach: entering helper")
 
         // Read runtime values from App Group UserDefaults — these keys
-        // are written by the main app. VKCredsPreferences/TURNCredsStore
+        // are written by the main app. VKSession paramsPreferences/TURNSession paramsStore
         // are included in the extension target for read-side helpers, but
         // the WKWebView refresh writer remains main-app-only.
         let groupID = "group.com.anarki.samizdat-test"
@@ -317,8 +317,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // Read raw creds JSON from App Group UserDefaults directly —
-        // TURNCredsStore lives in main-app target.
+        // Read raw session params JSON from App Group UserDefaults directly —
+        // TURNSession paramsStore lives in main-app target.
         guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
               !credsJSON.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — no creds JSON in App Group. Открой приложение и подожди автообновление (5-минутный heartbeat) или сделай ручной refresh.")
@@ -328,17 +328,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Safety margin gate. The pre-fix code hard-coded 3480 s
         // (lifetime 3600 minus 120 s cushion), but VK has shipped
-        // shorter-lived creds in the past — and a future TTL change
+        // shorter-lived session params in the past — and a future TTL change
         // would have silently let us call `SocksstubStartVKTurnUpstream`
-        // against creds that were already past expiry. That gomobile
+        // against session params that were already past expiry. That gomobile
         // function does a synchronous VK Allocate against the TURN
         // server, which can sleep up to 15 s before failing 401, so
         // we want to bail clean here and let the foreground/BG
-        // refresher grab fresh creds instead.
+        // refresher grab fresh session params instead.
         //
-        // Now: parse `lifetime_sec` out of the credsJSON we already
+        // Now: parse `lifetime_sec` out of the session paramsJSON we already
         // loaded above (wire shape `{username, password, turn_servers,
-        // lifetime_sec}` from TURNCredsStore.vkCredsAsJSON) and gate
+        // lifetime_sec}` from TURNSession paramsStore.vkSession paramsAsJSON) and gate
         // on `age >= lifetime - 120 s`. lifetime_sec <= 0 falls back
         // to the historic 3480 s value so older entries (pre-refresh
         // schema) still age-check cleanly.
@@ -354,7 +354,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }()
         let safeBound: TimeInterval = lifetimeSec > 0 ? (lifetimeSec - cushionSec) : 3480
 
-        // Key written by `TURNCredsStore.save(_:)` alongside the JSON
+        // Key written by `TURNSession paramsStore.save(_:)` alongside the JSON
         // payload — see step C of feat/turn-autonomous-refresh.
         if let acquiredAt = defaults?.object(forKey: "tamizdat.vkTURNCredsAcquiredAt") as? Date {
             let age = Date().timeIntervalSince(acquiredAt)
@@ -507,7 +507,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// interface changes, the OS sockets the samizdat client opened on
     /// the old interface are stale (may RST or just hang); rebuilding
     /// the upstream-facing pool from scratch is the cheapest correct
-    /// fix and matches what every other production iOS proxy client
+    /// fix and matches what every other production iOS network adapter client
     /// does.
     private func startPathMonitor() {
         pathMonitor.pathUpdateHandler = { [weak self] path in
@@ -594,7 +594,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// Suppress ping-prober rewire loops when the selected path is TURN but
-    /// TURN cannot start until the main app refreshes expired VK credentials.
+    /// TURN cannot start until the main app refreshes expired VK session parameters.
     /// Rebuilding the H2 client every ~11 s in this state just closes flows and
     /// makes the connection look like it is "trying" for minutes.
     private func shouldDeferAutoRewireForPendingTURN() -> Bool {
@@ -708,8 +708,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func whitelistTargetConfigured(backup: String?, whitelistModeRaw: String) -> Bool {
         // H2 whitelist needs an explicit backup tamizdat:// URI. VK TURN does
         // not: peer host + password are derived from the Main URI and TURN
-        // creds live in App Group storage. Treating nil backup as "primary"
-        // here made manual Whitelist+TURN silently run H2/Main.
+        // session params live in App Group storage. Treating nil backup as "primary"
+        // here made manual Restricted+Relay silently run H2/Main.
         backup != nil || whitelistModeRaw == "vkTurn"
     }
 
@@ -843,7 +843,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             SocksstubSetPingProbeURL(url)
             completionHandler?("pingURLRefreshed".data(using: .utf8))
         case "refreshWhitelistProbes":
-            // IPA-D23: SettingsView's whitelist probe targets changed.
+            // IPA-D23: SettingsView's restricted-profile probe targets changed.
             // Re-read prefs and tell the detector to adopt them. The
             // excludedRoutes change requires a tunnel reconnect to take
             // effect (we don't currently rebuild network settings live);
@@ -852,7 +852,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
         case "refreshVKTurnCreds":
-            // Main app fetched fresh VK TURN creds and wrote them to the
+            // Main app fetched fresh VK TURN session params and wrote them to the
             // App Group. The active runner lives in THIS extension
             // process, so update it here; calling the gomobile bridge
             // in the main app only touches that process' idle Go runtime.
@@ -867,10 +867,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             let result = Self.refreshVKTurnCredsFromAppGroup()
             if result == "not running" {
-                // If the tunnel started before VK creds existed,
+                // If the tunnel started before VK session params existed,
                 // attachVKTurnUpstream() skipped. A later successful
                 // refresh should start the runner immediately, but only
-                // while the effective endpoint is Whitelist+TURN.
+                // while the effective endpoint is Restricted+Relay.
                 appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
                 Self.attachVKTurnUpstream()
                 completionHandler?("attachStarted".data(using: .utf8))
@@ -882,7 +882,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // at runner construction, so apply them by stopping the
             // current TURN runner and starting a fresh attach if TURN is
             // the active policy. H2/Main users just keep the saved value
-            // for the next Whitelist+TURN connect.
+            // for the next Restricted+Relay connect.
             let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
             appendExtLog("info: app requested VK TURN restart → workers=\(VKCredsPreferences.workers) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
             guard policy.usesTURN else {
@@ -958,12 +958,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "turnRunning": turnRunning ? 1 : 0,
                 "turnNetstackReady": turnNetstackReady ? 1 : 0,
                 "turnWorkers": VKCredsPreferences.workers,
-                // VK TURN relay credential status. IPA-D65b: the main
-                // app now acquires creds itself via WKWebView captcha
+                // VK TURN relay session parameter status. IPA-D65b: the main
+                // app now acquires session params itself via WKWebView verification challenge
                 // solving and writes them to App Group UserDefaults
-                // (`TURNCredsStore`). The extension only READS the
+                // (`TURNSession paramsStore`). The extension only READS the
                 // cache here — no VK API touch from inside the NE.
-                // The legacy `SocksstubTURNCredsSnapshot()` is kept on
+                // The legacy `SocksstubTURNSession paramsSnapshot()` is kept on
                 // the Go side as a no-op fallback for now but is no
                 // longer the source of truth.
                 "hasTURNCreds": TURNCredsStore.shared.isFresh,
@@ -1032,7 +1032,7 @@ misc:
         // IPA-A1: direct utun fd handoff to hev. Same pattern as
         // Tun2SocksKit, Shadowrocket, sing-box-with-hev configs etc.
         // KVO `socket.fileDescriptor` is the well-known private API
-        // every shipping iOS proxy app uses — wireguard-apple,
+        // every shipping iOS network adapter app uses — wireguard-apple,
         // sing-box-for-apple, Tun2SocksKit. Apple has not deprecated it.
         // Fallback fd-scanner kept as diagnostic for the rare case KVO
         // returns nil (typically when iCloud Private Relay's utun
@@ -1139,7 +1139,7 @@ misc:
     /// IPA-D23: turn a user-entered probe target ("8.8.8.8" or "google.com")
     /// into an IPv4 literal suitable for an NEIPv4Route /32 exclusion.
     /// IP literals pass through unchanged. Hostnames are resolved via the
-    /// system resolver with a 2 s budget; failure returns nil and the
+    /// system rehandler with a 2 s budget; failure returns nil and the
     /// caller skips the route (the detector will then surface that probe
     /// as a failure until the tunnel reconnects). IPv6 literals also
     /// return nil — we don't currently expose IPv6 excludedRoutes (the
@@ -1271,7 +1271,7 @@ misc:
         //
         // Earlier (IPA-F) we set dnsSettings = nil on the theory that iOS
         // mDNSResponder would scope DNS queries to the underlying Wi-Fi
-        // interface (IP_BOUND_IF) and bypass the tunnel. On iOS 17/18 with
+        // interface (IP_BOUND_IF) and alternate path the tunnel. On iOS 17/18 with
         // a default-route VPN, this is not what happens: with no
         // dnsSettings installed, iOS treats name resolution as broken
         // ("iPhone не подключен к интернету"), the captive-portal probe
@@ -1282,9 +1282,9 @@ misc:
         // backed by samizdat.Client.DialUDP, we can safely force DNS
         // (UDP/53) through the tunnel: hev wraps it as cmd=0x05, our
         // SocksStub opens a samizdat UDP tunnel to the configured
-        // resolver, and the response comes back the same way.
+        // rehandler, and the response comes back the same way.
         //
-        // IPA-D22 fix3 (DNS leak): the resolver IPs were 1.1.1.1 + 8.8.8.8
+        // IPA-D22 fix3 (DNS leak): the rehandler IPs were 1.1.1.1 + 8.8.8.8
         // — the SAME IPs we exclude above for WhitelistDetector canary.
         // Result: iOS sent DNS queries to 1.1.1.1, routing matched
         // excludedRoutes, packets went OUT VIA PHYSICAL Wi-Fi/cellular
@@ -1304,13 +1304,13 @@ misc:
         // `matchDomains = [""]` but did NOT set `matchDomainsNoSearch =
         // true`. On iOS 17/18 with split-DNS semantics this is the
         // documented difference between "every query goes to our DNS"
-        // vs "iOS still consults the system resolver in parallel /
-        // first for FQDNs". Production iOS proxy clients (sing-box-
+        // vs "iOS still consults the system rehandler in parallel /
+        // first for FQDNs". Production iOS network adapter clients (sing-box-
         // for-apple ExtensionProvider.swift, Hiddify, Streisand) all
         // set BOTH flags together — empty matchDomain alone is not a
         // reliable catch-all on iOS. The leak manifested as ChatGPT
         // and Roblox refusing the iPhone: app got a Russia-biased CDN
-        // IP from the leaked system DNS query (RU ISP resolver
+        // IP from the leaked system DNS query (RU ISP rehandler
         // returning RU-edge), then opened TCP to that RU-edge IP via
         // tunnel → exit IP Finland but destination is RU-edge of CDN
         // → CDN sees geo-mismatch → block. Setting
@@ -1322,10 +1322,10 @@ misc:
         //   sing-box-for-apple/ExtensionProvider/include/ExtensionProvider.swift
         //   Apple NEDNSSettings docs:
         //     matchDomainsNoSearch=true means "treat matchDomains as a
-        //     pure resolver-selection filter, do NOT also add them to
+        //     pure rehandler-selection filter, do NOT also add them to
         //     the system search list" — which is exactly what we want
         //     for [""] catch-all (otherwise iOS treats "" as a search
-        //     suffix and bypass FQDNs).
+        //     suffix and alternate path FQDNs).
         let dns = NEDNSSettings(servers: ["1.0.0.1", "8.8.4.4"])
         dns.matchDomains = [""]
         dns.matchDomainsNoSearch = true

@@ -1,93 +1,102 @@
 # tamizdat-ios
 
-iOS client for the tamizdat proxy protocol.
+Experimental iOS client for the Tamizdat packet-network stack.
 
+The project combines a SwiftUI control app, an iOS Network Extension, and a
+Go runtime built with `gomobile`. The public repository is intended to document
+build structure, signing requirements, and client-side integration points.
+
+## Architecture
+
+```text
+┌──────────────────────────────────────────────┐
+│ SwiftUI app                                  │
+│  ├─ profile/configuration editor             │
+│  ├─ status and diagnostics UI                │
+│  ├─ local notification preferences           │
+│  └─ Swift ↔ Go bridge                        │
+│                                              │
+│ Network Extension                            │
+│  ├─ PacketTunnelProvider lifecycle           │
+│  ├─ packet adapter                           │
+│  └─ gomobile client runtime                  │
+└──────────────────────────────────────────────┘
 ```
-┌─────────────────────────────────────┐
-│ App (SwiftUI)                       │
-│  ├─ ContentView   status + button   │
-│  ├─ ConfigPaste   modal             │
-│  ├─ LogView       modal             │
-│  └─ tamizdatBridge → Go shim ───────┼──► tamizdatClient.xcframework
-│                                     │      (gomobile bind ./mobile/tamizdat)
-│ tamizdat-tunnel (extension, stub)   │
-│  └─ PacketTunnelProvider            │
-└─────────────────────────────────────┘
+
+## Current status
+
+The CI pipeline builds a signed IPA from the public tree:
+
+```text
+Go sources → gomobile framework → Xcode project → archive/export → IPA artifact
 ```
 
-## Status
+The app stores a Tamizdat profile, creates the required iOS Network Extension
+configuration, starts/stops the extension, and exposes diagnostic status from the
+extension process back to the SwiftUI app.
 
-**Iteration 1 (current).** End-to-end pipeline (Go → gomobile → xcframework
-→ Xcode → IPA → Sideloadly → iPhone) is wired up. The Go shim parses real
-`tamizdat://` config blobs but `Connect()` is a simulation — no real
-network tunnel yet. Lets us validate UI + signing + extension target
-without the integration risk of the real tamizdat client.
+## Repository layout
 
-**Iteration 2 (next).** Replace the simulation with `tamizdat.NewClient`
-inside the PacketTunnelProvider extension, plus a tun2socks layer so all
-device traffic flows through the tunnel.
+```text
+mobile/                          # Go module used by gomobile
+  samizdat/                      # public gomobile entry points
+  socksstub/                     # iOS runtime bridge
+  upstream-tamizdat/             # embedded protocol module
 
-## Layout
-
-```
-mobile/                          # Go module — gomobile-friendly shim
-  go.mod
-  tamizdat/
-    tamizdat.go                  # API: Connect, Disconnect, Status, Logs, …
-    tamizdat_test.go
-
-tamizdat-ios/                    # main app target (SwiftUI)
+samizdat-ios/                    # SwiftUI app target
   App.swift
   ContentView.swift
-  ConfigPasteView.swift
+  SettingsView.swift
   LogView.swift
-  ConfigStore.swift              # Keychain-backed config persistence
-  tamizdatBridge.swift           # Swift wrapper around the Go shim
+  SamizdatBridge.swift
   Info.plist
-  tamizdat-ios.entitlements      # Network Extensions + App Group
+  samizdat-ios.entitlements
   Assets.xcassets/
 
-tamizdat-tunnel/                 # extension target (PacketTunnelProvider)
-  PacketTunnelProvider.swift     # iter1 stub
+samizdat-tunnel/                 # Network Extension target
+  PacketTunnelProvider.swift
   Info.plist
   tamizdat-tunnel.entitlements
 
-project.yml                      # XcodeGen config — generates .xcodeproj
-ExportOptions.plist              # Ad-hoc export, both bundle IDs
-.github/workflows/build.yml      # CI: Go bind + Xcode archive + upload IPA
+project.yml                      # XcodeGen config
+ExportOptions.plist              # Ad-hoc export options
+.github/workflows/build.yml      # CI build and IPA upload
 ```
 
-## Building
-
-Local Mac (optional):
+## Building locally on macOS
 
 ```sh
 brew install xcodegen go
 go install golang.org/x/mobile/cmd/gomobile@latest
 gomobile init
-( cd mobile && gomobile bind -target=ios -o ../Frameworks/tamizdatClient.xcframework ./tamizdat )
+( cd mobile && gomobile bind -target=ios -o ../Frameworks/SamizdatClient.xcframework ./samizdat ./socksstub )
 xcodegen generate
 open tamizdat-ios.xcodeproj
 ```
 
-Without a Mac (the actual deployment path):
+## CI build
 
+The normal build path is GitHub Actions:
+
+```text
+git push → GitHub Actions → signed IPA artifact
 ```
-git push                  → GitHub Actions builds → IPA artifact
-download artifact         → Sideloadly → iPhone
-```
+
+Required signing material is supplied via repository secrets. Do not commit
+certificates, provisioning profiles, passwords, API keys, session parameters, or
+runtime logs containing private values.
 
 ## Bundle / signing
 
 | Item | Value |
 |---|---|
 | Team ID | `DRMTP6V372` |
-| App bundle ID | `com.anarki.tamizdat-test` |
-| Tunnel bundle ID | `com.anarki.tamizdat-test.tunnel` |
-| App Group | `group.com.anarki.tamizdat-test` |
-| App profile | `tamizdat Test AdHoc` (Ad Hoc) |
-| Tunnel profile | `tamizdat Tunnel AdHoc` (Ad Hoc) |
-| Cert | Apple Distribution (1-year validity) |
+| App bundle ID | `com.anarki.samizdat-test` |
+| Extension bundle ID | `com.anarki.samizdat-test.tunnel` |
+| App Group | `group.com.anarki.samizdat-test` |
+| App profile | `Samizdat Test AdHoc` |
+| Extension profile | `Samizdat Tunnel AdHoc` |
+| Certificate | Apple Distribution |
 
 ## Required GitHub Secrets
 
@@ -95,6 +104,6 @@ download artifact         → Sideloadly → iPhone
 |---|---|
 | `BUILD_CERTIFICATE_BASE64` | base64 of the `.p12` |
 | `P12_PASSWORD` | password protecting the `.p12` |
-| `BUILD_PROVISION_PROFILE_BASE64` | base64 of `tamizdat Test AdHoc.mobileprovision` |
-| `BUILD_TUNNEL_PROVISION_PROFILE_BASE64` | base64 of `tamizdat Tunnel AdHoc.mobileprovision` |
-| `KEYCHAIN_PASSWORD` | any random string (temp keychain unlock) |
+| `BUILD_PROVISION_PROFILE_BASE64` | base64 of the app provisioning profile |
+| `BUILD_TUNNEL_PROVISION_PROFILE_BASE64` | base64 of the extension provisioning profile |
+| `KEYCHAIN_PASSWORD` | temporary CI keychain password |

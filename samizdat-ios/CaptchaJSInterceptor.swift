@@ -1,16 +1,16 @@
 import Foundation
 
-/// JS interceptor injected into the VK captcha page.
+/// JS interceptor injected into the VK verification challenge page.
 ///
-/// WHY a single source string: both `CaptchaWebViewManager` (auto path)
-/// and `ManualCaptchaSheet` (slider fallback) install the same hook —
+/// WHY a single source string: both the WebKit verification manager (auto path)
+/// and the manual verification sheet (slider fallback) install the same hook —
 /// override `fetch` + `XMLHttpRequest` so any response from
-/// `captchaNotRobot.check` is parsed for `success_token`. The token is
+/// `verification challengeNotRobot.check` is parsed for `success_token`. The token is
 /// then posted back to native code via
-/// `webkit.messageHandlers.tamizdatCaptcha.postMessage(...)`.
+/// `webkit.messageHandlers.tamizdatVerification challenge.postMessage(...)`.
 ///
-/// The Android donor (`amurcanov/proxy-turn-vk-android`) uses
-/// `WdttCaptcha.onSuccess/onError/onSliderDetected` on a Java bridge.
+/// The Android donor (`amurcanov/network adapter-turn-vk-android`) uses
+/// `WdttVerification challenge.onSuccess/onError/onSliderDetected` on a Java bridge.
 /// WKWebView has no `addJavascriptInterface`-equivalent — every message
 /// goes through one `WKScriptMessageHandler`, so we shape the payload
 /// as `{ kind: "success" | "error" | "slider", value: ... }` and
@@ -18,7 +18,7 @@ import Foundation
 ///
 /// Idempotency: `window.__tamizdat_interceptor_installed` gates the
 /// install so re-running `evaluateJavaScript` on every navigation event
-/// (start, finish, redirect) is safe — VK's captcha SPA does internal
+/// (start, finish, redirect) is safe — VK's verification challenge SPA does internal
 /// route changes that we'd otherwise hook twice.
 enum CaptchaJSInterceptor {
 
@@ -29,12 +29,12 @@ enum CaptchaJSInterceptor {
 
     /// Token returned by the slider-detection JS when the page already
     /// shows a slider instead of the simple checkbox. Caller throws
-    /// `CaptchaError.sliderRequired` and falls back to `ManualCaptchaSheet`.
+    /// verification-required signal and falls back to the manual verification sheet.
     static let errorSliderDetected = "slider_detected"
 
     /// Extracts `success_token` when VK returns it through a top-level
-    /// navigation instead of the intercepted `captchaNotRobot.check`
-    /// XHR/fetch body. Some manual captcha variants finish with a normal
+    /// navigation instead of the intercepted `verification challengeNotRobot.check`
+    /// XHR/fetch body. Some manual verification variants finish with a normal
     /// redirect/window.open; without this, the visible WKWebView appears
     /// frozen after the user taps the pass button.
     static func successToken(from url: URL?) -> String? {

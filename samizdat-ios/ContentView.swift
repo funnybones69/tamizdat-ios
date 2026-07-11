@@ -222,8 +222,8 @@ struct ContentView: View {
             }
             .environment(\.themeTokens, theme)
         }
-        // IPA-D65b: slider-fallback for VK Smart Captcha. The hidden
-        // WKWebView solver throws `CaptchaError.sliderRequired` when
+        // IPA-D65b: slider-fallback for VK Smart Verification challenge. The hidden
+        // WKWebView handler throws verification-required signal when
         // VK swaps in a slider; the refresher publishes a
         // `manualChallenge` here, we present a modal sheet and pass
         // the user-solved success_token back into the refresh task.
@@ -453,8 +453,8 @@ struct ContentView: View {
     /// TURN tile glyph based on four states:
     ///   "▲" — TURN netstack ready and routing can use it
     ///   "…" — runner alive, waiting for WG config/netstack
-    ///   "✓" — creds cached but not actively used
-    ///   "—" — no creds, no upstream
+    ///   "✓" — session params cached but not actively used
+    ///   "—" — no session params, no upstream
     private var turnTileValue: String {
         if lampStore.turnNetstackReady {
             return "▲"

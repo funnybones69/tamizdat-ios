@@ -422,7 +422,7 @@ final class ICMPPinger {
         return nil
     }
 
-    /// Resolves a hostname via the system resolver (which, in our
+    /// Resolves a hostname via the system rehandler (which, in our
     /// extension with DNS-via-tunnel, hits 1.0.0.1/8.8.4.4 through the
     /// tunnel). Returns the first usable IPv4 address; falls back to
     /// the first IPv6 if no v4 is returned. Synchronous with a hard
