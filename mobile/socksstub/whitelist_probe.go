@@ -25,15 +25,16 @@ type whitelistProbeCycleRequest struct {
 }
 
 type whitelistProbeTargetResult struct {
-	Group      string `json:"group"`
-	Host       string `json:"host"`
-	Port       int    `json:"port"`
-	TCPOK      bool   `json:"tcp_ok"`
-	TLSOK      bool   `json:"tls_ok"`
-	Pass       bool   `json:"pass"`
-	ErrorClass string `json:"error_class,omitempty"`
-	Error      string `json:"error,omitempty"`
-	DurationMs int64  `json:"duration_ms"`
+	Group         string `json:"group"`
+	Host          string `json:"host"`
+	Port          int    `json:"port"`
+	TCPOK         bool   `json:"tcp_ok"`
+	TLSOK         bool   `json:"tls_ok"`
+	Pass          bool   `json:"pass"`
+	ErrorClass    string `json:"error_class,omitempty"`
+	Error         string `json:"error,omitempty"`
+	RemoteAddress string `json:"remote_address,omitempty"`
+	DurationMs    int64  `json:"duration_ms"`
 }
 
 type whitelistProbeCycleResult struct {
@@ -194,6 +195,7 @@ func runTCPThenTLSProbe(ctx context.Context, host string, port int, ifaceIndex i
 		return res
 	}
 	res.TCPOK = true
+	res.RemoteAddress = tcpConn.RemoteAddr().String()
 	_ = tcpConn.Close()
 
 	plainConn, err := dialer.DialContext(ctx, "tcp", addr)

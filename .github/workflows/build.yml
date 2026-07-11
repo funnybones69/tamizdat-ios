@@ -17,6 +17,9 @@ jobs:
       ARCHIVE_PATH: ${{ github.workspace }}/build/samizdat-ios.xcarchive
       EXPORT_PATH: ${{ github.workspace }}/build/export
       FRAMEWORK_OUT: ${{ github.workspace }}/Frameworks/SamizdatClient.xcframework
+      # This private repo's run numbering started after public build 281.
+      # Keep operator-facing IPA/build numbers monotonic: run 4 → build 282.
+      BUILD_NUMBER_OFFSET: 278
 
     steps:
       - name: Checkout
@@ -125,7 +128,8 @@ jobs:
         # bake the same filename into Info.plist for the main-screen label.
         run: |
           SHORT_SHA=${GITHUB_SHA:0:7}
-          NAME="Tamizdat-0.2.${GITHUB_RUN_NUMBER}-${SHORT_SHA}-build-${GITHUB_RUN_NUMBER}"
+          BUILD_NUM=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
+          NAME="Tamizdat-0.2.${BUILD_NUM}-${SHORT_SHA}-build-${BUILD_NUM}"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "Artifact will be: ${NAME}.ipa"
 
@@ -136,8 +140,8 @@ jobs:
           # so the in-app version label changes every build (and tracks
           # the source revision).
           GIT_SHA=$(git rev-parse --short HEAD)
-          MARKETING="0.2.${GITHUB_RUN_NUMBER}-${GIT_SHA}"
-          BUILD_NUM="${GITHUB_RUN_NUMBER}"
+          BUILD_NUM=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
+          MARKETING="0.2.${BUILD_NUM}-${GIT_SHA}"
           IPA_ARTIFACT_NAME="${{ steps.ipa_name.outputs.name }}.ipa"
           echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM IPA_ARTIFACT_NAME=$IPA_ARTIFACT_NAME"
           xcodebuild archive \

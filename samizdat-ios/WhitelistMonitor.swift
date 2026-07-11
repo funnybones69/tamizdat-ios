@@ -21,6 +21,11 @@ final class WhitelistMonitor: ObservableObject {
 
     private var task: Task<Void, Never>?
     private var generation = 0
+    private var pathMonitor: NWPathMonitor?
+    private let pathMonitorQueue = DispatchQueue(
+        label: "com.anarki.samizdat-test.whitelist-main-path",
+        qos: .utility
+    )
 
     // Consecutive-result counters — switching happens only after
     // `successesNeeded` consecutive identical decisive verdicts.
@@ -32,10 +37,16 @@ final class WhitelistMonitor: ObservableObject {
         guard task == nil else { return }
         generation += 1
         let gen = generation
+        let monitor = NWPathMonitor()
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
         // Restore persisted counters so progress survives start/stop cycles.
         whitelistCount = WhitelistStatusStore.whitelistConsecutiveCount
         freeCount = WhitelistStatusStore.freeConsecutiveCount
-        TURNLog.info("whitelist", "monitor started method=tcp_tls_sni icmp=not_used threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
+        let build = (Bundle.main.object(forInfoDictionaryKey: "IPAArtifactName") as? String)
+            ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+            ?? "unknown"
+        TURNLog.info("whitelist", "monitor started build=\(build) method=tcp_tls_sni icmp=not_used threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
         task = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.runCycle(generation: gen)
@@ -48,6 +59,8 @@ final class WhitelistMonitor: ObservableObject {
         generation += 1
         task?.cancel()
         task = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
         TURNLog.info("whitelist", "monitor stopped")
     }
 
@@ -59,8 +72,9 @@ final class WhitelistMonitor: ObservableObject {
             return
         }
         let threshold = WhitelistProbePreferences.successesNeeded
-        TURNLog.info("whitelist", "monitor cycle start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
-        let result = await WhitelistProbeEngine.runAsync()
+        let pathSelection = WhitelistProbeEngine.pathSelection(pathMonitor?.currentPath)
+        TURNLog.info("whitelist", "monitor cycle start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
+        let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex)
         guard gen == generation, !Task.isCancelled else { return }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
             TURNLog.info("whitelist", "monitor probe \(line)")

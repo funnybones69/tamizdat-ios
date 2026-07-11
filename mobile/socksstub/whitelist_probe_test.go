@@ -70,6 +70,30 @@ func TestWhitelistProbeClassifiesPartialWhenSomeForeignPass(t *testing.T) {
 	}
 }
 
+func TestWhitelistProbeJSONIncludesRemoteAddress(t *testing.T) {
+	res := whitelistProbeCycleResult{
+		OK:             true,
+		Classification: "normal",
+		Targets: []whitelistProbeTargetResult{{
+			Group:         "foreign",
+			Host:          "example.com",
+			Port:          443,
+			TCPOK:         true,
+			TLSOK:         true,
+			Pass:          true,
+			RemoteAddress: "192.0.2.10:443",
+		}},
+	}
+	out := marshalWhitelistProbeResult(res)
+	var decoded whitelistProbeCycleResult
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("bad json: %v out=%s", err, out)
+	}
+	if len(decoded.Targets) != 1 || decoded.Targets[0].RemoteAddress != "192.0.2.10:443" {
+		t.Fatalf("remote address missing: %+v", decoded.Targets)
+	}
+}
+
 func TestRunWhitelistProbeCycleJSONDefaultsAndMarshals(t *testing.T) {
 	out := RunWhitelistProbeCycleJSON(`{"timeout_ms":1,"foreign":["203.0.113.1","198.51.100.1"],"domestic":["192.0.2.1"]}`)
 	var res whitelistProbeCycleResult

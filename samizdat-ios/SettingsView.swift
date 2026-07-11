@@ -569,7 +569,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("Comma-separated target lists. Domestic pass + foreign fail across ≥2 controls flips to Whitelist after the threshold. Apply live while connected; VPN-off monitor uses the same probes.")
+                Text("Comma-separated target lists. Domestic majority pass + all foreign controls fail flips to Whitelist after the threshold. Apply live while connected; VPN-off monitor uses the same probes.")
                     .font(.geist(.regular, size: 11))
                     .foregroundStyle(theme.textDim)
             }

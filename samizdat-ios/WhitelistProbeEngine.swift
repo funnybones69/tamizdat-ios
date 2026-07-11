@@ -1,5 +1,11 @@
 import Foundation
+import Network
 import SamizdatClient
+
+struct WhitelistProbePathSelection {
+    let interfaceIndex: UInt32?
+    let summary: String
+}
 
 struct WhitelistProbeCycleConfig: Encodable {
     let foreign: [String]
@@ -36,6 +42,7 @@ struct WhitelistProbeCycleResult: Decodable {
         let pass: Bool
         let errorClass: String?
         let error: String?
+        let remoteAddress: String?
         let durationMs: Int64
 
         enum CodingKeys: String, CodingKey {
@@ -43,6 +50,7 @@ struct WhitelistProbeCycleResult: Decodable {
             case tcpOK = "tcp_ok"
             case tlsOK = "tls_ok"
             case errorClass = "error_class"
+            case remoteAddress = "remote_address"
             case durationMs = "duration_ms"
         }
     }
@@ -81,6 +89,57 @@ struct WhitelistProbeCycleResult: Decodable {
 enum WhitelistProbeEngine {
     static let defaultTimeoutMs = 4_000
     static let defaultPort = 443
+
+    /// Select an explicit physical interface only when NWPath says that type
+    /// is in use and there is exactly one matching candidate. `availableInterfaces`
+    /// may contain Wi-Fi plus multiple cellular interfaces (dual SIM/eSIM); binding
+    /// to the first entry can send probes over the wrong or inactive data line.
+    /// In ambiguous cases interfaceIndex stays nil and NECP/default routing chooses
+    /// the actual underlying path for the provider process.
+    static func pathSelection(_ path: NWPath?) -> WhitelistProbePathSelection {
+        guard let path else {
+            return WhitelistProbePathSelection(interfaceIndex: nil, summary: "status=missing bind=default")
+        }
+
+        let status: String
+        switch path.status {
+        case .satisfied: status = "satisfied"
+        case .unsatisfied: status = "unsatisfied"
+        case .requiresConnection: status = "requiresConnection"
+        @unknown default: status = "unknown"
+        }
+
+        let physicalTypes: [(NWInterface.InterfaceType, String)] = [
+            (.wifi, "wifi"),
+            (.cellular, "cellular"),
+            (.wiredEthernet, "wired")
+        ]
+        let usedKinds = physicalTypes.filter { path.usesInterfaceType($0.0) }
+        let usedNames = usedKinds.map { $0.1 }
+        let candidates = path.availableInterfaces.filter { iface in
+            usedKinds.contains { $0.0 == iface.type } && !iface.name.hasPrefix("utun")
+        }
+        let candidateText = candidates
+            .map { "\($0.name)#\($0.index)" }
+            .sorted()
+            .joined(separator: ",")
+        let bindIndex: UInt32? = path.status == .satisfied && candidates.count == 1
+            ? UInt32(candidates[0].index)
+            : nil
+        let bindText = bindIndex.map(String.init) ?? "default"
+        let summary = [
+            "status=\(status)",
+            "used=\(usedNames.isEmpty ? "other" : usedNames.joined(separator: "+"))",
+            "candidates=\(candidateText.isEmpty ? "none" : candidateText)",
+            "bind=\(bindText)",
+            "expensive=\(path.isExpensive)",
+            "constrained=\(path.isConstrained)",
+            "ipv4=\(path.supportsIPv4)",
+            "ipv6=\(path.supportsIPv6)",
+            "dns=\(path.supportsDNS)"
+        ].joined(separator: " ")
+        return WhitelistProbePathSelection(interfaceIndex: bindIndex, summary: summary)
+    }
 
     static func run(interfaceIndex: UInt32? = nil) -> WhitelistProbeCycleResult {
         let cfg = WhitelistProbeCycleConfig(
@@ -132,7 +191,8 @@ enum WhitelistProbeEngine {
             let pass = target.pass ? "yes" : "no"
             let errClass = sanitize(target.errorClass ?? "")
             let err = sanitize(target.error ?? "")
-            lines.append("target group=\(target.group) host=\(target.host):\(target.port) tcp=\(tcp) tls=\(tls) pass=\(pass) dur=\(target.durationMs)ms errorClass=\(errClass.isEmpty ? "none" : errClass) error=\(err.isEmpty ? "none" : err)")
+            let remote = sanitize(target.remoteAddress ?? "")
+            lines.append("target group=\(target.group) host=\(target.host):\(target.port) remote=\(remote.isEmpty ? "none" : remote) tcp=\(tcp) tls=\(tls) pass=\(pass) dur=\(target.durationMs)ms errorClass=\(errClass.isEmpty ? "none" : errClass) error=\(err.isEmpty ? "none" : err)")
         }
         if let error = result.error, !error.isEmpty {
             lines.append("engineError=\(sanitize(error))")

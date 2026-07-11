@@ -154,13 +154,14 @@ final class WhitelistDetector {
             scheduleNextProbe(after: Self.normalCadence)
             return
         }
-        let iface = pickPhysicalInterfaceIndex()
+        let pathSelection = WhitelistProbeEngine.pathSelection(pathProvider())
+        let iface = pathSelection.interfaceIndex
         let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
         let baseCadence = onBackup ? Self.onBackupCadence : Self.normalCadence
         let cadence = ProcessInfo.processInfo.isLowPowerModeEnabled ? baseCadence * 3 : baseCadence
-        log("info: detector cycle start method=tcp_tls_sni icmp=not_used active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded) iface=\(iface.map(String.init) ?? "none") foreign=\(foreignTargets) domestic=\(domesticTargets)")
+        log("info: detector cycle start method=tcp_tls_sni icmp=not_used active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded) path={\(pathSelection.summary)} foreign=\(foreignTargets) domestic=\(domesticTargets)")
         if iface == nil {
-            log("warn: detector probe — no physical interface available; Go probe will rely on NECP/default route")
+            log("info: detector probe uses NECP/default route (no unambiguous physical interface)")
         }
 
         probeGeneration += 1
@@ -197,23 +198,6 @@ final class WhitelistDetector {
         case .partial, .anomalous, .error:
             return .uncertain
         }
-    }
-
-    /// Returns the index of the first non-loopback, non-utun physical
-    /// interface on the current path. Passed into Go so Darwin sockets can use
-    /// IP_BOUND_IF/IPV6_BOUND_IF when available. The provider's own sockets are
-    /// also normally NECP-excluded from the tunnel, but explicit binding is a
-    /// useful guard for non-includeAllNetworks tunnels.
-    private func pickPhysicalInterfaceIndex() -> UInt32? {
-        guard let path = pathProvider() else { return nil }
-        // Prefer wifi → cellular → wired.
-        let order: [NWInterface.InterfaceType] = [.wifi, .cellular, .wiredEthernet]
-        for kind in order {
-            if let iface = path.availableInterfaces.first(where: { $0.type == kind }) {
-                return UInt32(iface.index)
-            }
-        }
-        return nil
     }
 
     // MARK: – decisions
