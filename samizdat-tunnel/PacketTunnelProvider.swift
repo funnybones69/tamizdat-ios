@@ -518,17 +518,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func onPathUpdate(_ path: Network.NWPath) {
-        // Forward path-satisfied state to the WhitelistDetector so it
-        // pauses probes during a network outage (lift / forest / metro).
+        // Compose a stable interface fingerprint first so the detector can
+        // reset confidence on satisfied→satisfied Wi-Fi/cellular/SIM changes.
         let satisfied = (path.status == .satisfied)
-        if satisfied != lastPathSatisfied {
-            lastPathSatisfied = satisfied
-            whitelistDetector?.notePathChange(satisfied: satisfied)
-        }
-
-        // Compose a stable interface fingerprint: type + name(s). This
-        // avoids treating "same Wi-Fi, just IP renewed" as a change.
         let kind = describePath(path)
+        let detectorPath = WhitelistProbeEngine.pathSelection(path)
+        whitelistDetector?.notePathChange(
+            satisfied: satisfied,
+            fingerprint: detectorPath.summary
+        )
+        lastPathSatisfied = satisfied
+
         let prev = lastPathInterfaceID
         lastPathInterfaceID = kind
 
@@ -569,27 +569,31 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if path.status != Network.NWPath.Status.satisfied {
             return "unsatisfied"
         }
-        // Pick the dominant interface type for label purposes.
+        let activeType: NWInterface.InterfaceType?
         let typeName: String
-        if path.usesInterfaceType(NWInterface.InterfaceType.wifi) {
+        if path.usesInterfaceType(.wifi) {
+            activeType = .wifi
             typeName = "wifi"
-        } else if path.usesInterfaceType(NWInterface.InterfaceType.cellular) {
+        } else if path.usesInterfaceType(.cellular) {
+            activeType = .cellular
             typeName = "cellular"
-        } else if path.usesInterfaceType(NWInterface.InterfaceType.wiredEthernet) {
+        } else if path.usesInterfaceType(.wiredEthernet) {
+            activeType = .wiredEthernet
             typeName = "wired"
-        } else if path.usesInterfaceType(NWInterface.InterfaceType.loopback) {
+        } else if path.usesInterfaceType(.loopback) {
+            activeType = .loopback
             typeName = "loopback"
         } else {
+            activeType = nil
             typeName = "other"
         }
-        var seenNames = Set<String>()
         let names = path.availableInterfaces.compactMap { iface -> String? in
-            let name = iface.name
-            guard !name.hasPrefix("utun"), seenNames.insert(name).inserted else {
-                return nil
-            }
-            return name
-        }.joined(separator: ",")
+            guard !iface.name.hasPrefix("utun") else { return nil }
+            if let activeType, iface.type != activeType { return nil }
+            return iface.name
+        }
+        .sorted()
+        .joined(separator: ",")
         return "\(typeName)[\(names)]"
     }
 
@@ -722,7 +726,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return hasWhitelistTarget ? .backup : .primary
         case .auto:
             guard hasWhitelistTarget else { return .primary }
-            return WhitelistStatusStore.activeEndpoint == .backup ? .backup : .primary
+            return WhitelistStatusStore.trustedAutoEndpoint
         }
     }
 
@@ -745,11 +749,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         case .backup:
             return backup ?? primary
         case .auto:
-            // Detector's effective choice; defaults to primary on first run.
-            switch WhitelistStatusStore.activeEndpoint {
-            case .backup: return backup ?? primary
-            default:      return primary
-            }
+            return WhitelistStatusStore.trustedAutoEndpoint == .backup
+                ? (backup ?? primary)
+                : primary
         }
     }
 
@@ -801,9 +803,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             },
             pathProvider: { [weak self] in self?.pathMonitor.currentPath }
         )
-        // Seed with current path-status so first-cycle decisions don't
-        // trip on a stale "satisfied" assumption.
-        detector.notePathChange(satisfied: lastPathSatisfied)
+        // Seed with current path status/fingerprint so first-cycle decisions
+        // cannot inherit confidence from another physical path.
+        detector.notePathChange(
+            satisfied: lastPathSatisfied,
+            fingerprint: lastPathInterfaceID ?? "uninitialized"
+        )
         whitelistDetector = detector
         detector.start()
     }
@@ -1136,46 +1141,48 @@ misc:
         return best >= 0 ? best : nil
     }
 
-    /// IPA-D23: turn a user-entered probe target ("8.8.8.8" or "google.com")
-    /// into an IPv4 literal suitable for an NEIPv4Route /32 exclusion.
-    /// IP literals pass through unchanged. Hostnames are resolved via the
-    /// system rehandler with a 2 s budget; failure returns nil and the
-    /// caller skips the route (the detector will then surface that probe
-    /// as a failure until the tunnel reconnects). IPv6 literals also
-    /// return nil — we don't currently expose IPv6 excludedRoutes (the
-    /// tunnel is v4-only by Phase 2.5 design).
-    private static func resolveProbeTargetIPv4(_ target: String, log: (String) -> Void) -> String? {
+    /// Resolve every current IPv4 answer for a probe target so DNS answer
+    /// ordering cannot make the Go dialer select an address that was not
+    /// excluded when tunnel settings were installed.
+    private static func resolveProbeTargetIPv4(_ target: String, log: (String) -> Void) -> [String] {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return nil }
-        // Already an IPv4 literal?
+        if trimmed.isEmpty { return [] }
         var v4 = in_addr()
         if inet_pton(AF_INET, trimmed, &v4) == 1 {
-            return trimmed
+            return [trimmed]
         }
-        // IPv6 literal — explicitly skip (v4-only tunnel, no v6 routes).
         var v6 = in6_addr()
         if inet_pton(AF_INET6, trimmed, &v6) == 1 {
             log("info: probe target \(trimmed) is IPv6 literal — skipping v4 exclusion")
-            return nil
+            return []
         }
-        // Hostname — synchronous resolve with 2 s budget.
+
         var hints = addrinfo()
         hints.ai_family = AF_INET
         hints.ai_socktype = SOCK_STREAM
         let sem = DispatchSemaphore(value: 0)
-        var found: String?
+        var found: [String] = []
         DispatchQueue.global(qos: .utility).async {
             var res: UnsafeMutablePointer<addrinfo>?
             defer { if let res = res { freeaddrinfo(res) } }
-            if getaddrinfo(trimmed, nil, &hints, &res) != 0 {
-                sem.signal(); return
+            guard getaddrinfo(trimmed, nil, &hints, &res) == 0 else {
+                sem.signal()
+                return
             }
-            if let head = res {
-                var addr = head.pointee.ai_addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr }
-                var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-                if inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
-                    found = String(cString: buf)
+            var cursor = res
+            var seen = Set<String>()
+            while let item = cursor {
+                if item.pointee.ai_family == AF_INET, let raw = item.pointee.ai_addr {
+                    var addr = raw.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+                        $0.pointee.sin_addr
+                    }
+                    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+                    if inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+                        let ip = String(cString: buf)
+                        if seen.insert(ip).inserted { found.append(ip) }
+                    }
                 }
+                cursor = item.pointee.ai_next
             }
             sem.signal()
         }
@@ -1249,17 +1256,20 @@ misc:
         probeTargets.append(contentsOf: WhitelistProbePreferences.domesticAllowlistedTargets)
         var addedProbeIPs = Set<String>()
         for target in probeTargets {
-            guard let ip = Self.resolveProbeTargetIPv4(target, log: appendExtLog) else {
+            let ips = Self.resolveProbeTargetIPv4(target, log: appendExtLog)
+            if ips.isEmpty {
                 appendExtLog("warn: probe target \(target) — could not resolve to IPv4, route skipped")
                 continue
             }
-            if addedProbeIPs.contains(ip) {
-                appendExtLog("info: probe target \(target) → \(ip) already excluded (deduped)")
-                continue
+            for ip in ips {
+                if addedProbeIPs.contains(ip) {
+                    appendExtLog("info: probe target \(target) → \(ip) already excluded (deduped)")
+                    continue
+                }
+                addedProbeIPs.insert(ip)
+                appendExtLog("info: probe target \(target) → excludedRoute \(ip)/32")
+                excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
             }
-            addedProbeIPs.insert(ip)
-            appendExtLog("info: probe target \(target) → excludedRoute \(ip)/32")
-            excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
         }
         ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4

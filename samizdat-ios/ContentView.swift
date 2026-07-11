@@ -473,7 +473,7 @@ struct ContentView: View {
     ///   - auto                 → WhitelistStatusStore.activeEndpoint
     private var effectiveEndpoint: EndpointMode {
         if EndpointModeStore.current == .auto {
-            return whitelistActiveEndpoint
+            return WhitelistStatusStore.trustedAutoEndpoint
         }
         return EndpointModeStore.current
     }
@@ -482,7 +482,7 @@ struct ContentView: View {
         guard WhitelistMode.current == .vkTurn else { return false }
         let mode = EndpointModeStore.current
         if mode == .backup { return true }
-        if mode == .auto && WhitelistStatusStore.activeEndpoint == .backup { return true }
+        if mode == .auto && WhitelistStatusStore.trustedAutoEndpoint == .backup { return true }
         return false
     }
 

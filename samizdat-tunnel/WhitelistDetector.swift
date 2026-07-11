@@ -35,12 +35,14 @@ final class WhitelistDetector {
     // Target-list display strings (re-read on applyConfig).
     private var foreignTargets: String = WhitelistProbePreferences.testHost
     private var domesticTargets: String = WhitelistProbePreferences.whitelistHost
+    private var configSignature = ""
 
     // State.
     private var lastSwitchedAt = Date.distantPast
     private var failbackSuccesses = 0
     private var whitelistSuccesses = 0
     private var isPathSatisfied = true
+    private var lastPathFingerprint: String?
     private var stopped = false
     private var probeGeneration = 0
 
@@ -57,9 +59,12 @@ final class WhitelistDetector {
             guard let self else { return }
             self.stopped = false
             self.probeGeneration += 1
-            // Restore persisted counters so progress survives extension restart.
-            self.failbackSuccesses = WhitelistStatusStore.failbackSuccesses
-            self.whitelistSuccesses = WhitelistStatusStore.whitelistSuccessesExtension
+            // Consecutive confidence is local to this detector instance. A
+            // previous extension/app process may have observed another path.
+            self.failbackSuccesses = 0
+            self.whitelistSuccesses = 0
+            WhitelistStatusStore.failbackSuccesses = 0
+            WhitelistStatusStore.whitelistSuccessesExtension = 0
             self.applyConfigLocked()
             self.scheduleNextProbe(after: 2)
             self.log("info: WhitelistDetector started method=tcp_tls_sni icmp=not_used threshold=\(Self.failbackSuccessesNeeded) interval=\(Int(Self.normalCadence))s foreign=\(self.foreignTargets) domestic=\(self.domesticTargets)")
@@ -95,36 +100,52 @@ final class WhitelistDetector {
     private func applyConfigLocked() {
         let f = WhitelistProbePreferences.testHost
         let d = WhitelistProbePreferences.whitelistHost
+        let signature = "\(f)|\(d)|\(WhitelistProbePreferences.successesNeeded)|\(WhitelistProbePreferences.probeInterval)"
+        let changed = !configSignature.isEmpty && signature != configSignature
         if f != foreignTargets || d != domesticTargets {
             log("info: detector targets updated: foreign=\(f) domestic=\(d)")
-            foreignTargets = f
-            domesticTargets = d
+        }
+        foreignTargets = f
+        domesticTargets = d
+        configSignature = signature
+        if changed {
             probeGeneration += 1
+            resetProgressLocked(reason: "probe configuration changed")
+            scheduleNextProbe(after: 1)
         }
     }
 
-    /// Notify the detector that NWPath status flipped. Resets per-cycle
-    /// state so we don't carry stale failure counts across a reconnect.
-    func notePathChange(satisfied: Bool) {
+    /// Notify the detector about every physical-path update. Consecutive
+    /// confidence cannot cross Wi-Fi/cellular/SIM changes even when both old
+    /// and new NWPath values are `.satisfied`.
+    func notePathChange(satisfied: Bool, fingerprint: String) {
         queue.async { [weak self] in
-            guard let self else { return }
-            let was = self.isPathSatisfied
+            guard let self, !self.stopped else { return }
+            let statusChanged = self.isPathSatisfied != satisfied
+            let pathChanged = self.lastPathFingerprint != nil
+                && self.lastPathFingerprint != fingerprint
             self.isPathSatisfied = satisfied
-            if was != satisfied {
-                self.probeGeneration += 1
-                self.failbackSuccesses = 0
-                self.whitelistSuccesses = 0
-                WhitelistStatusStore.failbackSuccesses = 0
-                WhitelistStatusStore.whitelistSuccessesExtension = 0
-                if !satisfied {
-                    WhitelistStatusStore.current = .noNetwork
-                    self.log("info: detector paused (path unsatisfied)")
-                } else {
-                    WhitelistStatusStore.current = .unknown
-                    self.log("info: detector resumed (path satisfied)")
-                }
+            self.lastPathFingerprint = fingerprint
+            guard statusChanged || pathChanged else { return }
+
+            self.probeGeneration += 1
+            self.resetProgressLocked(reason: "network path changed → \(fingerprint)")
+            if !satisfied {
+                WhitelistStatusStore.current = .noNetwork
+                self.log("info: detector paused (path unsatisfied)")
+            } else {
+                WhitelistStatusStore.current = .unknown
+                self.log("info: detector resumed on fresh path")
+                self.scheduleNextProbe(after: 1)
             }
         }
+    }
+
+    private func resetProgressLocked(reason: String) {
+        failbackSuccesses = 0
+        whitelistSuccesses = 0
+        WhitelistStatusStore.resetDetectionProgress()
+        log("info: detector progress reset — \(reason)")
     }
 
     // MARK: – cycle
@@ -175,7 +196,9 @@ final class WhitelistDetector {
                     self.log("info: detector probe \(line)")
                 }
                 self.handleOutcome(Self.outcome(from: result))
-                self.scheduleNextProbe(after: cadence)
+                let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && self.whitelistSuccesses > 0)
+                    || (WhitelistStatusStore.activeEndpoint == .backup && self.failbackSuccesses > 0)
+                self.scheduleNextProbe(after: switchPending ? 5 : cadence)
             }
         }
     }
@@ -244,10 +267,9 @@ final class WhitelistDetector {
             WhitelistStatusStore.current = .noNetwork
         }
 
-        // Persist counters across extension lifecycle so they survive
-        // VPN reconnect / extension restart.
-        WhitelistStatusStore.failbackSuccesses = failbackSuccesses
-        WhitelistStatusStore.whitelistSuccessesExtension = whitelistSuccesses
+        // Keep counters process-local; only the current verdict/endpoint cross
+        // the App Group boundary. Persisting partial confidence made a fresh
+        // detector inherit results from another network.
         log("info: detector counters status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded)")
     }
 

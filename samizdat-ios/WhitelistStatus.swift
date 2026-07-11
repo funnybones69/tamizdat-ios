@@ -22,6 +22,13 @@ enum WhitelistStatusStore {
     private static let updatedAtKey = "whitelistStatusUpdatedAt"
     private static let activeEndpointKey = "whitelistActiveEndpoint"
 
+    /// The extension's slowest normal cadence is backup × Low Power Mode
+    /// (2 × 3). Keep one extra interval of slack before treating a verdict as
+    /// stale, while retaining the historical 200 s minimum.
+    private static var autoDecisionMaxAge: TimeInterval {
+        max(200, TimeInterval(WhitelistProbePreferences.probeInterval * 7))
+    }
+
     // Main-app WhitelistMonitor consecutive-result counters
     private static let whitelistCountKey = "whitelistConsecutiveCount"
     private static let freeCountKey = "freeConsecutiveCount"
@@ -54,6 +61,19 @@ enum WhitelistStatusStore {
         let then = defaults?.double(forKey: updatedAtKey) ?? 0
         guard then > 0 else { return .infinity }
         return Date().timeIntervalSince1970 - then
+    }
+
+    /// Auto mode must not bootstrap a new tunnel from an arbitrarily old App
+    /// Group endpoint. A decisive, recently-written status is required; the
+    /// detector then refreshes that timestamp on every completed cycle.
+    static var trustedAutoEndpoint: EndpointMode {
+        guard ageSeconds <= autoDecisionMaxAge else { return .primary }
+        switch current {
+        case .detected, .off:
+            return activeEndpoint == .backup ? .backup : .primary
+        case .unknown, .frozen, .noNetwork:
+            return .primary
+        }
     }
 
     /// Which endpoint the detector is currently routing through. Mirrors
@@ -95,13 +115,22 @@ enum WhitelistStatusStore {
         set { defaults?.set(newValue, forKey: whitelistSuccessesKey) }
     }
 
-    static func reset() {
+    /// Consecutive probe results are process/path local. Clear them whenever
+    /// the network, target set, threshold, or detector owner changes; carrying
+    /// 2/3 successes from another carrier path makes identical phones diverge.
+    static func resetDetectionProgress(preserveActiveEndpoint: Bool = true) {
         defaults?.removeObject(forKey: statusKey)
         defaults?.removeObject(forKey: updatedAtKey)
-        defaults?.removeObject(forKey: activeEndpointKey)
         defaults?.removeObject(forKey: whitelistCountKey)
         defaults?.removeObject(forKey: freeCountKey)
         defaults?.removeObject(forKey: failbackSuccessesKey)
         defaults?.removeObject(forKey: whitelistSuccessesKey)
+        if !preserveActiveEndpoint {
+            defaults?.removeObject(forKey: activeEndpointKey)
+        }
+    }
+
+    static func reset() {
+        resetDetectionProgress(preserveActiveEndpoint: false)
     }
 }

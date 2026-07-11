@@ -112,9 +112,19 @@ final class VPNProfileStore {
     /// VPN. Writes EndpointModeStore.current first (source of truth)
     /// then pokes the extension via provider message so it re-reads
     /// and rewires its samizdat client over the current network.
-    func switchEndpoint(to mode: EndpointMode) async {
+    @discardableResult
+    func switchEndpoint(to mode: EndpointMode) async -> String {
         EndpointModeStore.current = mode
-        _ = try? await sendProviderMessage("switchEndpoint")
+        do {
+            let response = try await sendProviderMessage("switchEndpoint")
+            if response.isEmpty {
+                SamizdatAddLog("warn: switchEndpoint provider did not acknowledge mode=\(mode.rawValue)")
+            }
+            return response
+        } catch {
+            SamizdatAddLog("warn: switchEndpoint provider message failed mode=\(mode.rawValue): \(error.localizedDescription)")
+            return "sendError"
+        }
     }
 
     /// Triggers extension to rebuild the samizdat client. Used by the

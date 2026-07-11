@@ -482,10 +482,12 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
                 .onChange(of: whitelistMode) { _, newValue in
                     WhitelistMode.current = newValue
-                    // EndpointTurnMode mirror REMOVED on the autonomous-
-                    // refresh pass — `WhitelistMode` is now the single
-                    // source of truth and the extension reads it
-                    // directly in attachVKTurnUpstream.
+                    // Re-evaluate the currently effective endpoint immediately.
+                    // Without this RPC, H2↔TURN only changed persisted prefs and
+                    // the live extension kept the old upstream until reconnect.
+                    Task {
+                        _ = await VPNProfileStore.shared.switchEndpoint(to: EndpointModeStore.current)
+                    }
                 }
 
                 Text("Foreign control targets")
@@ -530,6 +532,8 @@ struct SettingsView: View {
                 .tint(theme.mint)
                 .onChange(of: wlSuccessesDraft) { _, newValue in
                     WhitelistProbePreferences.successesNeeded = newValue
+                    WhitelistStatusStore.resetDetectionProgress()
+                    Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
                 }
 
                 // D45: probe interval (seconds)
@@ -544,6 +548,8 @@ struct SettingsView: View {
                 .tint(theme.mint)
                 .onChange(of: wlIntervalDraft) { _, newValue in
                     WhitelistProbePreferences.probeInterval = newValue
+                    WhitelistStatusStore.resetDetectionProgress()
+                    Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
                 }
 
                 HStack(spacing: 8) {
@@ -569,7 +575,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("Comma-separated target lists. Domestic majority pass + all foreign controls fail flips to Whitelist after the threshold. Apply live while connected; VPN-off monitor uses the same probes.")
+                Text("Comma-separated target lists. Domestic majority pass + all foreign controls fail flips to Whitelist after the threshold. Target changes are picked up live; reconnect the VPN if DNS returned new probe IPs so excluded routes are rebuilt.")
                     .font(.geist(.regular, size: 11))
                     .foregroundStyle(theme.textDim)
             }
@@ -735,6 +741,7 @@ struct SettingsView: View {
         WhitelistProbePreferences.whitelistHost = whitelistHostDraft
         WhitelistProbePreferences.successesNeeded = wlSuccessesDraft
         WhitelistProbePreferences.probeInterval = wlIntervalDraft
+        WhitelistStatusStore.resetDetectionProgress()
         // Re-sync drafts so blank-saves snap back to the resolved default.
         testHostDraft = WhitelistProbePreferences.testHost
         whitelistHostDraft = WhitelistProbePreferences.whitelistHost
@@ -745,6 +752,7 @@ struct SettingsView: View {
 
     private func resetWhitelistProbes() {
         WhitelistProbePreferences.reset()
+        WhitelistStatusStore.resetDetectionProgress()
         testHostDraft = WhitelistProbePreferences.testHost
         whitelistHostDraft = WhitelistProbePreferences.whitelistHost
         wlSuccessesDraft = WhitelistProbePreferences.successesNeeded

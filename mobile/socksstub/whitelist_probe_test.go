@@ -94,6 +94,12 @@ func TestWhitelistProbeJSONIncludesRemoteAddress(t *testing.T) {
 	}
 }
 
+func TestWhitelistProbeNetworkMatchesIPv4OnlyTunnel(t *testing.T) {
+	if whitelistProbeNetwork != "tcp4" {
+		t.Fatalf("network=%q want tcp4", whitelistProbeNetwork)
+	}
+}
+
 func TestRunWhitelistProbeCycleJSONDefaultsAndMarshals(t *testing.T) {
 	out := RunWhitelistProbeCycleJSON(`{"timeout_ms":1,"foreign":["203.0.113.1","198.51.100.1"],"domestic":["192.0.2.1"]}`)
 	var res whitelistProbeCycleResult

@@ -14,6 +14,10 @@ import (
 const (
 	defaultWhitelistProbeTimeout = 4 * time.Second
 	defaultWhitelistProbePort    = 443
+	// The packet tunnel is deliberately IPv4-only. Using "tcp" here lets
+	// different iPhones/DNS answers choose AAAA and silently probe a different
+	// carrier path. Keep the detector on the same address family as its routes.
+	whitelistProbeNetwork = "tcp4"
 )
 
 type whitelistProbeCycleRequest struct {
@@ -188,7 +192,7 @@ func runTCPThenTLSProbe(ctx context.Context, host string, port int, ifaceIndex i
 	dialer := &net.Dialer{Timeout: deadlineTimeout(ctx, defaultWhitelistProbeTimeout)}
 	applyWhitelistProbeInterface(dialer, ifaceIndex)
 
-	tcpConn, err := dialer.DialContext(ctx, "tcp", addr)
+	tcpConn, err := dialer.DialContext(ctx, whitelistProbeNetwork, addr)
 	if err != nil {
 		res.DurationMs = time.Since(start).Milliseconds()
 		res.ErrorClass, res.Error = classifyProbeError(err)
@@ -196,17 +200,9 @@ func runTCPThenTLSProbe(ctx context.Context, host string, port int, ifaceIndex i
 	}
 	res.TCPOK = true
 	res.RemoteAddress = tcpConn.RemoteAddr().String()
-	_ = tcpConn.Close()
+	defer tcpConn.Close()
 
-	plainConn, err := dialer.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		res.DurationMs = time.Since(start).Milliseconds()
-		res.ErrorClass, res.Error = classifyProbeError(err)
-		return res
-	}
-	defer plainConn.Close()
-
-	tlsConn := tls.Client(plainConn, &tls.Config{
+	tlsConn := tls.Client(tcpConn, &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true, // probe reachability/SNI behavior, not PKI validity
 	})

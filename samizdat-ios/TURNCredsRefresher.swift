@@ -120,7 +120,7 @@ final class TURNCredsRefresher: ObservableObject {
         case .backup:
             return true
         case .auto:
-            return WhitelistStatusStore.activeEndpoint == .backup
+            return WhitelistStatusStore.trustedAutoEndpoint == .backup
         case .primary:
             return false
         }

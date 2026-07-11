@@ -31,6 +31,8 @@ final class WhitelistMonitor: ObservableObject {
     // `successesNeeded` consecutive identical decisive verdicts.
     private var whitelistCount = 0
     private var freeCount = 0
+    private var lastPathSummary: String?
+    private var lastConfigSignature: String?
 
     /// Begin monitoring. Idempotent; no-op if already running.
     func start() {
@@ -40,17 +42,21 @@ final class WhitelistMonitor: ObservableObject {
         let monitor = NWPathMonitor()
         monitor.start(queue: pathMonitorQueue)
         pathMonitor = monitor
-        // Restore persisted counters so progress survives start/stop cycles.
-        whitelistCount = WhitelistStatusStore.whitelistConsecutiveCount
-        freeCount = WhitelistStatusStore.freeConsecutiveCount
+        // A consecutive sequence cannot span monitor owners or carrier paths.
+        // Start clean; the 5 s settling cadence below rebuilds confidence fast.
+        whitelistCount = 0
+        freeCount = 0
+        lastPathSummary = nil
+        lastConfigSignature = nil
+        WhitelistStatusStore.resetDetectionProgress()
         let build = (Bundle.main.object(forInfoDictionaryKey: "IPAArtifactName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
             ?? "unknown"
         TURNLog.info("whitelist", "monitor started build=\(build) method=tcp_tls_sni icmp=not_used threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
         task = Task { [weak self] in
             while !Task.isCancelled {
-                await self?.runCycle(generation: gen)
-                try? await Task.sleep(for: .seconds(Self.cycleInterval))
+                let delay = await self?.runCycle(generation: gen) ?? Self.cycleInterval
+                try? await Task.sleep(for: .seconds(delay))
             }
         }
     }
@@ -66,16 +72,26 @@ final class WhitelistMonitor: ObservableObject {
 
     // MARK: – cycle
 
-    private func runCycle(generation gen: Int) async {
+    private func runCycle(generation gen: Int) async -> TimeInterval {
         guard EndpointModeStore.current == .auto else {
             WhitelistStatusStore.current = .unknown
-            return
+            return Self.cycleInterval
         }
         let threshold = WhitelistProbePreferences.successesNeeded
         let pathSelection = WhitelistProbeEngine.pathSelection(pathMonitor?.currentPath)
+        let configSignature = "\(WhitelistProbePreferences.testHost)|\(WhitelistProbePreferences.whitelistHost)|\(threshold)|\(WhitelistProbePreferences.probeInterval)"
+        if let previous = lastPathSummary, previous != pathSelection.summary {
+            resetProgress(reason: "network path changed: {\(previous)} → {\(pathSelection.summary)}")
+        }
+        if let previous = lastConfigSignature, previous != configSignature {
+            resetProgress(reason: "probe configuration changed")
+        }
+        lastPathSummary = pathSelection.summary
+        lastConfigSignature = configSignature
+
         TURNLog.info("whitelist", "monitor cycle start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
         let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex)
-        guard gen == generation, !Task.isCancelled else { return }
+        guard gen == generation, !Task.isCancelled else { return Self.cycleInterval }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
             TURNLog.info("whitelist", "monitor probe \(line)")
         }
@@ -116,10 +132,16 @@ final class WhitelistMonitor: ObservableObject {
             WhitelistStatusStore.current = .unknown
         }
 
-        // Persist counters across app lifecycle (background/foreground,
-        // VPN state changes) so they survive start/stop resets.
-        WhitelistStatusStore.whitelistConsecutiveCount = whitelistCount
-        WhitelistStatusStore.freeConsecutiveCount = freeCount
         TURNLog.info("whitelist", "monitor counters classification=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
+        let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && whitelistCount > 0)
+            || (WhitelistStatusStore.activeEndpoint == .backup && freeCount > 0)
+        return switchPending ? 5 : Self.cycleInterval
+    }
+
+    private func resetProgress(reason: String) {
+        whitelistCount = 0
+        freeCount = 0
+        WhitelistStatusStore.resetDetectionProgress()
+        TURNLog.info("whitelist", "monitor progress reset — \(reason)")
     }
 }
