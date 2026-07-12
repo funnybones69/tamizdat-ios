@@ -59,6 +59,10 @@ final class TURNCredsRefresher: ObservableObject {
     /// compatibility states, not red error states.
     @Published private(set) var turnInfo: String?
 
+    /// Auto-dismisses transient method-selection/status messages from the
+    /// home screen. They are informational, not persistent errors.
+    private var turnInfoDismissTask: Task<Void, Never>?
+
     /// When non-nil, a the manual verification sheet should be presented so
     /// the user can solve the slider. The sheet calls `resolveManual`
     /// / `cancelManual` to drive the refresh forward.
@@ -78,6 +82,21 @@ final class TURNCredsRefresher: ObservableObject {
     /// `isRefreshing=true` and every explicit Save/Refresh gets skipped.
     private var refreshStartedAt: Date?
     private var refreshGeneration: Int = 0
+
+    deinit {
+        turnInfoDismissTask?.cancel()
+    }
+
+    func publishTurnInfo(_ message: String) {
+        turnInfoDismissTask?.cancel()
+        turnInfo = message
+        turnInfoDismissTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.turnInfo = nil
+            self?.turnInfoDismissTask = nil
+        }
+    }
 
     /// Manual-fallback handoff: when the auto handler throws
     /// `.sliderRequired`, we open the sheet and `await` this
@@ -294,6 +313,7 @@ final class TURNCredsRefresher: ObservableObject {
         refreshStartedAt = Date()
         isRefreshing = true
         lastError = nil
+        turnInfoDismissTask?.cancel()
         turnInfo = nil
         TURNLog.info("turncreds", "starting refresh task gen=\(generation)")
 
@@ -319,7 +339,7 @@ final class TURNCredsRefresher: ObservableObject {
                     captchaSolver: ChainedCaptchaSolver(refresher: self),
                     progress: { [weak self] message in
                         Task { @MainActor in
-                            self?.turnInfo = message
+                            self?.publishTurnInfo(message)
                         }
                     }
                 )
@@ -353,7 +373,7 @@ final class TURNCredsRefresher: ObservableObject {
                         "полученные credentials имеют недостаточный TTL (осталось \(Int(remaining))с)"
                     )
                 }
-                self.turnInfo = "TURN: подключение без капчи успешно."
+                self.publishTurnInfo("TURN: подключение без капчи успешно.")
                 // Push the fresh snapshot into the in-process Go VK
                 // TURN runner so the next worker-group rotation uses
                 // them — without this hop the runner kept reading the

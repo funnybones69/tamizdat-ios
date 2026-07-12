@@ -396,7 +396,7 @@ struct ContentView: View {
                 if let turnInfo = turnRefresher.turnInfo, !turnInfo.isEmpty {
                     Text(turnInfo)
                         .font(.geist(.regular, size: 13))
-                        .foregroundStyle(theme.amber)
+                        .foregroundStyle(theme.textDim)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
