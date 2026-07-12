@@ -184,7 +184,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // is unreachable RIGHT NOW. Throttled in Go to once per 15 s.
         let rewireBridge = AutoRewireBridge { [weak self] in
             guard let self else { return }
-            if self.shouldDeferAutoRewireForPendingTURN() {
+            if self.shouldSuppressPingRewireForTURN() {
                 return
             }
             self.appendExtLog("info: auto-rewire fired by ping prober (consecutive fails)")
@@ -316,6 +316,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// shortid not mirrored yet. Re-save Main URI in Settings → Proxies.")
             return
         }
+        if SocksstubTURNUpstreamRunning() {
+            let ready = !SocksstubTURNUpstreamWGConfig().isEmpty
+            ExtLog.info("[vkturn] attach deduplicated — runner already \(ready ? "ready" : "waiting for GETCONF") generation=\(SocksstubTURNUpstreamGeneration())")
+            return
+        }
 
         // Prefer the atomic multi-room bundle. Legacy single-room JSON remains
         // readable so existing installs can refresh once after upgrading.
@@ -382,18 +387,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
         ExtLog.info("[vkturn] attach: AFTER runner start dur=\(durMs)ms err=\"\(err)\"")
+        if err == "already running" {
+            ExtLog.info("[vkturn] attach deduplicated by Go singleton")
+            return
+        }
         if !err.isEmpty {
             ExtLog.error("[vkturn] runner start returned: \"\(err)\"")
             return
         }
-        ExtLog.info("[vkturn] runner OK, polling for WG config + netstack (up to 60 s)")
+        let generation = SocksstubTURNUpstreamGeneration()
+        ExtLog.info("[vkturn] runner OK generation=\(generation), polling for WG config + netstack (up to 60 s)")
 
         Task.detached(priority: .utility) {
-            ExtLog.info("[vkturn] async polling task started")
+            ExtLog.info("[vkturn] async polling task started generation=\(generation)")
             struct TurnStatsShape: Decodable { let error: String? }
             var attempts = 0
             for _ in 0..<240 { // 240 * 250 ms = 60 s
                 attempts += 1
+                let currentGeneration = SocksstubTURNUpstreamGeneration()
+                if currentGeneration != generation {
+                    ExtLog.info("[vkturn] polling stopped — stale generation=\(generation) current=\(currentGeneration)")
+                    return
+                }
                 let wg = SocksstubTURNUpstreamWGConfig()
                 let running = SocksstubTURNUpstreamRunning()
                 if !wg.isEmpty {
@@ -406,7 +421,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                    let shape = try? JSONDecoder().decode(TurnStatsShape.self, from: data),
                    let error = shape.error,
                    !error.isEmpty {
-                    ExtLog.error("[vkturn] async attach failed: \(error)")
+                    ExtLog.error("[vkturn] async attach failed generation=\(generation): \(error)")
+                    return
+                }
+                if !running {
+                    ExtLog.warn("[vkturn] polling stopped — runner exited before GETCONF generation=\(generation)")
                     return
                 }
                 if attempts % 8 == 0 { // every 2 sec
@@ -580,16 +599,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return "\(typeName)[\(names)]"
     }
 
-    /// Suppress ping-prober rewire loops when the selected path is TURN but
-    /// TURN cannot start until the main app refreshes expired VK session parameters.
-    /// Rebuilding the H2 client every ~11 s in this state just closes flows and
-    /// makes the connection look like it is "trying" for minutes.
-    private func shouldDeferAutoRewireForPendingTURN() -> Bool {
+    /// A ping miss in TURN mode must not rebuild the dormant H2 client and
+    /// close all live SOCKS flows. That old behavior reset TCP every ~11–15 s,
+    /// reducing throughput; while GETCONF was pending it also spawned duplicate
+    /// attach pollers and eventually caused rapid runner restart/quota churn.
+    /// Physical NWPath changes and explicit user reconnects remain separate,
+    /// authoritative lifecycle triggers.
+    private func shouldSuppressPingRewireForTURN() -> Bool {
         let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-        guard policy.usesTURN, !SocksstubTURNUpstreamRunning() else { return false }
-        let freshness = Self.vkTurnCredsFreshness()
-        guard !freshness.isFresh else { return false }
-        appendExtLog("warn: auto-rewire ignored — desired TURN but runner not ready and \(freshness.reason); waiting for VK TURN credential refresh")
+        guard policy.usesTURN else { return false }
+
+        let running = SocksstubTURNUpstreamRunning()
+        let ready = !SocksstubTURNUpstreamWGConfig().isEmpty
+        if ready {
+            appendExtLog("info: auto-rewire ignored — TURN data plane owns upstream; preserving live flows")
+        } else if running {
+            appendExtLog("info: auto-rewire ignored — TURN runner is waiting for GETCONF; preserving attach generation")
+        } else {
+            let freshness = Self.vkTurnCredsFreshness()
+            appendExtLog("warn: auto-rewire ignored — TURN runner is stopped (\(freshness.reason)); waiting for explicit refresh/reconnect")
+        }
         return true
     }
 
@@ -612,6 +641,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         rewireQueue.async { [weak self] in
             guard let self else { return }
+            guard self.rewireGeneration == generation else {
+                self.appendExtLog("info: rewire gen=\(generation) skipped — superseded before start")
+                return
+            }
             let mode = EndpointModeStore.current
             let policy = Self.upstreamPolicy(mode: mode, backup: self.backupBlob)
             let blob = Self.pick(mode: mode, primary: self.primaryBlob, backup: self.backupBlob)
@@ -623,11 +656,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             self.appendExtLog("info: rewire gen=\(generation) start mode=\(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue)")
 
-            // Main/H2 must win over any stale VK TURN netstack before the
-            // Go bridge starts accepting fresh flows. Go dialUpstream()
-            // prefers VKTurnNetstack() whenever it is non-nil.
-            if !policy.usesTURN {
-                SocksstubStopVKTurnUpstream()
+            // Every authoritative rewire owns the current data-plane lifecycle.
+            // H2 must clear a stale TURN netstack; TURN must drain and recreate
+            // its relay sockets on the new NWPath instead of "rewiring" only
+            // the dormant H2 client. Ping-prober callbacks never reach here in
+            // TURN mode, so this cannot create the old 11-second restart loop.
+            SocksstubStopVKTurnUpstream()
+            guard self.rewireGeneration == generation else {
+                self.appendExtLog("info: rewire gen=\(generation) stopped after TURN drain — superseded")
+                return
             }
 
             var err: NSError?
@@ -635,6 +672,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if let err {
                 self.appendExtLog("error: rewire gen=\(generation) SetSamizdatConfig: \(err.localizedDescription)")
                 self.finishRewireGeneration(generation)
+                return
+            }
+            guard self.rewireGeneration == generation else {
+                self.appendExtLog("info: rewire gen=\(generation) skipped after config — superseded before attach")
                 return
             }
 

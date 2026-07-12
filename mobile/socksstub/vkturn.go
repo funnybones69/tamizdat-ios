@@ -30,30 +30,36 @@ import (
 // strings: an empty string means success.
 
 var (
-	vkturnRunner     *wgturnclient.Runner
-	vkturnCancel     context.CancelFunc
-	vkturnWGConfig   atomic.Pointer[string]
-	vkturnStats      atomic.Pointer[string]
-	vkturnErr        atomic.Pointer[string]
-	vkturnNet        atomic.Pointer[netstack.Net]
-	vkturnRunning    atomic.Bool
-	vkturnAttachStop func()
-	vkturnMu         sync.Mutex
+	vkturnRunner           *wgturnclient.Runner
+	vkturnCancel           context.CancelFunc
+	vkturnWGConfig         atomic.Pointer[string]
+	vkturnStats            atomic.Pointer[string]
+	vkturnErr              atomic.Pointer[string]
+	vkturnNet              atomic.Pointer[netstack.Net]
+	vkturnRunning          atomic.Bool
+	vkturnGeneration       atomic.Int64
+	vkturnRestartNotBefore atomic.Int64
+	vkturnRunDone          <-chan struct{}
+	vkturnDraining         <-chan struct{}
+	vkturnAttachStop       func()
+	vkturnMu               sync.Mutex
 )
 
 const (
-	vkturnConfigAttachTimeout = 60 * time.Second
-	vkturnDefaultWorkers      = 24
-	vkturnMinWorkers          = 12
-	vkturnMaxWorkers          = 72
-	vkturnWorkerStep          = 12
+	vkturnConfigAttachTimeout   = 60 * time.Second
+	vkturnShutdownWaitTimeout   = 15 * time.Second
+	vkturnAllocationReleaseWait = 500 * time.Millisecond
+	vkturnDefaultWorkers        = 24
+	vkturnMinWorkers            = 12
+	vkturnMaxWorkers            = 72
 )
 
 // StartVKTurnUpstream starts the VK TURN upstream. On success it returns "".
 // On immediate setup error it returns the error message. GETCONF and
 // userspace-WireGuard attach continue asynchronously so Network Extension
 // startup is not blocked on TURN Allocate / DTLS handshakes. Calling it
-// again while the runner is alive is treated as success.
+// again while the runner is alive returns the "already running" sentinel so
+// the Swift side does not spawn another attach poller for the same generation.
 func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int, workers int) string {
 	creds, err := parseVKTurnCredsJSON(credsJSON)
 	if err != nil {
@@ -77,14 +83,28 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 
 func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, workers, workersPerRoom int, hashes []string, credsByHash map[string]*wgturnclient.Credentials, singleCreds *wgturnclient.Credentials, jsonLen int) string {
 	vkturnMu.Lock()
+	if vkturnDraining != nil {
+		select {
+		case <-vkturnDraining:
+			vkturnDraining = nil
+		default:
+			vkturnMu.Unlock()
+			rt.appendLog("warn: vkturn start blocked — previous runner still draining worker sessions")
+			return "previous runner still draining"
+		}
+	}
 	if vkturnRunning.Load() {
 		runningStats := TURNUpstreamStatsJSON()
 		vkturnMu.Unlock()
-		rt.appendLog(fmt.Sprintf("info: vkturn already running stats=%s", truncateLogField(runningStats, 180)))
-		if p := vkturnErr.Load(); p != nil {
-			return *p
+		rt.appendLog(fmt.Sprintf("info: vkturn already running generation=%d stats=%s", vkturnGeneration.Load(), truncateLogField(runningStats, 180)))
+		return "already running"
+	}
+	if notBefore := vkturnRestartNotBefore.Load(); notBefore > 0 {
+		if wait := time.Until(time.Unix(0, notBefore)); wait > 0 {
+			rt.appendLog(fmt.Sprintf("info: vkturn waiting %s for prior TURN allocation release", wait.Round(time.Millisecond)))
+			time.Sleep(wait)
 		}
-		return ""
+		vkturnRestartNotBefore.Store(0)
 	}
 
 	resetVKTurnAtomicsLocked()
@@ -116,15 +136,20 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	vkturnRunner, vkturnCancel = runner, cancel
+	runDone := make(chan struct{})
+	generation := vkturnGeneration.Add(1)
+	vkturnRunner, vkturnCancel, vkturnRunDone = runner, cancel, runDone
 	vkturnRunning.Store(true)
 	storeVKTurnStats(0, true)
 	vkturnMu.Unlock()
 
-	runDone := make(chan struct{})
 	go func() {
-		defer close(runDone)
 		err := runner.Start(ctx)
+		// Signal that all worker groups, TURN allocations and dispatcher loops
+		// have exited before attempting global-state cleanup. Stop can wait on
+		// this while holding vkturnMu, preventing a replacement runner from
+		// racing old allocation teardown.
+		close(runDone)
 		vkturnMu.Lock()
 		defer vkturnMu.Unlock()
 		if vkturnRunner != runner {
@@ -140,9 +165,10 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 		stopVKTurnAttachLocked()
 		vkturnRunning.Store(false)
 		storeVKTurnStats(0, false)
-		vkturnRunner, vkturnCancel = nil, nil
+		vkturnRestartNotBefore.Store(time.Now().Add(vkturnAllocationReleaseWait).UnixNano())
+		vkturnRunner, vkturnCancel, vkturnRunDone = nil, nil, nil
 	}()
-	rt.appendLog(fmt.Sprintf("info: vkturn runner started; waiting for GETCONF rooms=%d workers=%d", maxInt(1, len(hashes)), workers))
+	rt.appendLog(fmt.Sprintf("info: vkturn runner started generation=%d; waiting for GETCONF rooms=%d workers=%d", generation, maxInt(1, len(hashes)), workers))
 	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh, attachOnce)
 	return ""
 }
@@ -164,7 +190,10 @@ func normalizeVKTurnWorkers(n int) int {
 	if n > vkturnMaxWorkers {
 		n = vkturnMaxWorkers
 	}
-	return (n / vkturnWorkerStep) * vkturnWorkerStep
+	// buildWorkerGroupPlans now supports a final partial group (for example
+	// 12+8). Preserve the requested exact count instead of silently flooring
+	// 20 to 12 in the legacy single-room fallback path.
+	return n
 }
 
 // UpdateVKTurnCreds swaps fresh credentials into the running runner so
@@ -234,14 +263,44 @@ func StopVKTurnUpstream() {
 	vkturnMu.Lock()
 	defer vkturnMu.Unlock()
 
+	runner := vkturnRunner
+	done := vkturnRunDone
+	if done == nil {
+		done = vkturnDraining
+	}
 	if vkturnCancel != nil {
 		vkturnCancel()
 	}
-	if vkturnRunner != nil {
-		vkturnRunner.Shutdown()
+	if runner != nil {
+		runner.Shutdown()
 	}
+
+	// Do not allow a replacement runner to consume the same room quota until
+	// every old session has returned and its TURN allocation has been closed.
+	// runner.Start closes done before taking vkturnMu for final bookkeeping,
+	// so waiting here cannot deadlock with the owner cleanup goroutine.
+	if done != nil {
+		select {
+		case <-done:
+			vkturnDraining = nil
+			// pion sends Lifetime=0 without waiting for a TURN response. Give
+			// the relay a short grace window to apply deallocation before a
+			// replacement consumes the same per-room quota.
+			time.Sleep(vkturnAllocationReleaseWait)
+			vkturnRestartNotBefore.Store(0)
+			rt.appendLog("info: vkturn shutdown drained all worker sessions and waited for allocation release")
+		case <-time.After(vkturnShutdownWaitTimeout):
+			vkturnDraining = done
+			rt.appendLog(fmt.Sprintf("warn: vkturn shutdown drain timed out after %s; replacement starts are blocked until drain completes", vkturnShutdownWaitTimeout))
+		}
+	} else {
+		vkturnDraining = nil
+	}
+
 	vkturnRunner = nil
 	vkturnCancel = nil
+	vkturnRunDone = nil
+	vkturnGeneration.Add(1) // invalidate detached Swift diagnostics immediately
 	stopVKTurnAttachLocked()
 	resetVKTurnAtomicsLocked()
 }
@@ -275,6 +334,13 @@ func TURNUpstreamStatsJSON() string {
 // TURNUpstreamRunning reports whether the VK TURN runner goroutine is alive.
 func TURNUpstreamRunning() bool {
 	return vkturnRunning.Load()
+}
+
+// TURNUpstreamGeneration identifies the current runner lifecycle. Swift
+// diagnostics capture it before polling and stop when a newer start/stop
+// invalidates their generation, preventing overlapping 60-second pollers.
+func TURNUpstreamGeneration() int64 {
+	return vkturnGeneration.Load()
 }
 
 // VKTurnNetstack returns the userspace WireGuard netstack the upstream
@@ -520,6 +586,12 @@ func resetVKTurnAtomicsLocked() {
 	vkturnRunning.Store(false)
 }
 
+func isCurrentVKTurnRunner(runner *wgturnclient.Runner) bool {
+	vkturnMu.Lock()
+	defer vkturnMu.Unlock()
+	return runner != nil && vkturnRunner == runner && vkturnRunning.Load()
+}
+
 func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel context.CancelFunc, runDone <-chan struct{}, configCh <-chan string, attachOnce *sync.Once) {
 	timer := time.NewTimer(vkturnConfigAttachTimeout)
 	defer timer.Stop()
@@ -528,15 +600,17 @@ func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel
 	case conf := <-configCh:
 		attachVKTurnConfig(runner, cancel, conf, attachOnce)
 	case <-runDone:
-		if ctx.Err() == nil && vkturnErr.Load() == nil {
-			storeVKTurnError("not running before GETCONF")
+		if ctx.Err() == nil && vkturnErr.Load() == nil && storeVKTurnErrorIfCurrent(runner, "not running before GETCONF") {
 			rt.appendLog("warn: vkturn runner stopped before GETCONF")
 		}
 	case <-ctx.Done():
 		rt.appendLog("info: vkturn attach wait cancelled")
 	case <-timer.C:
 		errText := fmt.Sprintf("GETCONF timeout after %s", vkturnConfigAttachTimeout)
-		storeVKTurnError(errText)
+		if !storeVKTurnErrorIfCurrent(runner, errText) {
+			rt.appendLog("info: vkturn GETCONF timeout ignored for stale runner")
+			return
+		}
 		rt.appendLog("error: vkturn " + errText)
 		cancel()
 		runner.Shutdown()
@@ -545,6 +619,10 @@ func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel
 
 func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, conf string, attachOnce *sync.Once) {
 	if conf == "" {
+		return
+	}
+	if !isCurrentVKTurnRunner(runner) {
+		rt.appendLog("info: vkturn GETCONF ignored for stale runner")
 		return
 	}
 	rt.appendLog("info: vkturn GETCONF received; attaching userspace WireGuard")
@@ -556,10 +634,13 @@ func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, 
 	})
 	if attachErr != nil {
 		errText := "wg attach: " + attachErr.Error()
-		storeVKTurnError(errText)
-		rt.appendLog("error: vkturn " + errText)
-		cancel()
-		runner.Shutdown()
+		if storeVKTurnErrorIfCurrent(runner, errText) {
+			rt.appendLog("error: vkturn " + errText)
+			cancel()
+			runner.Shutdown()
+		} else {
+			rt.appendLog("info: vkturn wg attach error ignored for stale runner")
+		}
 		return
 	}
 	if res == nil {
@@ -581,9 +662,15 @@ func attachVKTurnConfig(runner *wgturnclient.Runner, cancel context.CancelFunc, 
 	rt.appendLog("info: vkturn userspace WireGuard attached; netstack ready")
 }
 
-func storeVKTurnError(errText string) {
+func storeVKTurnErrorIfCurrent(runner *wgturnclient.Runner, errText string) bool {
+	vkturnMu.Lock()
+	defer vkturnMu.Unlock()
+	if runner == nil || vkturnRunner != runner || !vkturnRunning.Load() {
+		return false
+	}
 	vkturnErr.Store(&errText)
-	storeVKTurnStats(0, vkturnRunning.Load())
+	storeVKTurnStats(0, true)
+	return true
 }
 
 func storeVKTurnStats(active int, running bool) {

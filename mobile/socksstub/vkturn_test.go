@@ -14,6 +14,8 @@ func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
 	vkturnMu.Lock()
 	vkturnRunner = nil
 	vkturnCancel = nil
+	vkturnRunDone = nil
+	vkturnDraining = nil
 	vkturnAttachStop = nil
 	vkturnRunning.Store(false)
 	vkturnNet.Store(&netstack.Net{})
@@ -27,6 +29,122 @@ func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
 	if got := VKTurnNetstack(); got != nil {
 		t.Fatalf("VKTurnNetstack() after StopVKTurnUpstream with running=false = %p, want nil", got)
 	}
+}
+
+func TestStopVKTurnUpstreamWaitsForWorkerDrain(t *testing.T) {
+	done := make(chan struct{})
+	vkturnMu.Lock()
+	vkturnRunner = &wgturnclient.Runner{}
+	vkturnCancel = nil
+	vkturnRunDone = done
+	vkturnDraining = nil
+	vkturnAttachStop = nil
+	vkturnRunning.Store(true)
+	vkturnNet.Store(&netstack.Net{})
+	beforeGeneration := vkturnGeneration.Load()
+	vkturnMu.Unlock()
+
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		close(done)
+	}()
+	started := time.Now()
+	StopVKTurnUpstream()
+	if elapsed := time.Since(started); elapsed < 60*time.Millisecond {
+		t.Fatalf("StopVKTurnUpstream returned before worker drain: %v", elapsed)
+	}
+	if vkturnGeneration.Load() <= beforeGeneration {
+		t.Fatal("StopVKTurnUpstream did not invalidate the runner generation")
+	}
+	if TURNUpstreamRunning() || VKTurnNetstack() != nil {
+		t.Fatal("StopVKTurnUpstream left runtime state active")
+	}
+}
+
+func TestStartVKTurnUpstreamReturnsAlreadyRunningSentinel(t *testing.T) {
+	vkturnMu.Lock()
+	vkturnRunning.Store(true)
+	vkturnErr.Store(nil)
+	vkturnStats.Store(nil)
+	vkturnMu.Unlock()
+
+	got := StartVKTurnUpstream(`{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600}`, "127.0.0.1:443", "password", "device", 9000, 20)
+	if got != "already running" {
+		t.Fatalf("StartVKTurnUpstream while active = %q, want already running", got)
+	}
+
+	vkturnMu.Lock()
+	vkturnRunning.Store(false)
+	vkturnStats.Store(nil)
+	vkturnMu.Unlock()
+}
+
+func TestStartVKTurnUpstreamBlocksWhilePreviousRunnerDrains(t *testing.T) {
+	draining := make(chan struct{})
+	vkturnMu.Lock()
+	vkturnRunner = nil
+	vkturnRunDone = nil
+	vkturnDraining = draining
+	vkturnRunning.Store(false)
+	vkturnMu.Unlock()
+
+	got := StartVKTurnUpstream(`{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600}`, "127.0.0.1:443", "password", "device", 9000, 20)
+	if got != "previous runner still draining" {
+		t.Fatalf("StartVKTurnUpstream during drain = %q, want drain blocker", got)
+	}
+
+	close(draining)
+	vkturnMu.Lock()
+	vkturnDraining = nil
+	vkturnMu.Unlock()
+}
+
+func TestStartVKTurnUpstreamHonorsAllocationReleaseBarrier(t *testing.T) {
+	vkturnMu.Lock()
+	vkturnRunner = nil
+	vkturnDraining = nil
+	vkturnRunning.Store(false)
+	vkturnRestartNotBefore.Store(time.Now().Add(75 * time.Millisecond).UnixNano())
+	vkturnMu.Unlock()
+
+	started := time.Now()
+	got := StartVKTurnUpstream(`{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600}`, "invalid-peer", "password", "device", 9000, 20)
+	if elapsed := time.Since(started); elapsed < 60*time.Millisecond {
+		t.Fatalf("StartVKTurnUpstream skipped allocation release barrier: %v", elapsed)
+	}
+	if got != "" {
+		t.Fatalf("expected async runner start after release barrier, got %q", got)
+	}
+	StopVKTurnUpstream()
+	vkturnRestartNotBefore.Store(0)
+}
+
+func TestStaleRunnerCannotOverwriteCurrentErrorState(t *testing.T) {
+	current := &wgturnclient.Runner{}
+	stale := &wgturnclient.Runner{}
+	vkturnMu.Lock()
+	vkturnRunner = current
+	vkturnRunning.Store(true)
+	vkturnErr.Store(nil)
+	vkturnStats.Store(nil)
+	vkturnMu.Unlock()
+
+	if storeVKTurnErrorIfCurrent(stale, "stale timeout") {
+		t.Fatal("stale runner unexpectedly stored an error")
+	}
+	if got := vkturnErr.Load(); got != nil {
+		t.Fatalf("stale runner poisoned current error state: %q", *got)
+	}
+	if !storeVKTurnErrorIfCurrent(current, "current timeout") {
+		t.Fatal("current runner failed to store its error")
+	}
+
+	vkturnMu.Lock()
+	vkturnRunner = nil
+	vkturnRunning.Store(false)
+	vkturnErr.Store(nil)
+	vkturnStats.Store(nil)
+	vkturnMu.Unlock()
 }
 
 func TestShouldUseUDPIgnoresTurnsEndpoints(t *testing.T) {
@@ -49,7 +167,8 @@ func TestNormalizeVKTurnWorkers(t *testing.T) {
 		{-1, 24},
 		{1, 12},
 		{12, 12},
-		{13, 12},
+		{13, 13},
+		{20, 20},
 		{24, 24},
 		{36, 36},
 		{73, 72},
