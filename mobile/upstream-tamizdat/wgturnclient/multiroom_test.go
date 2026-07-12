@@ -11,6 +11,16 @@ func testRoomCreds(label string) *Credentials {
 	}
 }
 
+func TestLegacySingleRoomPlannerTwenty(t *testing.T) {
+	plans := buildWorkerGroupPlans(20, 0, 0)
+	if len(plans) != 2 {
+		t.Fatalf("plans=%d, want 2", len(plans))
+	}
+	if plans[0].hashIndex != 0 || plans[0].workerCount != 12 || plans[1].hashIndex != 0 || plans[1].workerCount != 8 {
+		t.Fatalf("legacy plans=%+v, want one room planned as 12+8", plans)
+	}
+}
+
 func TestMultiRoomPlannerFourByTwenty(t *testing.T) {
 	plans := buildWorkerGroupPlans(80, 4, 20)
 	if len(plans) != 8 {

@@ -113,6 +113,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let rewireQueue = DispatchQueue(label: "com.anarki.samizdat-test.rewire", qos: .userInitiated)
     private let rewireGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
+    private static let turnAttachAllowedLock = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private static let turnAttachRetryLock = OSAllocatedUnfairLock<Bool>(initialState: false)
     private var rewireGeneration: Int {
         get { rewireGenerationLock.withLock { $0 } }
         set { rewireGenerationLock.withLock { $0 = newValue } }
@@ -144,6 +146,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Start writing into App Group log file immediately so we have a
         // timeline even if hev fails to launch.
         openLogSink()
+        Self.turnAttachAllowedLock.withLock { $0 = true }
         appendExtLog("info: PacketTunnelProvider startTunnel (Path 3 / hev)")
 
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
@@ -292,8 +295,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Foundation's buffered handle silently dropped post-block lines.
     /// `ExtLog` open/write/fsync/close every call, so the timeline
     /// survives the block.
-    private static func attachVKTurnUpstream() {
+    @discardableResult
+    private static func attachVKTurnUpstream(scheduleDrainRetry: Bool = true) -> String {
         ExtLog.info("[vkturn] attach: entering helper")
+        guard turnAttachAllowedLock.withLock({ $0 }) else {
+            ExtLog.info("[vkturn] attach skipped — tunnel lifecycle no longer allows TURN starts")
+            return "tunnelStopped"
+        }
 
         // Read runtime values from App Group UserDefaults — these keys
         // are written by the main app. VKSession paramsPreferences/TURNSession paramsStore
@@ -310,16 +318,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         guard !peer.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// server not mirrored yet. Open Settings → Proxies and save Main URI.")
-            return
+            return "missingPeer"
         }
         guard !password.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// shortid not mirrored yet. Re-save Main URI in Settings → Proxies.")
-            return
+            return "missingPassword"
         }
         if SocksstubTURNUpstreamRunning() {
             let ready = !SocksstubTURNUpstreamWGConfig().isEmpty
             ExtLog.info("[vkturn] attach deduplicated — runner already \(ready ? "ready" : "waiting for GETCONF") generation=\(SocksstubTURNUpstreamGeneration())")
-            return
+            return "already running"
         }
 
         // Prefer the atomic multi-room bundle. Legacy single-room JSON remains
@@ -328,7 +336,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let legacyCredsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
         guard (roomBundleJSON?.isEmpty == false) || (legacyCredsJSON?.isEmpty == false) else {
             ExtLog.warn("[vkturn] attach SKIPPED — no complete credential bundle in App Group")
-            return
+            return "noCreds"
         }
         let credsJSON = legacyCredsJSON ?? ""
         ExtLog.info("[vkturn] attach: credential payload present mode=\(roomBundleJSON?.isEmpty == false ? "multi-room" : "legacy")")
@@ -369,7 +377,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.info("[vkturn] attach: creds age=\(Int(age))s (lifetime=\(Int(lifetimeSec))s, cushion=\(Int(cushionSec))s)")
             if age >= safeBound {
                 ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ \(Int(safeBound))s). Wait for refresh, then reconnect.")
-                return
+                return "staleCreds"
             }
         } else {
             ExtLog.warn("[vkturn] attach: no vkTURNCredsAcquiredAt stamp — proceeding without age check (legacy creds?)")
@@ -389,11 +397,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ExtLog.info("[vkturn] attach: AFTER runner start dur=\(durMs)ms err=\"\(err)\"")
         if err == "already running" {
             ExtLog.info("[vkturn] attach deduplicated by Go singleton")
-            return
+            return err
+        }
+        if err == "previous runner still draining" {
+            ExtLog.info("[vkturn] attach pending — previous runner still draining")
+            if scheduleDrainRetry {
+                scheduleVKTurnAttachAfterDrain()
+            }
+            return err
         }
         if !err.isEmpty {
             ExtLog.error("[vkturn] runner start returned: \"\(err)\"")
-            return
+            return err
         }
         let generation = SocksstubTURNUpstreamGeneration()
         ExtLog.info("[vkturn] runner OK generation=\(generation), polling for WG config + netstack (up to 60 s)")
@@ -434,6 +449,40 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
             ExtLog.warn("[vkturn] WG config NOT received within 60 s. running=\(SocksstubTURNUpstreamRunning()) stats=\(SocksstubTURNUpstreamStatsJSON())")
+        }
+        return ""
+    }
+
+    private static func scheduleVKTurnAttachAfterDrain() {
+        let shouldSchedule = turnAttachRetryLock.withLock { scheduled -> Bool in
+            if scheduled { return false }
+            scheduled = true
+            return true
+        }
+        guard shouldSchedule else {
+            ExtLog.info("[vkturn] drain retry already scheduled")
+            return
+        }
+
+        Task.detached(priority: .utility) {
+            defer { turnAttachRetryLock.withLock { $0 = false } }
+            for attempt in 1...120 { // up to 60 s; never blocks NE stop watchdog
+                guard turnAttachAllowedLock.withLock({ $0 }) else {
+                    ExtLog.info("[vkturn] drain retry cancelled — tunnel stopped")
+                    return
+                }
+                if !SocksstubTURNUpstreamDraining() {
+                    let result = attachVKTurnUpstream(scheduleDrainRetry: false)
+                    ExtLog.info("[vkturn] drain retry attempt=\(attempt) result=\(result.isEmpty ? "started" : result)")
+                    if result == "previous runner still draining" {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        continue
+                    }
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+            ExtLog.error("[vkturn] drain retry timed out after 60 s")
         }
     }
 
@@ -490,9 +539,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // main-app WhitelistMonitor resumes on disconnect and writes
         // fresh values; the 200s stale-check handles truly stale data.
         pathMonitor.cancel()
-        // Phase 2D-PART-C: stop the VK TURN runner if it was attached.
-        // Idempotent on the Go side — safe to call even when never started.
-        SocksstubStopVKTurnUpstream()
+        // NE stop must return promptly: cancel/reset synchronously, but drain
+        // TURN workers/allocations in Go background. Replacement starts remain
+        // gated until that drain completes.
+        Self.turnAttachAllowedLock.withLock { $0 = false }
+        SocksstubStopVKTurnUpstreamAsync()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
@@ -881,8 +932,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // refresh should start the runner immediately, but only
                 // while the effective endpoint is Restricted+Relay.
                 appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
-                Self.attachVKTurnUpstream()
-                completionHandler?("attachStarted".data(using: .utf8))
+                let attachResult = Self.attachVKTurnUpstream()
+                let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
+                completionHandler?(response.data(using: .utf8))
             } else {
                 completionHandler?(result.data(using: .utf8))
             }
@@ -908,8 +960,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler?("noCreds".data(using: .utf8))
                 return
             }
-            Self.attachVKTurnUpstream()
-            completionHandler?("attachStarted".data(using: .utf8))
+            let attachResult = Self.attachVKTurnUpstream()
+            let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
+            completionHandler?(response.data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
             // Snapshot is built from in-process Socksstub*() getters which

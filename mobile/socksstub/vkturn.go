@@ -305,6 +305,67 @@ func StopVKTurnUpstream() {
 	resetVKTurnAtomicsLocked()
 }
 
+// StopVKTurnUpstreamAsync performs the cancellation/reset half of stop
+// synchronously, but drains TURN workers and deallocations in the background.
+// Network Extension stopTunnel must return promptly to the iOS watchdog; any
+// replacement start remains gated by vkturnDraining until cleanup completes.
+func StopVKTurnUpstreamAsync() {
+	vkturnMu.Lock()
+	runner := vkturnRunner
+	done := vkturnRunDone
+	alreadyDraining := done == nil && vkturnDraining != nil
+	if done == nil {
+		done = vkturnDraining
+	}
+	if vkturnCancel != nil {
+		vkturnCancel()
+	}
+	if runner != nil {
+		runner.Shutdown()
+	}
+	if done != nil {
+		vkturnDraining = done
+	}
+	vkturnRunner = nil
+	vkturnCancel = nil
+	vkturnRunDone = nil
+	vkturnGeneration.Add(1)
+	stopVKTurnAttachLocked()
+	resetVKTurnAtomicsLocked()
+	vkturnMu.Unlock()
+
+	if done == nil || alreadyDraining {
+		return
+	}
+	go func(drain <-chan struct{}) {
+		<-drain
+		time.Sleep(vkturnAllocationReleaseWait)
+		vkturnMu.Lock()
+		if vkturnDraining == drain {
+			vkturnDraining = nil
+			vkturnRestartNotBefore.Store(0)
+		}
+		vkturnMu.Unlock()
+		rt.appendLog("info: vkturn async shutdown drained worker sessions and released allocations")
+	}(done)
+}
+
+// TURNUpstreamDraining reports that a cancelled runner still owns worker
+// sessions/allocations. Swift uses it to schedule one serialized attach retry.
+func TURNUpstreamDraining() bool {
+	vkturnMu.Lock()
+	defer vkturnMu.Unlock()
+	if vkturnDraining == nil {
+		return false
+	}
+	select {
+	case <-vkturnDraining:
+		return false
+	default:
+		return true
+	}
+}
+
 // TURNUpstreamWGConfig returns the latest WireGuard config text delivered
 // by the server (the [Interface]/[Peer] block), or "" if not yet received.
 func TURNUpstreamWGConfig() string {

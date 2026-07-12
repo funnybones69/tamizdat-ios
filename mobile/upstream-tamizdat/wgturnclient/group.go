@@ -118,7 +118,13 @@ func (r *Runner) workerGroup(
 		}
 
 		// Получаем креды ДО убийства старого батча (бесшовная ротация)
-		hash := tp.Hashes[hashIndex%len(tp.Hashes)]
+		// Preloaded legacy single-room mode intentionally has no VKHashes list;
+		// credential lookup ignores the hash in that path. Explicit multi-room
+		// always validates a non-empty per-room hash list.
+		hash := ""
+		if len(tp.Hashes) > 0 {
+			hash = tp.Hashes[hashIndex%len(tp.Hashes)]
+		}
 		log.Printf("[ГРУППА #%d] Цикл %d: ожидание очереди получения кредов", groupID, cycleNumber)
 
 		r.groupAuthMutex.Lock()

@@ -61,6 +61,35 @@ func TestStopVKTurnUpstreamWaitsForWorkerDrain(t *testing.T) {
 	}
 }
 
+func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
+	done := make(chan struct{})
+	vkturnMu.Lock()
+	vkturnRunner = &wgturnclient.Runner{}
+	vkturnCancel = nil
+	vkturnRunDone = done
+	vkturnDraining = nil
+	vkturnAttachStop = nil
+	vkturnRunning.Store(true)
+	vkturnMu.Unlock()
+
+	started := time.Now()
+	StopVKTurnUpstreamAsync()
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("StopVKTurnUpstreamAsync blocked stopTunnel for %v", elapsed)
+	}
+	if !TURNUpstreamDraining() {
+		t.Fatal("async stop did not gate replacement start while workers drain")
+	}
+	close(done)
+	deadline := time.Now().Add(2 * time.Second)
+	for TURNUpstreamDraining() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if TURNUpstreamDraining() {
+		t.Fatal("async stop did not clear drain gate after completion")
+	}
+}
+
 func TestStartVKTurnUpstreamReturnsAlreadyRunningSentinel(t *testing.T) {
 	vkturnMu.Lock()
 	vkturnRunning.Store(true)

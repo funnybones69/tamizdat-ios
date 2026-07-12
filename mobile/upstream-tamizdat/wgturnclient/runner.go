@@ -212,6 +212,10 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	plans := buildWorkerGroupPlans(r.cfg.Workers, len(r.cfg.VKHashes), r.cfg.WorkersPerRoom)
 	numGroups := len(plans)
+	logicalRoomCount := len(r.cfg.VKHashes)
+	if logicalRoomCount == 0 && numGroups > 0 {
+		logicalRoomCount = 1
+	}
 
 	log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
 	log.Printf("[КЛИЕНТ] VK App: %s", r.cfg.VKAppID)
@@ -261,7 +265,7 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	workerIDCounter := 1
-	roomWaitReady := make([]<-chan struct{}, len(r.cfg.VKHashes))
+	roomWaitReady := make([]<-chan struct{}, logicalRoomCount)
 	broker := &configBroker{ch: configCh}
 
 	for g, plan := range plans {
