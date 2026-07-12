@@ -53,6 +53,12 @@ final class TURNCredsRefresher: ObservableObject {
     /// Surfaced for UI / log display.
     @Published private(set) var lastError: String?
 
+    /// Short, non-error progress message for the home screen. This is
+    /// intentionally separate from `lastError`: trying the primary
+    /// accountless flow and switching to CAPTCHA fallback are expected
+    /// compatibility states, not red error states.
+    @Published private(set) var turnInfo: String?
+
     /// When non-nil, a the manual verification sheet should be presented so
     /// the user can solve the slider. The sheet calls `resolveManual`
     /// / `cancelManual` to drive the refresh forward.
@@ -288,6 +294,7 @@ final class TURNCredsRefresher: ObservableObject {
         refreshStartedAt = Date()
         isRefreshing = true
         lastError = nil
+        turnInfo = nil
         TURNLog.info("turncreds", "starting refresh task gen=\(generation)")
 
         inFlight = Task { @MainActor [weak self] in
@@ -307,8 +314,15 @@ final class TURNCredsRefresher: ObservableObject {
                 )
                 let hashPrefix = String(VKCredsPreferences.primaryCallHash.prefix(8))
                 TURNLog.info("turncreds", "config built (hash=\(hashPrefix)...)")
-                let client = VKCredsClient(config: config,
-                                            captchaSolver: ChainedCaptchaSolver(refresher: self))
+                let client = VKCredsClient(
+                    config: config,
+                    captchaSolver: ChainedCaptchaSolver(refresher: self),
+                    progress: { [weak self] message in
+                        Task { @MainActor in
+                            self?.turnInfo = message
+                        }
+                    }
+                )
                 // Race fetchSession parameters against a watchdog so a wedged
                 // network call or stuck WKWebView can't lock the
                 // refresher into `isRefreshing=true` forever.

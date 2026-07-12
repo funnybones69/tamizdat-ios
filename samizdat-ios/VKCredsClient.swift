@@ -158,7 +158,12 @@ enum VKCredsError: Error, LocalizedError {
         case .retriesExhausted(let e):
             return "Исчерпаны попытки получения TURN-кредов: \(e.localizedDescription)"
         case .vkError(let step, let payload):
-            return "Ошибка VK на шаге \(step): \(payload)"
+            let code: String = {
+                if let n = payload["error_code"] as? NSNumber { return n.stringValue }
+                if let s = payload["error_code"] as? String { return s }
+                return "unknown"
+            }()
+            return "Ошибка VK на шаге \(step) (code=\(code))"
         case .transport(let step, let underlying):
             return "Сетевая ошибка на шаге \(step): \(underlying.localizedDescription)"
         case .malformedResponse(let step, let hint):
@@ -231,6 +236,7 @@ private struct VKCaptchaChallenge {
 actor VKCredsClient {
     private let config: VKCredsConfig
     private let captchaSolver: VKCaptchaSolver
+    private let progress: (@Sendable (String) -> Void)?
     private let log = Logger(subsystem: "com.anarki.samizdat-test.captcha", category: "vkcreds")
 
     /// Per-instance URLSession backed by an isolated cookie jar — keeps
@@ -281,9 +287,11 @@ actor VKCredsClient {
     }
 
     init(config: VKCredsConfig,
-         captchaSolver: VKCaptchaSolver = WKWebViewCaptchaSolver()) {
+         captchaSolver: VKCaptchaSolver = WKWebViewCaptchaSolver(),
+         progress: (@Sendable (String) -> Void)? = nil) {
         self.config = config
         self.captchaSolver = captchaSolver
+        self.progress = progress
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieStorage = HTTPCookieStorage()
@@ -307,25 +315,138 @@ actor VKCredsClient {
     func fetchCredentials() async throws -> VKTURNCredentials {
         let hashPrefix = String(config.callHash.prefix(8))
         TURNLog.info("vkcreds", "fetchCredentials: starting (hash=\(hashPrefix)... appIDs=\(config.vkAppIDs.count))")
+        progress?("TURN: пробую подключение без капчи…")
         do {
-            return try await runWithRetries(hash: config.callHash)
-        } catch VKCredsError.deadHash {
-            TURNLog.error("vkcreds", "fetchCredentials: primary hash is dead (hash=\(hashPrefix)...)")
-            if let secondary = config.secondaryHash, !secondary.isEmpty {
-                log.warning("primary hash dead — trying secondary")
-                return try await runWithRetries(hash: secondary, maxAttempts: max(1, config.maxRetries - 2))
+            let creds = try await fetchAnonymousVKCallsCredentials(hash: config.callHash)
+            TURNLog.info("vkcreds", "anonymous VKCalls flow succeeded")
+            progress?("TURN: подключение без капчи успешно.")
+            return creds
+        } catch {
+            // The old five-call VK flow is deliberately retained as the
+            // automatic compatibility fallback. Do not expose the primary
+            // error (it may contain server payload data) in the UI.
+            TURNLog.warn("vkcreds", "anonymous VKCalls flow unavailable — falling back to legacy verification flow")
+            progress?("TURN: первый способ не сработал — пробую старый способ с капчей…")
+            do {
+                let creds = try await runWithRetries(hash: config.callHash)
+                progress?("TURN: подключение выполнено через резервный способ.")
+                return creds
+            } catch VKCredsError.deadHash {
+                TURNLog.error("vkcreds", "fetchCredentials: primary hash is dead (hash=\(hashPrefix)...)")
+                if let secondary = config.secondaryHash, !secondary.isEmpty {
+                    log.warning("primary hash dead — trying secondary")
+                    let creds = try await runWithRetries(hash: secondary, maxAttempts: max(1, config.maxRetries - 2))
+                    progress?("TURN: подключение выполнено через резервный способ.")
+                    return creds
+                }
+                throw VKCredsError.deadHash
+            } catch VKCredsError.allAppIDsExhausted {
+                throw VKCredsError.allAppIDsExhausted
             }
-            throw VKCredsError.deadHash
-        } catch VKCredsError.allAppIDsExhausted {
-            // Don't try secondary hash on rate-limit exhaustion: same
-            // pool of VK quotas, same exhaustion would just play out
-            // again. Surface the dedicated error so UI can show a
-            // "подожди X минут" message rather than a generic retry.
-            throw VKCredsError.allAppIDsExhausted
         }
     }
 
-    // MARK: – Retry loop
+    /// Primary accountless VKCalls flow. It does not use the legacy
+    /// `calls.getAnonymousToken` endpoint, so a VK verification challenge
+    /// never enters this path. Any failure is intentionally thrown to the
+    /// caller, which then invokes the existing CAPTCHA-capable flow.
+    private func fetchAnonymousVKCallsCredentials(hash: String) async throws -> VKTURNCredentials {
+        let normalizedHash = Self.normalizeCallHash(hash)
+        guard !normalizedHash.isEmpty else {
+            throw VKCredsError.malformedResponse(step: "anonymous", hint: "empty call hash")
+        }
+        let deviceID = UUID().uuidString.lowercased()
+        let joinURL = "https://vk.com/call/join/\(normalizedHash)"
+        let names = ["Alex", "Anna", "Ivan", "Maria", "Maxim", "Olga", "Pavel", "Sergey"]
+        let nameIndex = deviceID.unicodeScalars.reduce(0) { partial, scalar in
+            partial + Int(scalar.value)
+        } % names.count
+        let guestName = names[nameIndex]
+        let api = "https://api.vk.me"
+        let version = "5.276"
+        let clientID = "8093730"
+
+        let step1 = try await postJSON(
+            "v=\(version)&client_id=\(clientID)&link=\(Self.urlEncoded(joinURL))&device_id=\(deviceID)&anonymName=\(Self.urlEncoded(guestName))&lang=en",
+            to: "\(api)/method/auth.getAnonymToken",
+            step: "anonymous.1"
+        )
+        try Self.assertAnonymousResponseOK(step1, step: "anonymous.1")
+        let anonymousToken = try Self.requireString(step1, path: ["response", "token"], step: "anonymous.1")
+
+        let step2 = try await postJSON(
+            "v=\(version)&anonymous_token=\(Self.urlEncoded(anonymousToken))&device_id=\(deviceID)&extended=1&fields=first_name%2Clast_name%2Cphoto_200&lang=en&link=\(Self.urlEncoded(joinURL))",
+            to: "\(api)/method/messages.getCallPreview",
+            step: "anonymous.2"
+        )
+        try Self.assertAnonymousResponseOK(step2, step: "anonymous.2")
+        let userID = try Self.requireNumberString(step2, path: ["response", "user_id"], step: "anonymous.2")
+        let secret = try Self.requireString(step2, path: ["response", "secret"], step: "anonymous.2")
+
+        let step3 = try await postJSON(
+            "v=\(version)&anonymous_token=\(Self.urlEncoded(anonymousToken))&device_id=\(deviceID)&link=\(Self.urlEncoded(joinURL))&name=\(Self.urlEncoded(guestName))&user_id=\(Self.urlEncoded(userID))&secret=\(Self.urlEncoded(secret))&lang=en",
+            to: "\(api)/method/messages.getAnonymCallToken",
+            step: "anonymous.3"
+        )
+        try Self.assertAnonymousResponseOK(step3, step: "anonymous.3")
+        let callToken = try Self.requireString(step3, path: ["response", "token"], step: "anonymous.3")
+
+        let okDeviceID = UUID().uuidString.lowercased()
+        let sessionData = "{\"version\":2,\"device_id\":\"\(okDeviceID)\",\"client_version\":\"1.0.1\"}"
+        let step4 = try await postJSON(
+            "session_data=\(Self.urlEncoded(sessionData))&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA",
+            to: "https://calls.okcdn.ru/fb.do",
+            step: "anonymous.4"
+        )
+        try Self.assertAnonymousResponseOK(step4, step: "anonymous.4")
+        let sessionKey = try Self.requireString(step4, path: ["session_key"], step: "anonymous.4")
+
+        let step5 = try await postJSON(
+            "joinLink=\(Self.urlEncoded(normalizedHash))&isVideo=false&protocolVersion=5&anonymToken=\(Self.urlEncoded(callToken))&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=\(Self.urlEncoded(sessionKey))",
+            to: "https://calls.okcdn.ru/fb.do",
+            step: "anonymous.5"
+        )
+        try Self.assertAnonymousResponseOK(step5, step: "anonymous.5")
+        guard let turnBlock = step5["turn_server"] as? [String: Any] else {
+            throw VKCredsError.malformedResponse(step: "anonymous.5", hint: "TURN block missing")
+        }
+        return try Self.parseTurnBlock(turnBlock)
+    }
+
+    private static func assertAnonymousResponseOK(_ payload: [String: Any], step: String) throws {
+        if let code = payload["error_code"] as? NSNumber, code.intValue != 0 {
+            throw VKCredsError.vkError(step: step, payload: ["error_code": code])
+        }
+        guard let error = payload["error"] as? [String: Any] else {
+            return
+        }
+        if let code = error["error_code"] as? NSNumber, code.intValue != 0 {
+            throw VKCredsError.vkError(step: step, payload: ["error_code": code])
+        }
+    }
+
+    private static func requireNumberString(_ payload: [String: Any], path: [String], step: String) throws -> String {
+        var cur: Any = payload
+        for key in path {
+            guard let dict = cur as? [String: Any], let next = dict[key] else {
+                throw VKCredsError.malformedResponse(step: step, hint: "missing path \(path.joined(separator: "."))")
+            }
+            cur = next
+        }
+        if let s = cur as? String, !s.isEmpty { return s }
+        if let n = cur as? NSNumber { return n.stringValue }
+        throw VKCredsError.malformedResponse(step: step, hint: "non-numeric value")
+    }
+
+    private static func normalizeCallHash(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = URL(string: value), url.host != nil {
+            value = url.path.split(separator: "/").last.map(String.init) ?? value
+        }
+        if let slash = value.lastIndex(of: "/") { value = String(value[value.index(after: slash)...]) }
+        if let cut = value.firstIndex(where: { $0 == "?" || $0 == "#" }) { value = String(value[..<cut]) }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     private func runWithRetries(hash: String, maxAttempts: Int? = nil) async throws -> VKTURNCredentials {
         let attempts = maxAttempts ?? config.maxRetries
@@ -670,7 +791,9 @@ actor VKCredsClient {
                   !parts[0].isEmpty else {
                 return nil
             }
-            var transport = "udp"
+            // TLS TURN (`turns:`) is TCP by definition unless the response
+            // explicitly says otherwise. This matches the Go VKCalls client.
+            var transport = scheme == "turns" ? "tcp" : "udp"
             if let queryPart {
                 for kv in queryPart.split(separator: "&") {
                     let pair = kv.split(separator: "=", maxSplits: 1).map(String.init)
@@ -702,8 +825,8 @@ actor VKCredsClient {
                 TURNLog.info("vkcreds", "parsed ttl=\(Int(ttl))s from response")
                 return ttl
             }
-            TURNLog.warn("vkcreds", "no lifetime/ttl in step 5 response — using default 3600s")
-            return 3600
+            TURNLog.warn("vkcreds", "no lifetime/ttl in step 5 response — using default 600s")
+            return 600
         }()
         return VKTURNCredentials(
             username: user,

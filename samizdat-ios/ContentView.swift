@@ -393,6 +393,13 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
+                if let turnInfo = turnRefresher.turnInfo, !turnInfo.isEmpty {
+                    Text(turnInfo)
+                        .font(.geist(.regular, size: 13))
+                        .foregroundStyle(theme.amber)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 24)
+                }
                 if let vpnProfileError {
                     Text(vpnProfileError)
                         .font(.geist(.regular, size: 13))
