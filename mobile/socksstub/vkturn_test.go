@@ -81,6 +81,10 @@ func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
 		t.Fatal("async stop did not gate replacement start while workers drain")
 	}
 	close(done)
+	time.Sleep(100 * time.Millisecond)
+	if !TURNUpstreamDraining() {
+		t.Fatal("async stop cleared gate before TURN allocation release grace elapsed")
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for TURNUpstreamDraining() && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)

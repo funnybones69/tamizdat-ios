@@ -84,14 +84,9 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, workers, workersPerRoom int, hashes []string, credsByHash map[string]*wgturnclient.Credentials, singleCreds *wgturnclient.Credentials, jsonLen int) string {
 	vkturnMu.Lock()
 	if vkturnDraining != nil {
-		select {
-		case <-vkturnDraining:
-			vkturnDraining = nil
-		default:
-			vkturnMu.Unlock()
-			rt.appendLog("warn: vkturn start blocked — previous runner still draining worker sessions")
-			return "previous runner still draining"
-		}
+		vkturnMu.Unlock()
+		rt.appendLog("warn: vkturn start blocked — previous runner still draining worker sessions")
+		return "previous runner still draining"
 	}
 	if vkturnRunning.Load() {
 		runningStats := TURNUpstreamStatsJSON()
@@ -291,6 +286,7 @@ func StopVKTurnUpstream() {
 			rt.appendLog("info: vkturn shutdown drained all worker sessions and waited for allocation release")
 		case <-time.After(vkturnShutdownWaitTimeout):
 			vkturnDraining = done
+			finishVKTurnDrainAsync(done)
 			rt.appendLog(fmt.Sprintf("warn: vkturn shutdown drain timed out after %s; replacement starts are blocked until drain completes", vkturnShutdownWaitTimeout))
 		}
 	} else {
@@ -337,7 +333,11 @@ func StopVKTurnUpstreamAsync() {
 	if done == nil || alreadyDraining {
 		return
 	}
-	go func(drain <-chan struct{}) {
+	finishVKTurnDrainAsync(done)
+}
+
+func finishVKTurnDrainAsync(drain <-chan struct{}) {
+	go func() {
 		<-drain
 		time.Sleep(vkturnAllocationReleaseWait)
 		vkturnMu.Lock()
@@ -347,7 +347,7 @@ func StopVKTurnUpstreamAsync() {
 		}
 		vkturnMu.Unlock()
 		rt.appendLog("info: vkturn async shutdown drained worker sessions and released allocations")
-	}(done)
+	}()
 }
 
 // TURNUpstreamDraining reports that a cancelled runner still owns worker
@@ -355,15 +355,7 @@ func StopVKTurnUpstreamAsync() {
 func TURNUpstreamDraining() bool {
 	vkturnMu.Lock()
 	defer vkturnMu.Unlock()
-	if vkturnDraining == nil {
-		return false
-	}
-	select {
-	case <-vkturnDraining:
-		return false
-	default:
-		return true
-	}
+	return vkturnDraining != nil
 }
 
 // TURNUpstreamWGConfig returns the latest WireGuard config text delivered
