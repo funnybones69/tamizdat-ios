@@ -113,7 +113,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private let rewireQueue = DispatchQueue(label: "com.anarki.samizdat-test.rewire", qos: .userInitiated)
     private let rewireGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
-    private static let turnAttachAllowedLock = OSAllocatedUnfairLock<Bool>(initialState: false)
+    private static let turnTunnelGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
     private static let turnAttachRetryLock = OSAllocatedUnfairLock<Bool>(initialState: false)
     private var rewireGeneration: Int {
         get { rewireGenerationLock.withLock { $0 } }
@@ -146,7 +146,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Start writing into App Group log file immediately so we have a
         // timeline even if hev fails to launch.
         openLogSink()
-        Self.turnAttachAllowedLock.withLock { $0 = true }
+        Self.turnTunnelGenerationLock.withLock { $0 += 1 }
         appendExtLog("info: PacketTunnelProvider startTunnel (Path 3 / hev)")
 
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
@@ -298,10 +298,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     @discardableResult
     private static func attachVKTurnUpstream(scheduleDrainRetry: Bool = true) -> String {
         ExtLog.info("[vkturn] attach: entering helper")
-        guard turnAttachAllowedLock.withLock({ $0 }) else {
-            ExtLog.info("[vkturn] attach skipped — tunnel lifecycle no longer allows TURN starts")
-            return "tunnelStopped"
-        }
 
         // Read runtime values from App Group UserDefaults — these keys
         // are written by the main app. VKSession paramsPreferences/TURNSession paramsStore
@@ -464,11 +460,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
+        let capturedTunnelGeneration = turnTunnelGenerationLock.withLock { $0 }
         Task.detached(priority: .utility) {
             defer { turnAttachRetryLock.withLock { $0 = false } }
             for attempt in 1...120 { // up to 60 s; never blocks NE stop watchdog
-                guard turnAttachAllowedLock.withLock({ $0 }) else {
-                    ExtLog.info("[vkturn] drain retry cancelled — tunnel stopped")
+                guard turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration else {
+                    ExtLog.info("[vkturn] drain retry cancelled — tunnel generation changed")
+                    return
+                }
+                let policy = upstreamPolicy(mode: EndpointModeStore.current, backup: nil)
+                guard policy.usesTURN else {
+                    ExtLog.info("[vkturn] drain retry cancelled — current policy no longer uses TURN")
                     return
                 }
                 if !SocksstubTURNUpstreamDraining() {
@@ -542,7 +544,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // NE stop must return promptly: cancel/reset synchronously, but drain
         // TURN workers/allocations in Go background. Replacement starts remain
         // gated until that drain completes.
-        Self.turnAttachAllowedLock.withLock { $0 = false }
+        Self.turnTunnelGenerationLock.withLock { $0 += 1 }
         SocksstubStopVKTurnUpstreamAsync()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()

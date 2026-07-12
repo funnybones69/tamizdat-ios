@@ -21,6 +21,25 @@ func TestLegacySingleRoomPlannerTwenty(t *testing.T) {
 	}
 }
 
+func TestNewLegacySingleRoomPreservesTwentyWorkers(t *testing.T) {
+	runner, err := New(Config{
+		PeerAddr:       "127.0.0.1:443",
+		Workers:        20,
+		UseUDP:         true,
+		PreloadedCreds: testRoomCreds("legacy"),
+	})
+	if err != nil {
+		t.Fatalf("New legacy single-room: %v", err)
+	}
+	if runner.cfg.Workers != 20 {
+		t.Fatalf("effective workers=%d, want 20", runner.cfg.Workers)
+	}
+	plans := buildWorkerGroupPlans(runner.cfg.Workers, len(runner.cfg.VKHashes), runner.cfg.WorkersPerRoom)
+	if len(plans) != 2 || plans[0].workerCount != 12 || plans[1].workerCount != 8 {
+		t.Fatalf("effective plans=%+v, want 12+8", plans)
+	}
+}
+
 func TestMultiRoomPlannerFourByTwenty(t *testing.T) {
 	plans := buildWorkerGroupPlans(80, 4, 20)
 	if len(plans) != 8 {

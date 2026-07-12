@@ -417,7 +417,9 @@ func normalizeWorkerCount(n int) int {
 	if n < workersPerGroup {
 		n = workersPerGroup
 	}
-	return (n / workersPerGroup) * workersPerGroup
+	// The planner supports a final partial group (for example 20 => 12+8).
+	// Preserve the exact requested count instead of silently flooring it.
+	return n
 }
 
 func normalizeHashes(hashes []string) []string {
