@@ -28,6 +28,11 @@ import SamizdatClient
 /// gomobile cgo bridging, no per-flow Go goroutines.
 final class PacketTunnelProvider: NEPacketTunnelProvider {
 
+    private struct MemoryPressureState {
+        var lastNuclearCloseAt = Date.distantPast
+        var didDumpHeap = false
+    }
+
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
     private let runningState = OSAllocatedUnfairLock<Bool>(initialState: false)
     private var isRunning: Bool {
@@ -51,6 +56,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var hbTick: Int = 0
     private var swiftLogHandle: FileHandle?
     private var memPressureSrc: DispatchSourceMemoryPressure?
+    private let memoryPressureState = OSAllocatedUnfairLock<MemoryPressureState>(initialState: .init())
+    private static let memoryPressureCooldown: TimeInterval = 60
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
@@ -1431,18 +1438,38 @@ misc:
 
     private func startBurstProtection() {
         // IPA-D7: nuclear close pattern from sing-box-for-apple.
-        // IPA-D9: dump heap profile right before nuclear close — captures
-        // the heap state at the exact moment iOS says we're critical,
-        // which is the most informative snapshot for diagnosing leaks.
+        // IPA-D9: dump one heap profile per pressure episode. iOS may
+        // repeatedly deliver `.critical`; the shared cooldown below prevents
+        // a GC/profile/flow-close feedback loop.
+        memoryPressureState.withLock { $0 = MemoryPressureState() }
         let q = DispatchQueue(label: "com.anarki.samizdat-test.burst", qos: .userInitiated)
         let src = DispatchSource.makeMemoryPressureSource(eventMask: [.critical], queue: q)
         src.setEventHandler { [weak self] in
-            self?.dumpProfileBeforeNuclear(reason: "kernel-critical")
-            let closed = SocksstubCloseAllFlows()
-            self?.appendExtLog("warn: kernel memorypressure CRITICAL — nuclear close (\(closed) flows)")
+            _ = self?.handleCriticalMemoryPressure(reason: "kernel-critical")
         }
         src.activate()
         self.memPressureSrc = src
+    }
+
+    private func handleCriticalMemoryPressure(reason: String) -> Bool {
+        let now = Date()
+        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool) in
+            guard now.timeIntervalSince(state.lastNuclearCloseAt) >= Self.memoryPressureCooldown else {
+                return (false, false)
+            }
+            state.lastNuclearCloseAt = now
+            let shouldDump = !state.didDumpHeap
+            state.didDumpHeap = true
+            return (true, shouldDump)
+        }
+        guard decision.run else { return false }
+
+        if decision.dump {
+            dumpProfileBeforeNuclear(reason: reason)
+        }
+        let closed = SocksstubCloseAllFlows()
+        appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — nuclear close (\(closed) flows); cooldown=60s")
+        return true
     }
 
     private func dumpProfileBeforeNuclear(reason: String) {
@@ -1488,10 +1515,7 @@ misc:
             let availBytes = os_proc_available_memory()
             var nuclearFired = false
             if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
-                self.dumpProfileBeforeNuclear(reason: "avail8mib")
-                let closed = SocksstubCloseAllFlows()
-                self.appendExtLog("warn: avail<8MiB heartbeat — nuclear close (\(closed) flows)")
-                nuclearFired = true
+                nuclearFired = self.handleCriticalMemoryPressure(reason: "avail8mib")
             }
 
             // Go heap detail — disambiguates "Go is bloating" from

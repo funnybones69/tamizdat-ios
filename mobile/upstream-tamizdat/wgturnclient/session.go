@@ -19,10 +19,12 @@ import (
 )
 
 const (
-	workerSendBuf      = 128
-	sessionReadTimeout = 60 * time.Second
-	readBufSize        = 1600
-	socketBufSize      = 625 * 1024
+	singleRoomWorkerSendBuf = 128
+	multiRoomWorkerSendBuf  = 32
+	sessionReadTimeout      = 60 * time.Second
+	readBufSize             = 1600
+	singleRoomSocketBufSize = 625 * 1024
+	multiRoomSocketBufSize  = 128 * 1024
 	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696.
 	// Cap concurrent DTLS handshakes to 3 to stop the OK CDN TURN
 	// server from rate-limiting the whole worker group when many
@@ -32,6 +34,24 @@ const (
 	handshakeSemCap     = 3
 	handshakeAcquireTTL = 5 * time.Second
 )
+
+type sessionMemoryProfile struct {
+	socketBufferSize int
+	workerSendBuffer int
+}
+
+func memoryProfileForWorkers(workers int) sessionMemoryProfile {
+	if workers > maxWorkersPerRoom {
+		return sessionMemoryProfile{
+			socketBufferSize: multiRoomSocketBufSize,
+			workerSendBuffer: multiRoomWorkerSendBuf,
+		}
+	}
+	return sessionMemoryProfile{
+		socketBufferSize: singleRoomSocketBufSize,
+		workerSendBuffer: singleRoomWorkerSendBuf,
+	}
+}
 
 // handshakeSem throttles concurrent DTLS Client handshakes against
 // the TURN server. Package-level so all worker groups inside one
@@ -257,6 +277,7 @@ func RunSession(
 	deviceID, password string,
 	stats *Stats,
 	onEvent EventFunc,
+	memoryProfile sessionMemoryProfile,
 ) (bool, error) {
 	configDelivered := false
 
@@ -291,8 +312,8 @@ func RunSession(
 			return false, fmt.Errorf("подключение TURN UDP: %w", err)
 		}
 		defer c.Close()
-		_ = c.SetReadBuffer(socketBufSize)
-		_ = c.SetWriteBuffer(socketBufSize)
+		_ = c.SetReadBuffer(memoryProfile.socketBufferSize)
+		_ = c.SetWriteBuffer(memoryProfile.socketBufferSize)
 		turnConn = &connectedUDPConn{c}
 	} else {
 		dialer := &net.Dialer{Timeout: 10 * time.Second}
@@ -312,8 +333,8 @@ func RunSession(
 		defer c.Close()
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
-			_ = tc.SetReadBuffer(socketBufSize)
-			_ = tc.SetWriteBuffer(socketBufSize)
+			_ = tc.SetReadBuffer(memoryProfile.socketBufferSize)
+			_ = tc.SetWriteBuffer(memoryProfile.socketBufferSize)
 		}
 		turnConn = turn.NewSTUNConn(c)
 	}
@@ -485,7 +506,7 @@ func RunSession(
 	// Регистрация в диспетчере
 	slot := &WorkerSlot{
 		ID:     sessionID,
-		SendCh: make(chan []byte, workerSendBuf),
+		SendCh: make(chan []byte, memoryProfile.workerSendBuffer),
 	}
 	d.Register(slot)
 	defer d.Unregister(slot)

@@ -215,7 +215,8 @@ func (r *Runner) workerGroup(
 					}
 
 					configDelivered, sessErr := RunSession(batchCtx, tp, peer, d, localPort, useUDP,
-						getConf, cc, wid, creds, deviceID, password, stats, r.cfg.OnEvent)
+						getConf, cc, wid, creds, deviceID, password, stats, r.cfg.OnEvent,
+						memoryProfileForWorkers(r.cfg.Workers))
 
 					if getConf {
 						broker.complete(configDelivered)

@@ -40,6 +40,21 @@ func TestNewLegacySingleRoomPreservesTwentyWorkers(t *testing.T) {
 	}
 }
 
+func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T) {
+	single := memoryProfileForWorkers(20)
+	if single.socketBufferSize != 625*1024 || single.workerSendBuffer != 128 {
+		t.Fatalf("single-room profile=%+v, want legacy 625KiB/128", single)
+	}
+
+	multi := memoryProfileForWorkers(80)
+	if multi.socketBufferSize != 128*1024 || multi.workerSendBuffer != 32 {
+		t.Fatalf("multi-room profile=%+v, want 128KiB/32", multi)
+	}
+	if got := 80 * multi.socketBufferSize * 2; got > 20*1024*1024 {
+		t.Fatalf("multi-room requested socket memory=%d, want <=20MiB", got)
+	}
+}
+
 func TestMultiRoomPlannerFourByTwenty(t *testing.T) {
 	plans := buildWorkerGroupPlans(80, 4, 20)
 	if len(plans) != 8 {

@@ -199,8 +199,10 @@ func (r *Runner) Start(ctx context.Context) error {
 	r.setLocalConn(localConn)
 	defer localConn.Close()
 	if uc, ok := localConn.(*net.UDPConn); ok {
-		_ = uc.SetReadBuffer(socketBufSize)
-		_ = uc.SetWriteBuffer(socketBufSize)
+		// This is one shared dispatcher socket, so retain the single-room
+		// capacity. Per-worker TURN sockets use an adaptive memory profile.
+		_ = uc.SetReadBuffer(singleRoomSocketBufSize)
+		_ = uc.SetWriteBuffer(singleRoomSocketBufSize)
 	}
 	stopLocalConn := context.AfterFunc(runCtx, func() { _ = localConn.Close() })
 	defer stopLocalConn()
@@ -230,7 +232,8 @@ func (r *Runner) Start(ctx context.Context) error {
 	log.Printf("[КЛИЕНТ] Device ID: %s", r.cfg.DeviceID)
 	log.Printf("[КЛИЕНТ] Обход капчи: %s", r.getCaptchaMode())
 	log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
-	r.eventf("info", "runner start workers=%d groups=%d workersPerGroup=%d proto=%s preloaded=%t %s deviceIDLen=%d", r.cfg.Workers, numGroups, workersPerGroup, proto, r.preloadedCreds.Load() != nil, credentialsSummary(r.preloadedCreds.Load()), len(r.cfg.DeviceID))
+	memoryProfile := memoryProfileForWorkers(r.cfg.Workers)
+	r.eventf("info", "runner start workers=%d groups=%d workersPerGroup=%d proto=%s socketBuf=%d sendQueue=%d preloaded=%t %s deviceIDLen=%d", r.cfg.Workers, numGroups, workersPerGroup, proto, memoryProfile.socketBufferSize, memoryProfile.workerSendBuffer, r.preloadedCreds.Load() != nil, credentialsSummary(r.preloadedCreds.Load()), len(r.cfg.DeviceID))
 
 	stats := NewStats()
 	shutdownCh := make(chan struct{})
