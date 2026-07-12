@@ -35,13 +35,9 @@ struct SettingsView: View {
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
 
-    // VK TURN call-hash field. The hash is the slug after `/join/` in a
-    // VK call invite URL (e.g. `https://vk.ru/call/join/<HASH>`). Only
-    // the hash and TURN worker count are editable here: peer/server and
-    // connection password are derived from Main tamizdat:// URI and mirrored
-    // to App Group on Save.
-    @State private var vkCallHashDraft: String = VKCredsPreferences.primaryCallHash
-    @State private var vkWorkersDraft: Int = VKCredsPreferences.workers
+    // One VK invite per line, up to four rooms. Each room automatically gets
+    // the verified pool size of 20 workers; peer/password still derive from Main.
+    @State private var vkRoomsDraft: String = VKCredsPreferences.roomHashes.joined(separator: "\n")
     @State private var vkCallHashFeedback: String = ""
 
     // Whitelist-detection comparative TCP+TLS target lists.
@@ -223,54 +219,47 @@ struct SettingsView: View {
                     IconCard(systemName: "phone.connection",
                              bg: theme.mintDim, fg: theme.mint)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Call invite hash")
+                        Text("VK TURN rooms")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("VK → group → call → invite link → slug after /join/")
+                        Text("Paste 1–4 invite links, one per line")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
                     Spacer()
                 }
 
-                TextField("https://vk.ru/call/join/...", text: $vkCallHashDraft)
+                TextEditor(text: $vkRoomsDraft)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .keyboardType(.URL)
                     .font(.geistMono(.regular, size: 12.5))
                     .foregroundStyle(theme.text)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 11)
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 104)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
                     .background(theme.chip)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
-                    .onSubmit { saveVKTurnSettings() }
 
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Workers")
-                            .font(.geist(.medium, size: 12))
-                            .foregroundStyle(theme.textMuted)
-                        Spacer()
-                        Text("\(vkWorkersDraft)")
-                            .font(.geistMono(.semibold, size: 12))
-                            .foregroundStyle(theme.text)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(theme.chip)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-                    }
-                    Stepper(
-                        "",
-                        value: $vkWorkersDraft,
-                        in: VKCredsPreferences.minWorkers...VKCredsPreferences.maxWorkers,
-                        step: VKCredsPreferences.workerStep
-                    )
-                    .labelsHidden()
-                    Text("12–72, step 12. Save restarts active TURN; otherwise applies on next VPN/TURN connect.")
-                        .font(.geistMono(.regular, size: 10))
-                        .foregroundStyle(theme.textDim)
+                let roomCount = Self.roomHashes(from: vkRoomsDraft).count
+                HStack {
+                    Text("Rooms")
+                        .font(.geist(.medium, size: 12))
+                        .foregroundStyle(theme.textMuted)
+                    Spacer()
+                    Text("\(roomCount)/4 · \(roomCount * VKCredsPreferences.workersPerRoom) workers")
+                        .font(.geistMono(.semibold, size: 12))
+                        .foregroundStyle(theme.text)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(theme.chip)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
-                .padding(.top, 2)
+
+                Text("Rooms cannot be discovered automatically: VK does not expose the required private calls. Add each invite once; links are normalized and duplicates removed. Every room uses 20 workers automatically.")
+                    .font(.geistMono(.regular, size: 10))
+                    .foregroundStyle(theme.textDim)
 
                 Text("Server is derived from Main URI; connection password is that user's shortid. VK TURN is enabled by Whitelist mode = TURN.")
                     .font(.geistMono(.regular, size: 10))
@@ -297,18 +286,10 @@ struct SettingsView: View {
         }
     }
 
-    /// Strip wrapping whitespace and (if present) the `/call/join/`
-    /// prefix so the user can paste either a full invite URL or a bare
-    /// hash. Trailing query / fragment is dropped as well.
-    private static func normalizeVKHash(_ raw: String) -> String {
-        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if let range = s.range(of: "/call/join/") {
-            s = String(s[range.upperBound...])
-        }
-        if let q = s.firstIndex(where: { $0 == "?" || $0 == "#" }) {
-            s = String(s[..<q])
-        }
-        return s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    private static func roomHashes(from draft: String) -> [String] {
+        VKCredsPreferences.normalizeRoomHashes(
+            draft.components(separatedBy: .newlines)
+        )
     }
 
     private func syncVKDerivedH2Config() -> SamizdatURLCodec.H2PeerConfig? {
@@ -318,59 +299,55 @@ struct SettingsView: View {
         return derived
     }
 
-    /// Save the VK call hash explicitly. Peer/server and password are
-    /// always derived from the Main tamizdat:// URI: server = Main URI
-    /// authority, password = that user's shortid. Worker count is a local
-    /// performance knob for the client-side VK TURN fanout.
     private func saveVKTurnSettings() {
-        let oldHash = VKCredsPreferences.primaryCallHash
-        let oldWorkers = VKCredsPreferences.workers
+        let oldRooms = VKCredsPreferences.roomHashes
         let derived = syncVKDerivedH2Config()
-        let hash = Self.normalizeVKHash(vkCallHashDraft)
-        let workers = VKCredsPreferences.normalizeWorkers(vkWorkersDraft)
-        VKCredsPreferences.primaryCallHash = hash
-        VKCredsPreferences.workers = workers
-        vkCallHashDraft = hash
-        vkWorkersDraft = workers
+        let rooms = Self.roomHashes(from: vkRoomsDraft)
+        guard rooms.count <= VKCredsPreferences.maxRooms else {
+            vkCallHashFeedback = "Можно сохранить максимум 4 уникальные комнаты"
+            return
+        }
+        VKCredsPreferences.roomHashes = rooms
+        VKCredsPreferences.workers = VKCredsPreferences.workersPerRoom
+        vkRoomsDraft = rooms.joined(separator: "\n")
 
-        if hash != oldHash {
+        if rooms != oldRooms {
             TURNCredsStore.shared.clear()
         }
 
-        guard !hash.isEmpty else {
+        guard !rooms.isEmpty else {
             TURNCredsStore.shared.clear()
-            vkCallHashFeedback = "Сохранено: hash пуст, TURN credentials очищены; workers=\(workers)"
+            vkCallHashFeedback = "Сохранено: комнаты очищены"
             return
         }
         guard derived != nil else {
-            vkCallHashFeedback = "Нет Main URI или shortid в Proxies; workers=\(workers) сохранены"
+            vkCallHashFeedback = "Нет Main URI или shortid в Proxies; \(rooms.count) комнат сохранено"
             return
         }
 
-        let needsRefresh = (hash != oldHash) || TURNCredsStore.shared.needsRefresh
+        let totalWorkers = rooms.count * VKCredsPreferences.workersPerRoom
+        let needsRefresh = (rooms != oldRooms) || TURNCredsStore.shared.needsRefresh
         let turnActive = TURNCredsRefresher.shouldMaintainTurnCredentialsNow()
         if needsRefresh && turnActive {
-            vkCallHashFeedback = "Сохранено: workers=\(workers); обновляю TURN credentials..."
+            vkCallHashFeedback = "Сохранено: \(rooms.count) комнат, \(totalWorkers) workers; получаю credentials…"
             TURNCredsRefresher.shared.forceRefresh(reason: "settingsSave", requireActiveTURN: true)
         } else if needsRefresh {
-            vkCallHashFeedback = "Сохранено: workers=\(workers); TURN credentials обновятся при подключении к Whitelist+TURN"
-        } else if workers != oldWorkers {
-            vkCallHashFeedback = "Сохранено: workers=\(workers); перезапускаю активный TURN..."
+            vkCallHashFeedback = "Сохранено: \(rooms.count) комнат, \(totalWorkers) workers; credentials обновятся при TURN"
         } else {
-            vkCallHashFeedback = "Сохранено: workers=\(workers)"
+            vkCallHashFeedback = "Сохранено: \(rooms.count) комнат, \(totalWorkers) workers"
         }
 
         Task { @MainActor in
             let result = await VPNProfileStore.shared.restartVKTurnUpstream()
             switch result {
             case "attachStarted":
-                vkCallHashFeedback = "Сохранено: workers=\(workers); TURN перезапущен"
-            case let s where s.hasPrefix("turnDisabled"):
-                vkCallHashFeedback = "Сохранено: workers=\(workers); применится при Whitelist+TURN"
+                vkCallHashFeedback = "TURN перезапущен: \(rooms.count)×20"
+            case let value where value.hasPrefix("turnDisabled"):
+                vkCallHashFeedback = "Сохранено: \(rooms.count)×20 применится при Whitelist+TURN"
             case "noCreds":
-                vkCallHashFeedback = "Сохранено: workers=\(workers); жду свежие TURN credentials"
+                vkCallHashFeedback = "Сохранено: жду credentials для всех \(rooms.count) комнат"
             case "sendError":
-                vkCallHashFeedback = "Сохранено: workers=\(workers); применится при следующем connect"
+                vkCallHashFeedback = "Сохранено: применится при следующем connect"
             default:
                 break
             }

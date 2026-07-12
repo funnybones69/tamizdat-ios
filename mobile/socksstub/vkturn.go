@@ -55,6 +55,27 @@ const (
 // startup is not blocked on TURN Allocate / DTLS handshakes. Calling it
 // again while the runner is alive is treated as success.
 func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int, workers int) string {
+	creds, err := parseVKTurnCredsJSON(credsJSON)
+	if err != nil {
+		return "credsJSON: " + err.Error()
+	}
+	workers = normalizeVKTurnWorkers(workers)
+	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, workers, 0, nil, nil, creds, len(credsJSON))
+}
+
+// StartVKTurnMultiRoomUpstream starts one full 20-worker pool per room.
+func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int, workersPerRoom int) string {
+	hashes, credsByHash, err := parseVKTurnRoomCredsJSON(bundleJSON)
+	if err != nil {
+		return "roomCredsJSON: " + err.Error()
+	}
+	if workersPerRoom != 20 {
+		return "workersPerRoom must be 20"
+	}
+	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, len(hashes)*workersPerRoom, workersPerRoom, hashes, credsByHash, nil, len(bundleJSON))
+}
+
+func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, workers, workersPerRoom int, hashes []string, credsByHash map[string]*wgturnclient.Credentials, singleCreds *wgturnclient.Credentials, jsonLen int) string {
 	vkturnMu.Lock()
 	if vkturnRunning.Load() {
 		runningStats := TURNUpstreamStatsJSON()
@@ -66,51 +87,36 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 		return ""
 	}
 
-	creds, err := parseVKTurnCredsJSON(credsJSON)
-	if err != nil {
-		vkturnMu.Unlock()
-		return "credsJSON: " + err.Error()
-	}
-
 	resetVKTurnAtomicsLocked()
 	attachOnce := &sync.Once{}
-
-	// Pick transport from the first TURN server's metadata when the v2
-	// wire shape is present; otherwise default to UDP (legacy
-	// behaviour). VK has shipped both UDP and TCP-only relays, and
-	// hard-forcing UDP against a TCP-only relay produces the
-	// "Allocate: timeout" path users see on long-lived sessions.
-	useUDP := shouldUseUDP(creds)
-	workers = normalizeVKTurnWorkers(workers)
-	rt.appendLog(fmt.Sprintf("info: vkturn start requested workers=%d useUDP=%t listenPort=%d peer=%s %s jsonLen=%d deviceIDLen=%d passwordLen=%d", workers, useUDP, listenPort, redactHostPortForLog(peerAddr), vkturnCredsSummary(creds), len(credsJSON), len(deviceID), len(wgPassword)))
+	firstCreds := singleCreds
+	if firstCreds == nil && len(hashes) > 0 {
+		firstCreds = credsByHash[hashes[0]]
+	}
+	useUDP := shouldUseUDP(firstCreds)
+	rt.appendLog(fmt.Sprintf("info: vkturn start requested rooms=%d workers=%d workersPerRoom=%d useUDP=%t listenPort=%d peer=%s %s jsonLen=%d deviceIDLen=%d passwordLen=%d", maxInt(1, len(hashes)), workers, workersPerRoom, useUDP, listenPort, redactHostPortForLog(peerAddr), vkturnCredsSummary(firstCreds), jsonLen, len(deviceID), len(wgPassword)))
 	configCh := make(chan string, 1)
-
-	runner, err := wgturnclient.New(wgturnclient.Config{
-		Listen:         fmt.Sprintf("127.0.0.1:%d", listenPort),
-		PeerAddr:       peerAddr,
-		Workers:        workers,
-		UseUDP:         useUDP,
-		DeviceID:       deviceID,
-		ConnPassword:   wgPassword,
-		PreloadedCreds: creds,
+	cfg := wgturnclient.Config{
+		Listen: fmt.Sprintf("127.0.0.1:%d", listenPort), PeerAddr: peerAddr,
+		Workers: workers, WorkersPerRoom: workersPerRoom, UseUDP: useUDP,
+		VKHashes: hashes, DeviceID: deviceID, ConnPassword: wgPassword,
+		PreloadedCreds: singleCreds, PreloadedCredsByHash: credsByHash,
 		OnConfig: func(conf string) {
 			select {
 			case configCh <- conf:
 			default:
 			}
 		},
-		OnEvent: func(level, message string) {
-			appendVKTurnEvent(level, message)
-		},
-	})
+		OnEvent: func(level, message string) { appendVKTurnEvent(level, message) },
+	}
+	runner, err := wgturnclient.New(cfg)
 	if err != nil {
 		vkturnMu.Unlock()
 		return err.Error()
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	vkturnRunner = runner
-	vkturnCancel = cancel
+	vkturnRunner, vkturnCancel = runner, cancel
 	vkturnRunning.Store(true)
 	storeVKTurnStats(0, true)
 	vkturnMu.Unlock()
@@ -119,12 +125,8 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	go func() {
 		defer close(runDone)
 		err := runner.Start(ctx)
-
 		vkturnMu.Lock()
 		defer vkturnMu.Unlock()
-
-		// Concurrency: a fresh Start() might have replaced vkturnRunner
-		// while we were running; only clean up if we're still the owner.
 		if vkturnRunner != runner {
 			return
 		}
@@ -138,13 +140,18 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 		stopVKTurnAttachLocked()
 		vkturnRunning.Store(false)
 		storeVKTurnStats(0, false)
-		vkturnRunner = nil
-		vkturnCancel = nil
+		vkturnRunner, vkturnCancel = nil, nil
 	}()
-
-	rt.appendLog(fmt.Sprintf("info: vkturn runner started; waiting for GETCONF in background workers=%d useUDP=%t %s", workers, useUDP, vkturnCredsSummary(creds)))
+	rt.appendLog(fmt.Sprintf("info: vkturn runner started; waiting for GETCONF rooms=%d workers=%d", maxInt(1, len(hashes)), workers))
 	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh, attachOnce)
 	return ""
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func normalizeVKTurnWorkers(n int) int {
@@ -195,6 +202,27 @@ func UpdateVKTurnCreds(credsJSON string) string {
 	}
 	runner.UpdatePreloadedCreds(creds)
 	rt.appendLog(fmt.Sprintf("info: vkturn update creds OK %s jsonLen=%d", vkturnCredsSummary(creds), len(credsJSON)))
+	return ""
+}
+
+func UpdateVKTurnRoomCreds(bundleJSON string) string {
+	if !vkturnRunning.Load() {
+		return "not running"
+	}
+	hashes, credsByHash, err := parseVKTurnRoomCredsJSON(bundleJSON)
+	if err != nil {
+		return "roomCredsJSON: " + err.Error()
+	}
+	vkturnMu.Lock()
+	runner := vkturnRunner
+	vkturnMu.Unlock()
+	if runner == nil {
+		return "not running"
+	}
+	if err := runner.UpdatePreloadedCredsByHash(credsByHash); err != nil {
+		return "roomCredsJSON: " + err.Error()
+	}
+	rt.appendLog(fmt.Sprintf("info: vkturn multi-room credentials updated rooms=%d jsonLen=%d", len(hashes), len(bundleJSON)))
 	return ""
 }
 
@@ -357,6 +385,57 @@ func parseVKTurnCredsJSON(credsJSON string) (*wgturnclient.Credentials, error) {
 		TurnServers: turnServers,
 		Lifetime:    lifetime,
 	}, nil
+}
+
+func parseVKTurnRoomCredsJSON(bundleJSON string) ([]string, map[string]*wgturnclient.Credentials, error) {
+	var bundle struct {
+		Rooms []struct {
+			Hash        string          `json:"hash"`
+			Credentials json.RawMessage `json:"credentials"`
+		} `json:"rooms"`
+	}
+	if err := json.Unmarshal([]byte(bundleJSON), &bundle); err != nil {
+		return nil, nil, err
+	}
+	if len(bundle.Rooms) < 1 || len(bundle.Rooms) > 4 {
+		return nil, nil, fmt.Errorf("room count must be 1-4")
+	}
+	hashes := make([]string, 0, len(bundle.Rooms))
+	credsByHash := make(map[string]*wgturnclient.Credentials, len(bundle.Rooms))
+	for _, room := range bundle.Rooms {
+		hash := strings.TrimSpace(room.Hash)
+		if hash == "" {
+			return nil, nil, fmt.Errorf("empty room hash")
+		}
+		if _, duplicate := credsByHash[hash]; duplicate {
+			return nil, nil, fmt.Errorf("duplicate room hash")
+		}
+		creds, err := parseVKTurnCredsJSON(string(room.Credentials))
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid room credentials: %w", err)
+		}
+		var freshness struct {
+			AcquiredAtUnix int64 `json:"acquired_at_unix"`
+		}
+		if err := json.Unmarshal(room.Credentials, &freshness); err != nil || freshness.AcquiredAtUnix <= 0 {
+			return nil, nil, fmt.Errorf("room credentials missing acquisition time")
+		}
+		age := time.Now().Unix() - freshness.AcquiredAtUnix
+		if age < 0 {
+			age = 0
+		}
+		safeLifetime := creds.Lifetime - 120
+		if safeLifetime < 1 || age >= int64(safeLifetime) {
+			return nil, nil, fmt.Errorf("room credentials are stale")
+		}
+		// Preserve actual remaining TTL. Treating a late-loaded snapshot as a
+		// brand-new lifetime would rotate after the server-side credential had
+		// already expired.
+		creds.Lifetime -= int(age)
+		hashes = append(hashes, hash)
+		credsByHash[hash] = creds
+	}
+	return hashes, credsByHash, nil
 }
 
 // shouldUseUDP picks the wire transport for the runner. Preference

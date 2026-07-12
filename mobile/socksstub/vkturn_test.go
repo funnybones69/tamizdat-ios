@@ -1,8 +1,10 @@
 package socksstub
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/funnybones69/tamizdat/wgturnclient"
 	"golang.zx2c4.com/wireguard/tun/netstack"
@@ -56,6 +58,30 @@ func TestNormalizeVKTurnWorkers(t *testing.T) {
 		if got := normalizeVKTurnWorkers(tc.in); got != tc.want {
 			t.Fatalf("normalizeVKTurnWorkers(%d) = %d, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestParseVKTurnRoomCredsJSONRejectsPartialDuplicateAndStaleBundles(t *testing.T) {
+	fresh := time.Now().Unix()
+	room := func(hash string, acquired int64) string {
+		return fmt.Sprintf(`{"hash":%q,"credentials":{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600,"acquired_at_unix":%d}}`, hash, acquired)
+	}
+	valid := `{"rooms":[` + room("a", fresh) + `,` + room("b", fresh) + `,` + room("c", fresh) + `,` + room("d", fresh) + `]}`
+	hashes, creds, err := parseVKTurnRoomCredsJSON(valid)
+	if err != nil {
+		t.Fatalf("valid bundle: %v", err)
+	}
+	if len(hashes) != 4 || len(creds) != 4 {
+		t.Fatalf("valid bundle sizes hashes=%d creds=%d", len(hashes), len(creds))
+	}
+
+	duplicate := `{"rooms":[` + room("a", fresh) + `,` + room("a", fresh) + `]}`
+	if _, _, err := parseVKTurnRoomCredsJSON(duplicate); err == nil {
+		t.Fatal("expected duplicate room rejection")
+	}
+	stale := `{"rooms":[` + room("a", fresh-4000) + `]}`
+	if _, _, err := parseVKTurnRoomCredsJSON(stale); err == nil {
+		t.Fatal("expected stale credentials rejection")
 	}
 }
 

@@ -27,9 +27,14 @@ func (r *Runner) getCaptchaMode() string {
 // must set Config.PreloadedCreds before calling Start; the VK API
 // solver is not compiled into this build.
 func (r *Runner) getCredsWithFallback(ctx context.Context, tp *TurnParams, hash string, stats *Stats) (*Credentials, error) {
+	if r.cfg.WorkersPerRoom > 0 {
+		if creds := r.currentRoomCreds(hash); creds != nil {
+			return creds, nil
+		}
+		return nil, fmt.Errorf("wgturnclient (iOS build): missing credentials for configured room")
+	}
 	if pc := r.preloadedCreds.Load(); pc != nil {
-		dup := *pc
-		return &dup, nil
+		return cloneCredentials(pc), nil
 	}
 	return nil, fmt.Errorf("wgturnclient (iOS build): PreloadedCreds is required — VK API solver is not compiled in")
 }

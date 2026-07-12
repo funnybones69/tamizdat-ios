@@ -160,8 +160,7 @@ final class TURNCredsRefresher: ObservableObject {
             return
         }
 
-        if let creds = TURNCredsStore.shared.load(),
-           creds.expiresAt.timeIntervalSinceNow < 600 {
+        if TURNCredsStore.shared.needsRefresh {
             forceRefresh(reason: "foregroundNearExpiry", requireActiveTURN: true)
         } else {
             refreshIfNeeded(reason: "foreground")
@@ -229,7 +228,7 @@ final class TURNCredsRefresher: ObservableObject {
     /// verification challenge if VK asks for it, and return only once App Group session params are
     /// fresh enough for the extension to attach TURN.
     func ensureFreshForConnect(reason: String = "connectVKTurn",
-                               timeout: TimeInterval = 190) async throws {
+                               timeout: TimeInterval = 780) async throws {
         guard TURNCredsStore.shared.needsRefresh else {
             TURNLog.info("turncreds", "connect preflight: cached VK TURN creds are fresh")
             return
@@ -327,82 +326,75 @@ final class TURNCredsRefresher: ObservableObject {
                 }
             }
             do {
-                let config = VKCredsConfig(
-                    callHash: VKCredsPreferences.primaryCallHash,
-                    secondaryHash: VKCredsPreferences.secondaryCallHash,
-                    deviceID: VKCredsPreferences.deviceID
-                )
-                let hashPrefix = String(VKCredsPreferences.primaryCallHash.prefix(8))
-                TURNLog.info("turncreds", "config built (hash=\(hashPrefix)...)")
-                let client = VKCredsClient(
-                    config: config,
-                    captchaSolver: ChainedCaptchaSolver(refresher: self),
-                    progress: { [weak self] message in
-                        Task { @MainActor in
-                            self?.publishTurnInfo(message)
+                let hashes = VKCredsPreferences.roomHashes
+                guard !hashes.isEmpty else { throw TURNCredsRefreshWaitError.notConfigured }
+                var roomCredentials: [VKTURNRoomCredentials] = []
+                roomCredentials.reserveCapacity(hashes.count)
+
+                // Deliberately sequential: the CAPTCHA fallback owns one
+                // WKWebView/manual challenge. Parallel room refreshes would race
+                // that single UI. Accountless rooms normally finish quickly.
+                for (index, hash) in hashes.enumerated() {
+                    self.publishTurnInfo("TURN: комната \(index + 1)/\(hashes.count) — пробую без капчи…")
+                    let config = VKCredsConfig(
+                        callHash: hash,
+                        secondaryHash: nil,
+                        deviceID: VKCredsPreferences.deviceID
+                    )
+                    TURNLog.info("turncreds", "fetching room \(index + 1)/\(hashes.count)")
+                    let client = VKCredsClient(
+                        config: config,
+                        captchaSolver: ChainedCaptchaSolver(refresher: self),
+                        progress: { [weak self] message in
+                            Task { @MainActor in
+                                self?.publishTurnInfo("Комната \(index + 1)/\(hashes.count): \(message)")
+                            }
                         }
+                    )
+                    let creds = try await withThrowingTaskGroup(of: VKTURNCredentials.self) { group in
+                        group.addTask { try await client.fetchCredentials() }
+                        group.addTask {
+                            try await Task.sleep(nanoseconds: UInt64(Self.watchdogTimeout * 1_000_000_000))
+                            throw VKCredsError.transport(step: "watchdog", underlying: CancellationError())
+                        }
+                        guard let first = try await group.next() else { throw CancellationError() }
+                        group.cancelAll()
+                        return first
                     }
-                )
-                // Race fetchSession parameters against a watchdog so a wedged
-                // network call or stuck WKWebView can't lock the
-                // refresher into `isRefreshing=true` forever.
-                let creds = try await withThrowingTaskGroup(of: VKTURNCredentials.self) { group in
-                    group.addTask {
-                        try await client.fetchCredentials()
+                    guard creds.expiresAt.timeIntervalSinceNow > TURNCredsStore.refreshCushion else {
+                        throw TURNCredsRefreshWaitError.stillStale(
+                            "комната \(index + 1): недостаточный TTL"
+                        )
                     }
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: UInt64(Self.watchdogTimeout * 1_000_000_000))
-                        TURNLog.error("turncreds", "watchdog fired — refresh exceeded \(Int(Self.watchdogTimeout))s")
-                        throw VKCredsError.transport(step: "watchdog", underlying: CancellationError())
-                    }
-                    guard let first = try await group.next() else {
-                        throw CancellationError()
-                    }
-                    group.cancelAll()
-                    return first
+                    roomCredentials.append(VKTURNRoomCredentials(roomHash: hash, credentials: creds))
                 }
+
                 guard self.refreshGeneration == generation else {
-                    TURNLog.warn("turncreds", "stale refresh gen=\(generation) finished after replacement; discarding creds")
+                    TURNLog.warn("turncreds", "stale multi-room refresh finished after replacement; discarding")
                     return
                 }
-                TURNLog.info("turncreds", "creds received, saving")
-                TURNCredsStore.shared.save(creds)
-                guard TURNCredsStore.shared.isFresh else {
-                    let remaining = TURNCredsStore.shared.load()?.expiresAt.timeIntervalSinceNow ?? 0
-                    throw TURNCredsRefreshWaitError.stillStale(
-                        "полученные credentials имеют недостаточный TTL (осталось \(Int(remaining))с)"
-                    )
+                guard TURNCredsStore.shared.saveRooms(roomCredentials) else {
+                    throw TURNCredsRefreshWaitError.stillStale("не удалось сохранить multi-room credential bundle")
                 }
-                self.publishTurnInfo("TURN: подключение без капчи успешно.")
-                // Push the fresh snapshot into the in-process Go VK
-                // TURN runner so the next worker-group rotation uses
-                // them — without this hop the runner kept reading the
-                // session params it took at startup and started 401-ing once
-                // the original 3600 s lifetime elapsed.
-                //
-                // The runner lives in the extension process, not the
-                // main app, so this in-process call usually returns
-                // "not running". We still keep it for simulator/unit
-                // paths, then send a provider message so the extension
-                // re-reads the App Group mirror and updates its live
-                // Go runner in the correct process.
-                let credsJSON = vkCredsAsJSON(creds: creds)
-                let updateErr = SamizdatBridge.updateVKTurnCreds(credsJSON)
+                guard TURNCredsStore.shared.roomsAreFresh else {
+                    throw TURNCredsRefreshWaitError.stillStale("неполный multi-room credential bundle")
+                }
+                self.publishTurnInfo("TURN: \(roomCredentials.count) комнат готовы, \(roomCredentials.count * 20) workers.")
+
+                let bundleJSON = vkRoomCredsAsJSON(roomCredentials)
+                let updateErr = SamizdatBridge.updateVKTurnRoomCreds(bundleJSON)
                 if updateErr.isEmpty {
-                    TURNLog.info("turncreds", "VK TURN runner creds updated in-process")
+                    TURNLog.info("turncreds", "multi-room runner creds updated in-process")
                 } else if updateErr == "not running" {
-                    TURNLog.info("turncreds", "VK TURN runner not running in this process — App Group mirror still updated")
+                    TURNLog.info("turncreds", "multi-room runner not running in app process")
                 } else {
-                    TURNLog.warn("turncreds", "SocksstubUpdateVKTurnCreds returned: \(updateErr)")
+                    TURNLog.warn("turncreds", "multi-room creds update returned: \(updateErr)")
                 }
                 let extUpdate = await VPNProfileStore.shared.refreshVKTurnCreds()
-                if extUpdate == "ok" || extUpdate.isEmpty {
-                    let extStatus = extUpdate.isEmpty ? "not-running" : extUpdate
-                    TURNLog.info("turncreds", "extension VK TURN creds refresh result=\(extStatus)")
-                } else if extUpdate == "not running" {
-                    TURNLog.info("turncreds", "extension VK TURN runner not running — fresh creds saved for next attach")
+                if extUpdate == "ok" || extUpdate.isEmpty || extUpdate == "not running" {
+                    TURNLog.info("turncreds", "extension multi-room refresh result=\(extUpdate.isEmpty ? "not-running" : extUpdate)")
                 } else {
-                    TURNLog.warn("turncreds", "extension VK TURN creds refresh returned: \(extUpdate)")
+                    TURNLog.warn("turncreds", "extension multi-room refresh returned: \(extUpdate)")
                 }
                 self.lastSaveAt = Date()
                 self.lastError = nil

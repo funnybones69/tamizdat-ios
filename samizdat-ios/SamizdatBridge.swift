@@ -159,6 +159,11 @@ final class SamizdatBridge: ObservableObject {
         SocksstubUpdateVKTurnCreds(credsJSON)
     }
 
+    @discardableResult
+    static func updateVKTurnRoomCreds(_ bundleJSON: String) -> String {
+        SocksstubUpdateVKTurnRoomCreds(bundleJSON)
+    }
+
     // MARK: – Status
 
     private func refreshStatus() async {

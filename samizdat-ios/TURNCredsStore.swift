@@ -148,6 +148,57 @@ func vkCredsAsJSON(creds: VKTURNCredentials) -> String {
     }
 }
 
+/// Per-room credential snapshot used by multi-room VK TURN. The room hash is
+/// stored only in the App Group and is never written to diagnostic logs.
+struct VKTURNRoomCredentials: Codable, Equatable {
+    let roomHash: String
+    let credentials: VKTURNCredentials
+}
+
+func vkRoomCredsAsJSON(_ rooms: [VKTURNRoomCredentials]) -> String {
+    struct TurnServerWire: Encodable {
+        let host: String
+        let port: Int
+        let scheme: String
+        let transport: String
+    }
+    struct CredsWire: Encodable {
+        let username: String
+        let password: String
+        let turn_servers: [String]
+        let turn_servers_v2: [TurnServerWire]
+        let lifetime_sec: Int
+        let acquired_at_unix: Int64
+    }
+    struct RoomWire: Encodable {
+        let hash: String
+        let credentials: CredsWire
+    }
+    struct BundleWire: Encodable { let rooms: [RoomWire] }
+
+    let wireRooms = rooms.map { room in
+        let creds = room.credentials
+        return RoomWire(
+            hash: room.roomHash,
+            credentials: CredsWire(
+                username: creds.username,
+                password: creds.password,
+                turn_servers: creds.turnURLs,
+                turn_servers_v2: (creds.turnServers ?? []).map {
+                    TurnServerWire(host: $0.host, port: $0.port, scheme: $0.scheme, transport: $0.transport)
+                },
+                lifetime_sec: Int(creds.lifetime),
+                acquired_at_unix: Int64(creds.acquiredAt.timeIntervalSince1970)
+            )
+        )
+    }
+    guard let data = try? JSONEncoder().encode(BundleWire(rooms: wireRooms)),
+          let json = String(data: data, encoding: .utf8) else {
+        return ""
+    }
+    return json
+}
+
 func vkCredsLogSummary(creds: VKTURNCredentials) -> String {
     let v2 = creds.turnServers ?? []
     var udpCount = 0
@@ -191,6 +242,8 @@ final class TURNCredsStore {
     /// key, an old v1 entry is invisible to the new code and the
     /// refresher fetches a fresh v2 blob on first launch.
     private static let storageKey = "tamizdat.vkTURNCreds.v2"
+    private static let roomStorageKey = "tamizdat.vkTURNCreds.rooms.v1"
+    static let roomJSONKey = "tamizdat.vkTURNCredsRoomsJSON"
 
     /// Cushion before expiry that triggers a refresh. 15 min gives the
     /// foreground 5-minute heartbeat (TURNSession paramsRefresher) four chances
@@ -210,6 +263,43 @@ final class TURNCredsStore {
     }
 
     private init() {}
+
+    func loadRooms() -> [VKTURNRoomCredentials] {
+        guard let data = defaults?.data(forKey: Self.roomStorageKey),
+              let rooms = try? JSONDecoder.iso8601.decode([VKTURNRoomCredentials].self, from: data)
+        else { return [] }
+        return rooms
+    }
+
+    @discardableResult
+    func saveRooms(_ rooms: [VKTURNRoomCredentials]) -> Bool {
+        guard let defaults, !rooms.isEmpty,
+              let data = try? JSONEncoder.iso8601.encode(rooms) else { return false }
+        let bundleJSON = vkRoomCredsAsJSON(rooms)
+        guard !bundleJSON.isEmpty else { return false }
+        // Keep the legacy primary-room mirror during migration so an older
+        // extension process can still attach after an app-only refresh.
+        save(rooms[0].credentials)
+        defaults.set(data, forKey: Self.roomStorageKey)
+        defaults.set(bundleJSON, forKey: Self.roomJSONKey)
+        return true
+    }
+
+    /// All configured rooms must have a fresh credential snapshot. A partial
+    /// bundle is deliberately stale: silently running fewer rooms would make
+    /// the UI claim 4×20 while the data plane used less capacity.
+    var roomsAreFresh: Bool {
+        let configured = VKCredsPreferences.roomHashes
+        var saved: [String: VKTURNCredentials] = [:]
+        for room in loadRooms() where saved[room.roomHash] == nil {
+            saved[room.roomHash] = room.credentials
+        }
+        guard !configured.isEmpty, configured.count == saved.count else { return false }
+        return configured.allSatisfy { hash in
+            guard let creds = saved[hash] else { return false }
+            return creds.expiresAt.timeIntervalSinceNow > Self.refreshCushion
+        }
+    }
 
     /// Persisted session params (if any). Returns nil if the entry is missing
     /// or the stored payload can't be decoded (e.g. schema drift).
@@ -264,6 +354,8 @@ final class TURNCredsStore {
     /// the schema bump can never resurface old session params.
     func clear() {
         defaults?.removeObject(forKey: Self.storageKey)
+        defaults?.removeObject(forKey: Self.roomStorageKey)
+        defaults?.removeObject(forKey: Self.roomJSONKey)
         defaults?.removeObject(forKey: "tamizdat.vkTURNCreds.v1")
         defaults?.removeObject(forKey: "tamizdat.vkTURNCredsJSON")
         defaults?.removeObject(forKey: "tamizdat.vkTURNCredsAcquiredAt")
@@ -273,15 +365,12 @@ final class TURNCredsStore {
     /// seconds of remaining lifetime. Drives the green/grey TURN tile
     /// in the main UI and the `hasTURNSession params` field in the status RPC.
     var isFresh: Bool {
-        guard let c = load() else { return false }
-        return c.expiresAt.timeIntervalSinceNow > Self.refreshCushion
+        roomsAreFresh
     }
 
-    /// `true` iff the cache is empty or close to expiring. Drives the
-    /// refresh-on-scene-active path in `App.swift`.
+    /// `true` iff one or more configured rooms are missing/near expiry.
     var needsRefresh: Bool {
-        guard let c = load() else { return true }
-        return c.expiresAt.timeIntervalSinceNow <= Self.refreshCushion
+        !roomsAreFresh
     }
 }
 
@@ -320,18 +409,60 @@ enum VKCredsPreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let primaryHashKey = "tamizdat.vkCallHash"
     private static let secondaryHashKey = "tamizdat.vkCallHashSecondary"
+    private static let roomHashesKey = "tamizdat.vkCallHashes.v1"
     private static let deviceIDKey = "tamizdat.vkDeviceID"
     private static let peerAddrKey = "tamizdat.vkPeerAddr"
     private static let connectPasswordKey = "tamizdat.vkConnectPassword"
     private static let workersKey = "tamizdat.vkWorkers"
 
-    static let defaultWorkers = 24
-    static let minWorkers = 12
-    static let maxWorkers = 72
-    static let workerStep = 12
-
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
+    }
+
+    static let workersPerRoom = 20
+    static let maxRooms = 4
+
+    static var roomHashes: [String] {
+        get {
+            if let stored = defaults?.stringArray(forKey: roomHashesKey) {
+                return Array(normalizeRoomHashes(stored).prefix(maxRooms))
+            }
+            // One-time migration: only the previous primary room becomes room 1.
+            // The old secondary value was fallback/rotation semantics, not a
+            // simultaneously active room, so it must not silently become room 2.
+            return normalizeRoomHashes([primaryCallHash])
+        }
+        set {
+            let normalized = Array(normalizeRoomHashes(newValue).prefix(maxRooms))
+            defaults?.set(normalized, forKey: roomHashesKey)
+            defaults?.set(normalized.first ?? "", forKey: primaryHashKey)
+            // Explicit multi-room semantics do not reuse the legacy secondary
+            // fallback slot; keeping it populated could make old code rotate
+            // instead of running rooms concurrently.
+            defaults?.set("", forKey: secondaryHashKey)
+        }
+    }
+
+    static func normalizeRoomHash(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let range = value.range(of: "/call/join/") {
+            value = String(value[range.upperBound...])
+        }
+        if let boundary = value.firstIndex(where: { $0 == "?" || $0 == "#" }) {
+            value = String(value[..<boundary])
+        }
+        return value.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    }
+
+    static func normalizeRoomHashes(_ raw: [String]) -> [String] {
+        var result: [String] = []
+        var seen = Set<String>()
+        for item in raw {
+            let hash = normalizeRoomHash(item)
+            guard !hash.isEmpty, seen.insert(hash).inserted else { continue }
+            result.append(hash)
+        }
+        return result
     }
 
     static var primaryCallHash: String {
@@ -357,23 +488,15 @@ enum VKCredsPreferences {
         set { defaults?.set(newValue, forKey: connectPasswordKey) }
     }
 
+    /// Legacy accessor kept for existing call sites. Multi-room always uses a
+    /// fixed, experimentally verified pool of 20 workers per room.
     static var workers: Int {
-        get {
-            let stored = defaults?.integer(forKey: workersKey) ?? 0
-            return normalizeWorkers(stored)
-        }
-        set { defaults?.set(normalizeWorkers(newValue), forKey: workersKey) }
+        get { workersPerRoom }
+        set { defaults?.set(workersPerRoom, forKey: workersKey) }
     }
 
-    static var allowedWorkers: [Int] {
-        Array(stride(from: minWorkers, through: maxWorkers, by: workerStep))
-    }
-
-    static func normalizeWorkers(_ raw: Int) -> Int {
-        var value = raw <= 0 ? defaultWorkers : raw
-        value = max(minWorkers, min(maxWorkers, value))
-        return (value / workerStep) * workerStep
-    }
+    static var allowedWorkers: [Int] { [workersPerRoom] }
+    static func normalizeWorkers(_ raw: Int) -> Int { workersPerRoom }
 
     /// Mirror derived H2 identity into App Group keys consumed by the
     /// Network Extension. VK TURN does not have editable peer/password:
@@ -404,10 +527,9 @@ enum VKCredsPreferences {
         return fresh
     }
 
-    /// True iff a primary hash is configured — refresh is a no-op
-    /// otherwise.
+    /// True iff at least one room is configured — refresh is a no-op otherwise.
     static var isConfigured: Bool {
-        !primaryCallHash.isEmpty
+        !roomHashes.isEmpty
     }
 }
 

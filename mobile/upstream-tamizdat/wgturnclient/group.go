@@ -17,6 +17,33 @@ const (
 	defaultCycleSecs = 36000
 )
 
+type configBroker struct {
+	ch       chan<- string
+	sent     atomic.Bool
+	inFlight atomic.Bool
+}
+
+func (b *configBroker) claim() bool {
+	return b != nil && !b.sent.Load() && b.inFlight.CompareAndSwap(false, true)
+}
+
+func (b *configBroker) complete(delivered bool) {
+	if b == nil {
+		return
+	}
+	if delivered {
+		b.sent.Store(true)
+	}
+	b.inFlight.Store(false)
+}
+
+func (b *configBroker) channel() chan<- string {
+	if b == nil {
+		return nil
+	}
+	return b.ch
+}
+
 // workerGroup:
 // бесшовная ротация: получить новые креды → запустить новый батч → убить старый.
 func (r *Runner) workerGroup(
@@ -28,8 +55,7 @@ func (r *Runner) workerGroup(
 	d *Dispatcher,
 	localPort string,
 	useUDP bool,
-	getConfig bool,
-	configCh chan<- string,
+	broker *configBroker,
 	workerIDs []int,
 	cycleDuration time.Duration,
 	pauseFlag *int32,
@@ -49,10 +75,6 @@ func (r *Runner) workerGroup(
 	}
 
 	cycleNumber := 0
-	var configSent int32
-	if !getConfig {
-		configSent = 1
-	}
 
 	// Предыдущий батч
 	var prevCancel context.CancelFunc
@@ -97,11 +119,7 @@ func (r *Runner) workerGroup(
 
 		// Получаем креды ДО убийства старого батча (бесшовная ротация)
 		hash := tp.Hashes[hashIndex%len(tp.Hashes)]
-		shortHash := hash
-		if len(shortHash) > 8 {
-			shortHash = shortHash[:8]
-		}
-		log.Printf("[ГРУППА #%d] Цикл %d: ожидание очереди получения кредов (хеш: %s...)", groupID, cycleNumber, shortHash)
+		log.Printf("[ГРУППА #%d] Цикл %d: ожидание очереди получения кредов", groupID, cycleNumber)
 
 		r.groupAuthMutex.Lock()
 		log.Printf("[ГРУППА #%d] Цикл %d: запрос кредов", groupID, cycleNumber)
@@ -128,19 +146,22 @@ func (r *Runner) workerGroup(
 		}
 		cycleDurationLocal := time.Duration(sleepDuration) * time.Second
 
-		log.Printf("[ГРУППА #%d] Запуск %d потоков (до смены кредов: %d сек)", groupID, workersPerGroup, sleepDuration)
+		workerCount := len(workerIDs)
+		if workerCount <= 0 {
+			workerCount = workersPerGroup
+		}
+		log.Printf("[ГРУППА #%d] Запуск %d потоков (до смены кредов: %d сек)", groupID, workerCount, sleepDuration)
 
-		log.Printf("[ГРУППА #%d] Креды OK: %s, %d воркеров", groupID, credentialsSummary(creds), len(workerIDs))
-		r.eventf("info", "group start group=%d cycle=%d workers=%d sleepSec=%d getConfig=%t useUDP=%t %s", groupID, cycleNumber, len(workerIDs), sleepDuration, getConfig, useUDP, credentialsSummary(creds))
+		log.Printf("[ГРУППА #%d] Креды OK, TURN urls=%d, %d воркеров", groupID, len(creds.TurnURLs), len(workerIDs))
 
 		// ТЕПЕРЬ убиваем старый батч (креды уже готовы — минимальный простой)
 		killBatch()
 
 		// Создаём новый batch
 		batchCtx, batchCancel := context.WithCancel(ctx)
-		var configRequestInFlight int32
 
 		refreshCh := make(chan struct{}, 1)
+		quotaBackoffCh := make(chan struct{}, 1)
 		doneChs := make([]chan struct{}, len(workerIDs))
 		var quotaErrorWorkers sync.Map
 		var notFoundErrorWorkers sync.Map
@@ -174,8 +195,6 @@ func (r *Runner) workerGroup(
 					}
 				}
 
-				shouldGetConfig := getConfig
-
 				// Retry loop: воркер переподключается при ошибке
 				attempt := 0
 				for {
@@ -183,25 +202,17 @@ func (r *Runner) workerGroup(
 						return
 					}
 
-					getConf := false
-					if shouldGetConfig && attempt == 0 && atomic.LoadInt32(&configSent) == 0 {
-						getConf = atomic.CompareAndSwapInt32(&configRequestInFlight, 0, 1)
-					}
+					getConf := broker.claim()
 					var cc chan<- string
 					if getConf {
-						cc = configCh
+						cc = broker.channel()
 					}
 
-					r.eventf("info", "session start group=%d worker=%d cycle=%d attempt=%d getConfig=%t useUDP=%t", groupID, wid, cycleNumber, attempt, getConf, useUDP)
 					configDelivered, sessErr := RunSession(batchCtx, tp, peer, d, localPort, useUDP,
 						getConf, cc, wid, creds, deviceID, password, stats, r.cfg.OnEvent)
 
 					if getConf {
-						if configDelivered {
-							atomic.StoreInt32(&configSent, 1)
-						} else {
-							atomic.StoreInt32(&configRequestInFlight, 0)
-						}
+						broker.complete(configDelivered)
 					}
 
 					if sessErr != nil {
@@ -227,22 +238,33 @@ func (r *Runner) workerGroup(
 							return
 						}
 
-						// Исчерпана ли квота TURN?
+						// Исчерпана ли квота TURN? Do not sleep-and-retry the same
+						// credential batch: that hammers VK allocations and keeps gate in
+						// a restart loop. iOS behavior is important here: partial quota
+						// after GETCONF/attach is degraded capacity, not a fatal tunnel
+						// condition. Only pre-GETCONF quota should trigger process-level
+						// backoff because there is no usable tunnel yet.
 						if strings.Contains(errStrLower, "turn квота") || strings.Contains(errStrLower, "quota") {
 							quotaErrorWorkers.Store(wid, true)
 							qCount := 0
 							quotaErrorWorkers.Range(func(k, v any) bool { qCount++; return true })
-							r.eventf("warn", "quota worker=%d group=%d cycle=%d attempt=%d qCount=%d threshold=5 workersPerGroup=%d err=%s", wid, groupID, cycleNumber, attempt, qCount, workersPerGroup, sanitizeErrForEvent(sessErr))
-							if qCount >= 5 {
-								select {
-								case refreshCh <- struct{}{}:
-									log.Printf("[ГРУППА #%d] Досрочная ротация: исчерпана квота TURN у %d воркеров", groupID, qCount)
-									r.eventf("warn", "quota early rotation group=%d cycle=%d qCount=%d threshold=5", groupID, cycleNumber, qCount)
-								default:
-								}
+							threshold := len(workerIDs)
+							if threshold <= 0 || threshold > 5 {
+								threshold = 5
 							}
 							log.Printf("[ВОРКЕР #%d] Ошибка квоты TURN: %s", wid, errStr)
-							return // Воркер завершается, на текущих кредах он больше не поднимется
+							if qCount >= threshold {
+								if broker != nil && !broker.sent.Load() {
+									log.Printf("[ГРУППА #%d] TURN quota у %d/%d воркеров до GETCONF; backoff без hammer", groupID, qCount, len(workerIDs))
+									select {
+									case quotaBackoffCh <- struct{}{}:
+									default:
+									}
+								} else {
+									log.Printf("[ГРУППА #%d] TURN quota у %d/%d воркеров после GETCONF; degraded, без ротации", groupID, qCount, len(workerIDs))
+								}
+							}
+							return
 						}
 
 						attempt++
@@ -305,6 +327,14 @@ func (r *Runner) workerGroup(
 			log.Printf("[ГРУППА #%d] TTL %v истёк, ротация", groupID, cycleDurationLocal)
 		case <-refreshCh:
 			log.Printf("[ГРУППА #%d] Вызвана досрочная ротация (креды не отвечали)", groupID)
+		case <-quotaBackoffCh:
+			log.Printf("[ГРУППА #%d] TURN quota backoff: останавливаем batch и ждём очистки allocations", groupID)
+			killBatch()
+			select {
+			case <-time.After(10 * time.Minute):
+			case <-ctx.Done():
+				return
+			}
 		case <-ctx.Done():
 			return
 		}

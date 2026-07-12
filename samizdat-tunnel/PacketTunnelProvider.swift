@@ -305,8 +305,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let workers = VKCredsPreferences.workers
-        let hashLen = (defaults?.string(forKey: "tamizdat.vkCallHash") ?? "").count
-        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceIDLen=\(deviceID.count) hashLen=\(hashLen) workers=\(workers)")
+        let roomCount = VKCredsPreferences.roomHashes.count
+        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=20")
 
         guard !peer.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// server not mirrored yet. Open Settings → Proxies and save Main URI.")
@@ -317,14 +317,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // Read raw session params JSON from App Group UserDefaults directly —
-        // TURNSession paramsStore lives in main-app target.
-        guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
-              !credsJSON.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — no creds JSON in App Group. Открой приложение и подожди автообновление (5-минутный heartbeat) или сделай ручной refresh.")
+        // Prefer the atomic multi-room bundle. Legacy single-room JSON remains
+        // readable so existing installs can refresh once after upgrading.
+        let roomBundleJSON = defaults?.string(forKey: TURNCredsStore.roomJSONKey)
+        let legacyCredsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
+        guard (roomBundleJSON?.isEmpty == false) || (legacyCredsJSON?.isEmpty == false) else {
+            ExtLog.warn("[vkturn] attach SKIPPED — no complete credential bundle in App Group")
             return
         }
-        ExtLog.info("[vkturn] attach: credsJSON present (\(credsJSON.count) chars)")
+        let credsJSON = legacyCredsJSON ?? ""
+        ExtLog.info("[vkturn] attach: credential payload present mode=\(roomBundleJSON?.isEmpty == false ? "multi-room" : "legacy")")
 
         // Safety margin gate. The pre-fix code hard-coded 3480 s
         // (lifetime 3600 minus 120 s cushion), but VK has shipped
@@ -342,8 +344,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // on `age >= lifetime - 120 s`. lifetime_sec <= 0 falls back
         // to the historic 3480 s value so older entries (pre-refresh
         // schema) still age-check cleanly.
-        let cushionSec: TimeInterval = 120
-        let lifetimeSec: TimeInterval = {
+        if roomBundleJSON?.isEmpty != false {
+            let cushionSec: TimeInterval = 120
+            let lifetimeSec: TimeInterval = {
             guard let data = credsJSON.data(using: .utf8) else { return 0 }
             struct LifetimeShape: Decodable { let lifetime_sec: Int? }
             guard let parsed = try? JSONDecoder().decode(LifetimeShape.self, from: data),
@@ -367,16 +370,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.warn("[vkturn] attach: no vkTURNCredsAcquiredAt stamp — proceeding without age check (legacy creds?)")
         }
 
-        ExtLog.info("[vkturn] attach: BEFORE SocksstubStartVKTurnUpstream peer=\(peer), listenPort=9000, workers=\(workers)")
+        }
+
+        ExtLog.info("[vkturn] attach: BEFORE runner start peer=\(peer), listenPort=9000, rooms=\(roomCount)")
         let beforeMs = Date()
-        let err = SocksstubStartVKTurnUpstream(credsJSON, peer, password, deviceID, 9000, workers)
+        let err: String
+        if let bundle = roomBundleJSON, !bundle.isEmpty {
+            err = SocksstubStartVKTurnMultiRoomUpstream(bundle, peer, password, deviceID, 9000, VKCredsPreferences.workersPerRoom)
+        } else {
+            err = SocksstubStartVKTurnUpstream(credsJSON, peer, password, deviceID, 9000, workers)
+        }
         let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
-        ExtLog.info("[vkturn] attach: AFTER SocksstubStartVKTurnUpstream dur=\(durMs)ms err=\"\(err)\"")
+        ExtLog.info("[vkturn] attach: AFTER runner start dur=\(durMs)ms err=\"\(err)\"")
         if !err.isEmpty {
-            ExtLog.error("[vkturn] SocksstubStartVKTurnUpstream returned: \"\(err)\"")
+            ExtLog.error("[vkturn] runner start returned: \"\(err)\"")
             return
         }
-        ExtLog.info("[vkturn] SocksstubStartVKTurnUpstream OK, polling for WG config + netstack (up to 60 s)")
+        ExtLog.info("[vkturn] runner OK, polling for WG config + netstack (up to 60 s)")
 
         Task.detached(priority: .utility) {
             ExtLog.info("[vkturn] async polling task started")
@@ -411,60 +421,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func refreshVKTurnCredsFromAppGroup() -> String {
         let groupID = "group.com.anarki.samizdat-test"
         let defaults = UserDefaults(suiteName: groupID)
-        guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
-              !credsJSON.isEmpty else {
-            ExtLog.warn("[vkturn] refresh creds SKIPPED — no creds JSON in App Group")
+        let roomBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)
+        let legacyJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
+
+        let beforeMs = Date()
+        let err: String
+        let mode: String
+        if let roomBundle, !roomBundle.isEmpty {
+            mode = "multi-room"
+            err = SocksstubUpdateVKTurnRoomCreds(roomBundle)
+        } else if let legacyJSON, !legacyJSON.isEmpty {
+            mode = "legacy"
+            err = SocksstubUpdateVKTurnCreds(legacyJSON)
+        } else {
+            ExtLog.warn("[vkturn] refresh creds SKIPPED — no credential payload in App Group")
             return "noCreds"
         }
 
-        if let data = credsJSON.data(using: .utf8) {
-            struct Shape: Decodable {
-                struct Server: Decodable {
-                    let host: String?
-                    let port: Int?
-                    let scheme: String?
-                    let transport: String?
-                }
-                let username: String?
-                let turn_servers: [String]?
-                let turn_servers_v2: [Server]?
-                let lifetime_sec: Int?
-            }
-            if let shape = try? JSONDecoder().decode(Shape.self, from: data) {
-                let v1Count = shape.turn_servers?.count ?? 0
-                let v2 = shape.turn_servers_v2 ?? []
-                var udpCount = 0
-                var tcpCount = 0
-                var turnsCount = 0
-                for server in v2 {
-                    let scheme = (server.scheme ?? "turn").lowercased()
-                    let transport = (server.transport ?? (scheme == "turns" ? "tcp" : "udp")).lowercased()
-                    if scheme == "turns" {
-                        turnsCount += 1
-                    } else if transport == "tcp" {
-                        tcpCount += 1
-                    } else {
-                        udpCount += 1
-                    }
-                }
-                ExtLog.info("[vkturn] refresh creds: userLen=\(shape.username?.count ?? 0) lifetime=\(shape.lifetime_sec ?? 0)s v1=\(v1Count) v2=\(v2.count) transports=udp:\(udpCount),tcp:\(tcpCount),turns:\(turnsCount) jsonLen=\(data.count) running=\(SocksstubTURNUpstreamRunning())")
-            } else {
-                ExtLog.warn("[vkturn] refresh creds: metadata decode failed (raw creds JSON intentionally not logged)")
-            }
-        }
-
-        let beforeMs = Date()
-        let err = SocksstubUpdateVKTurnCreds(credsJSON)
         let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
         if err.isEmpty {
-            ExtLog.info("[vkturn] refresh creds: SocksstubUpdateVKTurnCreds OK dur=\(durMs)ms")
+            ExtLog.info("[vkturn] refresh creds OK mode=\(mode) dur=\(durMs)ms")
             return "ok"
         }
         if err == "not running" {
-            ExtLog.info("[vkturn] refresh creds: runner not running dur=\(durMs)ms")
+            ExtLog.info("[vkturn] refresh creds: runner not running mode=\(mode) dur=\(durMs)ms")
             return err
         }
-        ExtLog.warn("[vkturn] refresh creds: SocksstubUpdateVKTurnCreds returned \"\(err)\" dur=\(durMs)ms")
+        ExtLog.warn("[vkturn] refresh creds failed mode=\(mode) err=\"\(err)\" dur=\(durMs)ms")
         return err
     }
 
@@ -611,31 +594,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private static func vkTurnCredsFreshness() -> (isFresh: Bool, reason: String) {
-        let defaults = UserDefaults(suiteName: appGroupID)
-        guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
-              !credsJSON.isEmpty else {
-            return (false, "creds JSON missing")
+        if TURNCredsStore.shared.roomsAreFresh {
+            let rooms = VKCredsPreferences.roomHashes.count
+            return (true, "multi-room credentials fresh rooms=\(rooms)")
         }
-        struct LifetimeShape: Decodable { let lifetime_sec: Int? }
-        let lifetimeSec: TimeInterval = {
-            guard let data = credsJSON.data(using: .utf8),
-                  let parsed = try? JSONDecoder().decode(LifetimeShape.self, from: data),
-                  let life = parsed.lifetime_sec,
-                  life > 0 else {
-                return 3600
-            }
-            return TimeInterval(life)
-        }()
-        guard let acquiredAt = defaults?.object(forKey: "tamizdat.vkTURNCredsAcquiredAt") as? Date else {
-            return (false, "creds acquiredAt missing")
-        }
-        let cushionSec: TimeInterval = 120
-        let safeBound = max(0, lifetimeSec - cushionSec)
-        let age = Date().timeIntervalSince(acquiredAt)
-        if age >= safeBound {
-            return (false, "creds stale age=\(Int(age))s safe=\(Int(safeBound))s lifetime=\(Int(lifetimeSec))s")
-        }
-        return (true, "creds fresh age=\(Int(age))s safe=\(Int(safeBound))s")
+        return (false, "multi-room credentials missing, incomplete, or stale")
     }
 
     /// Rebuilds the samizdat client by re-calling SocksstubSetSamizdatConfig
@@ -889,7 +852,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // the active policy. H2/Main users just keep the saved value
             // for the next Restricted+Relay connect.
             let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-            appendExtLog("info: app requested VK TURN restart → workers=\(VKCredsPreferences.workers) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
+            appendExtLog("info: app requested VK TURN restart → rooms=\(VKCredsPreferences.roomHashes.count) workersPerRoom=20 effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
             guard policy.usesTURN else {
                 SocksstubStopVKTurnUpstream()
                 completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
@@ -897,9 +860,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             SocksstubStopVKTurnUpstream()
             let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
-            guard let credsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON"),
-                  !credsJSON.isEmpty else {
-                appendExtLog("warn: VK TURN restart skipped — no creds JSON in App Group")
+            let hasBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)?.isEmpty == false
+            let hasLegacy = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")?.isEmpty == false
+            guard hasBundle || hasLegacy else {
+                appendExtLog("warn: VK TURN restart skipped — no credential payload in App Group")
                 completionHandler?("noCreds".data(using: .utf8))
                 return
             }

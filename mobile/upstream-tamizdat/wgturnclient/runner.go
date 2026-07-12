@@ -12,34 +12,39 @@ import (
 )
 
 const (
-	defaultListen      = "127.0.0.1:9000"
-	defaultWorkers     = workersPerGroup
-	maxWorkers         = 72
-	defaultVKAppID     = "6287487"
-	defaultVKAppSecret = "QbYic1K3lEV5kTGiqlq2"
-	defaultUserAgent   = "Mozilla/5.0"
+	defaultListen       = "127.0.0.1:9000"
+	defaultWorkers      = workersPerGroup
+	maxWorkers          = 72 // legacy single-room compatibility
+	maxRooms            = 4
+	maxWorkersPerRoom   = 20
+	maxMultiRoomWorkers = maxRooms * maxWorkersPerRoom
+	defaultVKAppID      = "6287487"
+	defaultVKAppSecret  = "QbYic1K3lEV5kTGiqlq2"
+	defaultUserAgent    = "Mozilla/5.0"
 )
 
 type EventFunc func(level, message string)
 
 type Config struct {
-	Listen         string
-	PeerAddr       string
-	Workers        int
-	UseUDP         bool
-	UseTCP         bool
-	VKHashes       []string
-	SecondaryHash  string
-	DeviceID       string
-	ConnPassword   string
-	VKAppID        string
-	VKAppSecret    string
-	UserAgent      string
-	CaptchaMode    string
-	NoDNS          bool
-	PreloadedCreds *Credentials
-	OnConfig       func(string)
-	OnEvent        EventFunc
+	Listen               string
+	PeerAddr             string
+	Workers              int
+	WorkersPerRoom       int
+	UseUDP               bool
+	UseTCP               bool
+	VKHashes             []string
+	SecondaryHash        string
+	DeviceID             string
+	ConnPassword         string
+	VKAppID              string
+	VKAppSecret          string
+	UserAgent            string
+	CaptchaMode          string
+	NoDNS                bool
+	PreloadedCreds       *Credentials
+	PreloadedCredsByHash map[string]*Credentials
+	OnConfig             func(string)
+	OnEvent              EventFunc
 
 	TurnHost    string
 	TurnPort    string
@@ -65,6 +70,8 @@ type Runner struct {
 	cachedSuccessToken string
 	cachedTokenUsages  int32
 	groupAuthMutex     sync.Mutex
+	roomCredsMu        sync.Mutex
+	roomCreds          map[string]roomCredentialCacheEntry
 
 	pauseFlag int32
 
@@ -103,8 +110,32 @@ func New(cfg Config) (*Runner, error) {
 	if !cfg.UseTCP && !cfg.UseUDP {
 		cfg.UseTCP = true
 	}
-	cfg.Workers = normalizeWorkerCount(cfg.Workers)
 	cfg.VKHashes = normalizeHashes(cfg.VKHashes)
+	if cfg.WorkersPerRoom > 0 {
+		if len(cfg.VKHashes) < 1 || len(cfg.VKHashes) > maxRooms {
+			return nil, fmt.Errorf("multi-room mode requires 1-%d unique rooms", maxRooms)
+		}
+		if cfg.WorkersPerRoom < 1 || cfg.WorkersPerRoom > maxWorkersPerRoom {
+			return nil, fmt.Errorf("workers per room must be between 1 and %d", maxWorkersPerRoom)
+		}
+		if cfg.SecondaryHash != "" || cfg.PreloadedCreds != nil {
+			return nil, fmt.Errorf("legacy fallback/preloaded credentials are incompatible with multi-room mode")
+		}
+		if len(cfg.PreloadedCredsByHash) != len(cfg.VKHashes) {
+			return nil, fmt.Errorf("multi-room credentials must cover every room")
+		}
+		for _, hash := range cfg.VKHashes {
+			if cfg.PreloadedCredsByHash[hash] == nil {
+				return nil, fmt.Errorf("multi-room credentials missing configured room")
+			}
+		}
+		cfg.Workers = len(cfg.VKHashes) * cfg.WorkersPerRoom
+		if cfg.Workers > maxMultiRoomWorkers {
+			return nil, fmt.Errorf("multi-room worker count exceeds %d", maxMultiRoomWorkers)
+		}
+	} else {
+		cfg.Workers = normalizeWorkerCount(cfg.Workers)
+	}
 	if len(cfg.VKHashes) == 0 && cfg.PreloadedCreds != nil {
 		cfg.VKHashes = []string{"preloaded"}
 	}
@@ -117,6 +148,7 @@ func New(cfg Config) (*Runner, error) {
 		captchaResultCh: make(chan string, 1),
 		vkSemaphore:     make(chan struct{}, 2),
 		captchaWVSem:    make(chan struct{}, 1),
+		roomCreds:       make(map[string]roomCredentialCacheEntry),
 	}
 	r.vkAppID.Store(cfg.VKAppID)
 	r.vkAppSecret.Store(cfg.VKAppSecret)
@@ -124,12 +156,11 @@ func New(cfg Config) (*Runner, error) {
 	r.userAgent.Store(cfg.UserAgent)
 	r.noDNS.Store(cfg.NoDNS)
 	if cfg.PreloadedCreds != nil {
-		dup := *cfg.PreloadedCreds
-		dup.TurnURLs = append([]string(nil), cfg.PreloadedCreds.TurnURLs...)
-		if len(cfg.PreloadedCreds.TurnServers) > 0 {
-			dup.TurnServers = append([]TurnServer(nil), cfg.PreloadedCreds.TurnServers...)
-		}
-		r.preloadedCreds.Store(&dup)
+		dup := cloneCredentials(cfg.PreloadedCreds)
+		r.preloadedCreds.Store(dup)
+	}
+	for hash, creds := range cfg.PreloadedCredsByHash {
+		r.updateRoomCreds(hash, creds)
 	}
 	return r, nil
 }
@@ -179,7 +210,8 @@ func (r *Runner) Start(ctx context.Context) error {
 		localPort = "9000"
 	}
 
-	numGroups := r.cfg.Workers / workersPerGroup
+	plans := buildWorkerGroupPlans(r.cfg.Workers, len(r.cfg.VKHashes), r.cfg.WorkersPerRoom)
+	numGroups := len(plans)
 
 	log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
 	log.Printf("[КЛИЕНТ] VK App: %s", r.cfg.VKAppID)
@@ -229,24 +261,21 @@ func (r *Runner) Start(ctx context.Context) error {
 
 	var wg sync.WaitGroup
 	workerIDCounter := 1
-	var prevWaitReady <-chan struct{}
+	roomWaitReady := make([]<-chan struct{}, len(r.cfg.VKHashes))
+	broker := &configBroker{ch: configCh}
 
-	for g := 0; g < numGroups; g++ {
-		isFirst := g == 0
-
-		var myWaitReady <-chan struct{}
+	for g, plan := range plans {
+		myWaitReady := roomWaitReady[plan.hashIndex]
 		var mySignalReady chan<- struct{}
-
-		if g > 0 {
-			myWaitReady = prevWaitReady
-		}
-		if g < numGroups-1 {
+		if g+1 < numGroups && plans[g+1].hashIndex == plan.hashIndex {
 			ch := make(chan struct{})
 			mySignalReady = ch
-			prevWaitReady = ch
+			roomWaitReady[plan.hashIndex] = ch
+		} else {
+			roomWaitReady[plan.hashIndex] = nil
 		}
 
-		ids := make([]int, workersPerGroup)
+		ids := make([]int, plan.workerCount)
 		for i := range ids {
 			ids[i] = workerIDCounter
 			workerIDCounter++
@@ -254,17 +283,12 @@ func (r *Runner) Start(ctx context.Context) error {
 
 		gID := g + 1
 		cycle := time.Duration(defaultCycleSecs) * time.Second
-		var cc chan<- string
-		if isFirst {
-			cc = configCh
-		}
-
 		wg.Add(1)
-		go func(groupID int, cycleDir time.Duration, isFirstGroup bool, configChan chan<- string, workerIDs []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
+		go func(groupID int, cycleDir time.Duration, workerIDs []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
 			defer wg.Done()
 			r.workerGroup(runCtx, groupID, startHashIndex, tp, peer, disp, localPort, r.cfg.UseUDP,
-				isFirstGroup, configChan, workerIDs, cycleDir, &r.pauseFlag, r.cfg.DeviceID, r.cfg.ConnPassword, stats, waitR, sigR)
-		}(gID, cycle, isFirst, cc, ids, g, myWaitReady, mySignalReady)
+				broker, workerIDs, cycleDir, &r.pauseFlag, r.cfg.DeviceID, r.cfg.ConnPassword, stats, waitR, sigR)
+		}(gID, cycle, ids, plan.hashIndex, myWaitReady, mySignalReady)
 	}
 
 	wg.Wait()
@@ -394,11 +418,17 @@ func normalizeWorkerCount(n int) int {
 
 func normalizeHashes(hashes []string) []string {
 	result := make([]string, 0, len(hashes))
+	seen := make(map[string]struct{}, len(hashes))
 	for _, hash := range hashes {
 		hash = strings.TrimSpace(hash)
-		if hash != "" {
-			result = append(result, hash)
+		if hash == "" {
+			continue
 		}
+		if _, duplicate := seen[hash]; duplicate {
+			continue
+		}
+		seen[hash] = struct{}{}
+		result = append(result, hash)
 	}
 	return result
 }
