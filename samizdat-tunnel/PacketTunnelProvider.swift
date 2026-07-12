@@ -114,7 +114,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let rewireQueue = DispatchQueue(label: "com.anarki.samizdat-test.rewire", qos: .userInitiated)
     private let rewireGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
     private static let turnTunnelGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
-    private static let turnAttachRetryLock = OSAllocatedUnfairLock<Bool>(initialState: false)
+    // nil = no retry; otherwise the generation that currently owns the slot.
+    // A newer tunnel may replace a stale retry without waiting for its Task to
+    // observe cancellation, and stale defer blocks cannot clear the new owner.
+    private static let turnAttachRetryGenerationLock = OSAllocatedUnfairLock<Int?>(initialState: nil)
     private var rewireGeneration: Int {
         get { rewireGenerationLock.withLock { $0 } }
         set { rewireGenerationLock.withLock { $0 = newValue } }
@@ -450,19 +453,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private static func scheduleVKTurnAttachAfterDrain() {
-        let shouldSchedule = turnAttachRetryLock.withLock { scheduled -> Bool in
-            if scheduled { return false }
-            scheduled = true
+        let capturedTunnelGeneration = turnTunnelGenerationLock.withLock { $0 }
+        let shouldSchedule = turnAttachRetryGenerationLock.withLock { owner -> Bool in
+            if owner == capturedTunnelGeneration { return false }
+            owner = capturedTunnelGeneration
             return true
         }
         guard shouldSchedule else {
-            ExtLog.info("[vkturn] drain retry already scheduled")
+            ExtLog.info("[vkturn] drain retry already scheduled generation=\(capturedTunnelGeneration)")
             return
         }
 
-        let capturedTunnelGeneration = turnTunnelGenerationLock.withLock { $0 }
         Task.detached(priority: .utility) {
-            defer { turnAttachRetryLock.withLock { $0 = false } }
+            defer {
+                turnAttachRetryGenerationLock.withLock { owner in
+                    if owner == capturedTunnelGeneration {
+                        owner = nil
+                    }
+                }
+            }
             for attempt in 1...120 { // up to 60 s; never blocks NE stop watchdog
                 guard turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration else {
                     ExtLog.info("[vkturn] drain retry cancelled — tunnel generation changed")
