@@ -347,6 +347,13 @@ final class TURNCredsRefresher: ObservableObject {
                 }
                 TURNLog.info("turncreds", "creds received, saving")
                 TURNCredsStore.shared.save(creds)
+                guard TURNCredsStore.shared.isFresh else {
+                    let remaining = TURNCredsStore.shared.load()?.expiresAt.timeIntervalSinceNow ?? 0
+                    throw TURNCredsRefreshWaitError.stillStale(
+                        "полученные credentials имеют недостаточный TTL (осталось \(Int(remaining))с)"
+                    )
+                }
+                self.turnInfo = "TURN: подключение без капчи успешно."
                 // Push the fresh snapshot into the in-process Go VK
                 // TURN runner so the next worker-group rotation uses
                 // them — without this hop the runner kept reading the

@@ -319,7 +319,7 @@ actor VKCredsClient {
         do {
             let creds = try await fetchAnonymousVKCallsCredentials(hash: config.callHash)
             TURNLog.info("vkcreds", "anonymous VKCalls flow succeeded")
-            progress?("TURN: подключение без капчи успешно.")
+            progress?("TURN: credentials без капчи получены, сохраняю…")
             return creds
         } catch {
             // The old five-call VK flow is deliberately retained as the
@@ -813,9 +813,11 @@ actor VKCredsClient {
         // VK ships `lifetime` (sec) in some responses and `ttl` in others;
         // sometimes neither (build-227 log showed step 5 ok then immediate
         // re-refresh — root cause was lifetime=0, expiresAt = acquiredAt,
-        // needsRefresh always true → infinite refresh loop). Fall back to
         // 3600s (one hour) — the donor's empirical default and a safe
         // floor: VK invalidates session params long before they actually go stale.
+        // It must remain above TURNCredsStore.refreshCushion (900s),
+        // otherwise a response without lifetime/ttl is stale immediately
+        // after save and connect preflight can never succeed.
         let lifetime: TimeInterval = {
             if let life = block["lifetime"] as? Double, life > 0 {
                 TURNLog.info("vkcreds", "parsed lifetime=\(Int(life))s from response")
@@ -825,8 +827,8 @@ actor VKCredsClient {
                 TURNLog.info("vkcreds", "parsed ttl=\(Int(ttl))s from response")
                 return ttl
             }
-            TURNLog.warn("vkcreds", "no lifetime/ttl in step 5 response — using default 600s")
-            return 600
+            TURNLog.warn("vkcreds", "no lifetime/ttl in step 5 response — using default 3600s")
+            return 3600
         }()
         return VKTURNCredentials(
             username: user,
