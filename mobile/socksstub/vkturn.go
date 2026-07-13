@@ -34,6 +34,7 @@ var (
 	vkturnCancel           context.CancelFunc
 	vkturnWGConfig         atomic.Pointer[string]
 	vkturnStats            atomic.Pointer[string]
+	vkturnTelemetry        atomic.Pointer[wgturnclient.StatsSnapshot]
 	vkturnErr              atomic.Pointer[string]
 	vkturnNet              atomic.Pointer[netstack.Net]
 	vkturnRunning          atomic.Bool
@@ -111,6 +112,7 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 	useUDP := shouldUseUDP(firstCreds)
 	rt.appendLog(fmt.Sprintf("info: vkturn start requested rooms=%d workers=%d workersPerRoom=%d useUDP=%t listenPort=%d peer=%s %s jsonLen=%d deviceIDLen=%d passwordLen=%d", maxInt(1, len(hashes)), workers, workersPerRoom, useUDP, listenPort, redactHostPortForLog(peerAddr), vkturnCredsSummary(firstCreds), jsonLen, len(deviceID), len(wgPassword)))
 	configCh := make(chan string, 1)
+	var runner *wgturnclient.Runner
 	cfg := wgturnclient.Config{
 		Listen: fmt.Sprintf("127.0.0.1:%d", listenPort), PeerAddr: peerAddr,
 		Workers: workers, WorkersPerRoom: workersPerRoom, UseUDP: useUDP,
@@ -124,6 +126,9 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 			}
 		},
 		OnEvent: func(level, message string) { appendVKTurnEvent(level, message) },
+		OnStats: func(snapshot wgturnclient.StatsSnapshot) {
+			storeVKTurnTelemetryIfCurrent(runner, snapshot)
+		},
 	}
 	runner, err := wgturnclient.New(cfg)
 	if err != nil {
@@ -636,6 +641,7 @@ func redactHostPortForLog(addr string) string {
 func resetVKTurnAtomicsLocked() {
 	vkturnWGConfig.Store(nil)
 	vkturnStats.Store(nil)
+	vkturnTelemetry.Store(nil)
 	vkturnErr.Store(nil)
 	vkturnRunning.Store(false)
 }
@@ -727,16 +733,41 @@ func storeVKTurnErrorIfCurrent(runner *wgturnclient.Runner, errText string) bool
 	return true
 }
 
+func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnclient.StatsSnapshot) {
+	vkturnMu.Lock()
+	if runner == nil || vkturnRunner != runner || !vkturnRunning.Load() {
+		vkturnMu.Unlock()
+		return
+	}
+	copy := snapshot
+	vkturnTelemetry.Store(&copy)
+	storeVKTurnStats(int(snapshot.ActiveConnections), true)
+	vkturnMu.Unlock()
+
+	if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
+		rt.appendLog(fmt.Sprintf("info: vkturn bond telemetry active=%d frames_up=%d frames_down=%d bytes_up=%d bytes_down=%d drops=%d reorder_gaps_down=%d reorder_late_down=%d room_up_bytes=%v room_down_bytes=%v room_drops=%v",
+			snapshot.ActiveConnections, snapshot.BondFramesUp, snapshot.BondFramesDown,
+			snapshot.BondBytesUp, snapshot.BondBytesDown, snapshot.BondQueueDrops,
+			snapshot.BondReorderGaps, snapshot.BondReorderLate,
+			snapshot.RoomUpBytes, snapshot.RoomDownBytes, snapshot.RoomDrops))
+	}
+}
+
 func storeVKTurnStats(active int, running bool) {
 	var errText string
 	if p := vkturnErr.Load(); p != nil {
 		errText = *p
 	}
+	telemetry := vkturnTelemetry.Load()
+	if telemetry != nil {
+		active = int(telemetry.ActiveConnections)
+	}
 	payload := struct {
-		Active  int    `json:"active"`
-		Running bool   `json:"running"`
-		Error   string `json:"error,omitempty"`
-	}{Active: active, Running: running, Error: errText}
+		Active    int                         `json:"active"`
+		Running   bool                        `json:"running"`
+		Error     string                      `json:"error,omitempty"`
+		Telemetry *wgturnclient.StatsSnapshot `json:"telemetry,omitempty"`
+	}{Active: active, Running: running, Error: errText, Telemetry: telemetry}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		snapshot := fmt.Sprintf(`{"active":%d,"running":%t}`, active, running)

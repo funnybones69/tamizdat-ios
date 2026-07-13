@@ -1,6 +1,7 @@
 package socksstub
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -178,6 +179,50 @@ func TestStaleRunnerCannotOverwriteCurrentErrorState(t *testing.T) {
 	vkturnErr.Store(nil)
 	vkturnStats.Store(nil)
 	vkturnMu.Unlock()
+}
+
+func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
+	current := &wgturnclient.Runner{}
+	stale := &wgturnclient.Runner{}
+	vkturnMu.Lock()
+	vkturnRunner = current
+	vkturnRunning.Store(true)
+	vkturnErr.Store(nil)
+	vkturnStats.Store(nil)
+	vkturnTelemetry.Store(nil)
+	vkturnMu.Unlock()
+	defer func() {
+		vkturnMu.Lock()
+		vkturnRunner = nil
+		vkturnRunning.Store(false)
+		vkturnStats.Store(nil)
+		vkturnTelemetry.Store(nil)
+		vkturnMu.Unlock()
+	}()
+
+	snapshot := wgturnclient.StatsSnapshot{ActiveConnections: 80, BondFramesUp: 12, BondFramesDown: 13}
+	snapshot.RoomUpBytes[3] = 404
+	snapshot.RoomDownBytes[3] = 505
+	storeVKTurnTelemetryIfCurrent(current, snapshot)
+	staleSnapshot := snapshot
+	staleSnapshot.RoomDownBytes[3] = 999
+	storeVKTurnTelemetryIfCurrent(stale, staleSnapshot)
+
+	var got struct {
+		Active    int  `json:"active"`
+		Running   bool `json:"running"`
+		Telemetry struct {
+			BondFramesUp  int64    `json:"bond_frames_up"`
+			RoomUpBytes   [4]int64 `json:"room_up_bytes"`
+			RoomDownBytes [4]int64 `json:"room_down_bytes"`
+		} `json:"telemetry"`
+	}
+	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Running || got.Active != 80 || got.Telemetry.BondFramesUp != 12 || got.Telemetry.RoomUpBytes[3] != 404 || got.Telemetry.RoomDownBytes[3] != 505 {
+		t.Fatalf("telemetry JSON=%+v", got)
+	}
 }
 
 func TestShouldUseUDPIgnoresTurnsEndpoints(t *testing.T) {

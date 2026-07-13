@@ -46,6 +46,7 @@ type Config struct {
 	BondV2               bool
 	OnConfig             func(string)
 	OnEvent              EventFunc
+	OnStats              func(StatsSnapshot)
 
 	TurnHost    string
 	TurnPort    string
@@ -257,7 +258,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		<-runCtx.Done()
 		close(shutdownCh)
 	}()
-	go stats.RunLoop(shutdownCh)
+	go stats.RunLoopWithCallback(shutdownCh, r.cfg.OnStats)
 
 	disp := NewDispatcherWithOptions(runCtx, localConn, stats, r.cfg.BondV2, len(r.cfg.VKHashes), r.cfg.OnEvent)
 	defer disp.Shutdown()

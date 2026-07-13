@@ -631,6 +631,9 @@ func RunSession(
 			case <-sessCtx.Done():
 				return
 			}
+			if bondV2 {
+				recordBondRoomDown(stats, roomID, pkt)
+			}
 		}
 	}()
 
