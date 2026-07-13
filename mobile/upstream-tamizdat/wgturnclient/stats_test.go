@@ -1,11 +1,44 @@
 package wgturnclient
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"sync/atomic"
 	"testing"
 )
+
+func TestSessionReturnCountsValidBondDataBeforeCancelledEnqueue(t *testing.T) {
+	stats := NewStats()
+	d := &Dispatcher{ReturnCh: make(chan []byte, 1)}
+	d.ReturnCh <- []byte("occupied")
+	data, err := encodeBondFrame(bondFrame{Type: bondFrameData, Seq: 1, Payload: []byte("received-before-shutdown")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: 1 << 15, Seq: 2, Payload: []byte("reject")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if enqueueSessionReturn(ctx, d, stats, 2, data, true) {
+		t.Fatal("cancelled enqueue unexpectedly succeeded")
+	}
+	if enqueueSessionReturn(ctx, d, stats, 2, invalid, true) {
+		t.Fatal("cancelled invalid enqueue unexpectedly succeeded")
+	}
+	if enqueueSessionReturn(ctx, d, stats, 2, data, false) {
+		t.Fatal("cancelled legacy enqueue unexpectedly succeeded")
+	}
+	snapshot := stats.Snapshot()
+	if snapshot.BondFramesDown != 1 || snapshot.BondBytesDown != int64(len("received-before-shutdown")) || snapshot.RoomDownPackets[2] != 1 || snapshot.RoomDownBytes[2] != int64(len("received-before-shutdown")) {
+		t.Fatalf("raw downlink attribution=%+v", snapshot)
+	}
+	if snapshot.TotalBytesDown != 0 || len(d.ReturnCh) != 1 {
+		t.Fatalf("cancelled enqueue delivered bytes=%d queue=%d", snapshot.TotalBytesDown, len(d.ReturnCh))
+	}
+}
 
 func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	stats := NewStats()

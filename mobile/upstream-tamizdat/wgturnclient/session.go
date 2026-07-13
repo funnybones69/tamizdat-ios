@@ -263,6 +263,21 @@ func ternaryEventLevel(warn bool) string {
 	return "error"
 }
 
+func enqueueSessionReturn(ctx context.Context, d *Dispatcher, stats *Stats, roomID int, packet []byte, bondV2 bool) bool {
+	// Raw transport attribution belongs to the DTLS read boundary. Count before
+	// a possibly blocked enqueue so shutdown cannot erase an already received,
+	// wire-valid DATA frame from aggregate/per-room telemetry.
+	if bondV2 {
+		recordBondRoomDown(stats, roomID, packet)
+	}
+	select {
+	case d.ReturnCh <- packet:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func RunSession(
 	ctx context.Context,
 	tp *TurnParams,
@@ -626,13 +641,8 @@ func RunSession(
 
 			pkt := make([]byte, n)
 			copy(pkt, b[:n])
-			select {
-			case d.ReturnCh <- pkt:
-			case <-sessCtx.Done():
+			if !enqueueSessionReturn(sessCtx, d, stats, roomID, pkt, bondV2) {
 				return
-			}
-			if bondV2 {
-				recordBondRoomDown(stats, roomID, pkt)
 			}
 		}
 	}()

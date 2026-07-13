@@ -85,9 +85,9 @@ func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {
 	if err != nil || frame.Type != bondFrameData || frame.Flags&^bondKnownDataFlags != 0 {
 		return
 	}
-	// Count accepted transport DATA at the worker boundary after successful
-	// ReturnCh enqueue. This keeps the final aggregate/per-room snapshot
-	// complete even when the dispatcher is cancelled with valid frames queued.
+	// Count wire-valid transport DATA at the worker boundary immediately after
+	// DTLS read. This raw attribution intentionally includes a frame that cannot
+	// enqueue because shutdown wins; TotalBytesDown counts only local WG writes.
 	atomic.AddInt64(&stats.BondFramesDown, 1)
 	atomic.AddInt64(&stats.BondBytesDown, int64(len(frame.Payload)))
 	atomic.AddInt64(&stats.BondRoomDownPackets[roomID], 1)
