@@ -199,11 +199,12 @@ func TestBondSchedulerLargeRRSmallPinnedFailover(t *testing.T) {
 }
 
 func TestBondDispatcherUsesIndependentLaneSequences(t *testing.T) {
-	worker := &WorkerSlot{ID: 1, RoomID: 0, SendCh: make(chan []byte, 2)}
+	worker := &WorkerSlot{ID: 1, RoomID: 0, SendCh: make(chan []byte, 3)}
 	d := &Dispatcher{workers: []*WorkerSlot{worker}, stats: NewStats(), bondSched: newBondScheduler()}
 	d.dispatchBond(bytes.Repeat([]byte{'b'}, bondSmallPacketMax+1))
 	d.dispatchBond([]byte("small"))
-	bulk, err := decodeBondFrame(<-worker.SendCh)
+	d.dispatchBond(bytes.Repeat([]byte{'B'}, bondSmallPacketMax+1))
+	bulk1, err := decodeBondFrame(<-worker.SendCh)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,11 +212,18 @@ func TestBondDispatcherUsesIndependentLaneSequences(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bulk.Flags != 0 || bulk.Seq != 1 {
-		t.Fatalf("bulk flags=%d seq=%d want 0/1", bulk.Flags, bulk.Seq)
+	bulk2, err := decodeBondFrame(<-worker.SendCh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bulk1.Flags != 0 || bulk1.Seq != 1 {
+		t.Fatalf("bulk1 flags=%d seq=%d want 0/1", bulk1.Flags, bulk1.Seq)
 	}
 	if latency.Flags != bondFlagLatency || latency.Seq != 1 {
 		t.Fatalf("latency flags=%d seq=%d want %d/1", latency.Flags, latency.Seq, bondFlagLatency)
+	}
+	if bulk2.Flags != 0 || bulk2.Seq != 2 {
+		t.Fatalf("bulk2 flags=%d seq=%d want 0/2 (small packet must not consume bulk sequence)", bulk2.Flags, bulk2.Seq)
 	}
 }
 

@@ -170,10 +170,12 @@ func (d *Dispatcher) dispatchLegacy(pkt []byte) {
 
 func (d *Dispatcher) dispatchBond(payload []byte) {
 	flags := uint16(0)
-	seq := d.bondSeq.Add(1)
+	var seq uint64
 	if len(payload) <= bondSmallPacketMax {
 		flags = bondFlagLatency
 		seq = d.bondLatencySeq.Add(1)
+	} else {
+		seq = d.bondSeq.Add(1)
 	}
 	frame, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: flags, Seq: seq, Payload: payload})
 	if err != nil {
