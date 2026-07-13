@@ -23,8 +23,13 @@ func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	unknownFlagsFrame, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: 1 << 15, Seq: 2, Payload: []byte("reject")})
+	if err != nil {
+		t.Fatal(err)
+	}
 	recordBondRoomDown(stats, 1, dataFrame)
 	recordBondRoomDown(stats, 1, controlFrame)
+	recordBondRoomDown(stats, 1, unknownFlagsFrame)
 	recordBondRoomDown(stats, 1, []byte("invalid"))
 	recordBondRoomDown(stats, maxRooms, dataFrame)
 

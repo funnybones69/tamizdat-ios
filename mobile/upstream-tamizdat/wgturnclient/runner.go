@@ -253,15 +253,22 @@ func (r *Runner) Start(ctx context.Context) error {
 		}
 		r.eventf("info", "bond v2 enabled rooms=%d runIDLen=%d tokenLen=%d", len(r.cfg.VKHashes), len(bondID.RunID), len(bondID.Token))
 	}
-	shutdownCh := make(chan struct{})
+	statsShutdown := make(chan struct{})
+	statsDone := make(chan struct{})
 	go func() {
-		<-runCtx.Done()
-		close(shutdownCh)
+		defer close(statsDone)
+		stats.RunLoopWithCallback(statsShutdown, r.cfg.OnStats)
 	}()
-	go stats.RunLoopWithCallback(shutdownCh, r.cfg.OnStats)
 
 	disp := NewDispatcherWithOptions(runCtx, localConn, stats, r.cfg.BondV2, len(r.cfg.VKHashes), r.cfg.OnEvent)
-	defer disp.Shutdown()
+	defer func() {
+		// The callback emitted when statsShutdown closes is the final snapshot.
+		// Stop every producer first so worker/session tail counters and dispatcher
+		// downlink attribution cannot race that snapshot.
+		disp.Shutdown()
+		close(statsShutdown)
+		<-statsDone
+	}()
 
 	configCh := make(chan string, 1)
 	configDone := make(chan struct{})

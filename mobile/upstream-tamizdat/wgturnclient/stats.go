@@ -82,7 +82,7 @@ func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {
 		return
 	}
 	frame, err := decodeBondFrame(packet)
-	if err != nil || frame.Type != bondFrameData {
+	if err != nil || frame.Type != bondFrameData || frame.Flags & ^bondKnownDataFlags != 0 {
 		return
 	}
 	atomic.AddInt64(&stats.BondRoomDownPackets[roomID], 1)

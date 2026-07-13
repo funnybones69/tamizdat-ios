@@ -31,6 +31,7 @@ import (
 
 var (
 	vkturnRunner           *wgturnclient.Runner
+	vkturnTelemetryOwner   *wgturnclient.Runner // guarded by vkturnMu; may be the draining runner
 	vkturnCancel           context.CancelFunc
 	vkturnWGConfig         atomic.Pointer[string]
 	vkturnStats            atomic.Pointer[string]
@@ -140,6 +141,7 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 	runDone := make(chan struct{})
 	generation := vkturnGeneration.Add(1)
 	vkturnRunner, vkturnCancel, vkturnRunDone = runner, cancel, runDone
+	vkturnTelemetryOwner = runner
 	vkturnRunning.Store(true)
 	storeVKTurnStats(0, true)
 	vkturnMu.Unlock()
@@ -262,52 +264,69 @@ func UpdateVKTurnRoomCreds(bundleJSON string) string {
 // and dialUpstream gives that netstack priority over H2.
 func StopVKTurnUpstream() {
 	vkturnMu.Lock()
-	defer vkturnMu.Unlock()
-
 	runner := vkturnRunner
 	done := vkturnRunDone
 	if done == nil {
 		done = vkturnDraining
 	}
-	if vkturnCancel != nil {
-		vkturnCancel()
+	cancel := vkturnCancel
+	if done == nil {
+		// No live owner can publish a final callback. Clear stale transport
+		// state synchronously without discarding the last completed telemetry.
+		if cancel != nil {
+			cancel()
+		}
+		if runner != nil {
+			runner.Shutdown()
+		}
+		vkturnRunner, vkturnCancel, vkturnRunDone = nil, nil, nil
+		vkturnTelemetryOwner = nil
+		vkturnRunning.Store(false)
+		vkturnGeneration.Add(1)
+		stopVKTurnAttachLocked()
+		storeVKTurnStats(0, false)
+		vkturnMu.Unlock()
+		return
+	}
+	vkturnDraining = done
+	vkturnGeneration.Add(1) // invalidate detached Swift diagnostics immediately
+	stopVKTurnAttachLocked()
+	vkturnMu.Unlock()
+
+	// Never hold vkturnMu while waiting: Runner.Start emits its final stats
+	// callback before closing done, and that callback is serialized by vkturnMu.
+	if cancel != nil {
+		cancel()
 	}
 	if runner != nil {
 		runner.Shutdown()
 	}
 
-	// Do not allow a replacement runner to consume the same room quota until
-	// every old session has returned and its TURN allocation has been closed.
-	// runner.Start closes done before taking vkturnMu for final bookkeeping,
-	// so waiting here cannot deadlock with the owner cleanup goroutine.
-	if done != nil {
-		select {
-		case <-done:
-			vkturnDraining = nil
-			// pion sends Lifetime=0 without waiting for a TURN response. Give
-			// the relay a short grace window to apply deallocation before a
-			// replacement consumes the same per-room quota.
-			time.Sleep(vkturnAllocationReleaseWait)
-			vkturnRestartNotBefore.Store(0)
-			rt.appendLog("info: vkturn shutdown drained all worker sessions and waited for allocation release")
-		case <-time.After(vkturnShutdownWaitTimeout):
-			vkturnDraining = done
-			finishVKTurnDrainAsync(done)
-			rt.appendLog(fmt.Sprintf("warn: vkturn shutdown drain timed out after %s; replacement starts are blocked until drain completes", vkturnShutdownWaitTimeout))
-		}
-	} else {
-		vkturnDraining = nil
+	drained := false
+	select {
+	case <-done:
+		drained = true
+		time.Sleep(vkturnAllocationReleaseWait)
+		rt.appendLog("info: vkturn shutdown drained all worker sessions and waited for allocation release")
+	case <-time.After(vkturnShutdownWaitTimeout):
+		finishVKTurnDrainAsync(done)
+		rt.appendLog(fmt.Sprintf("warn: vkturn shutdown drain timed out after %s; replacement starts are blocked until drain completes", vkturnShutdownWaitTimeout))
 	}
 
-	vkturnRunner = nil
-	vkturnCancel = nil
-	vkturnRunDone = nil
-	vkturnGeneration.Add(1) // invalidate detached Swift diagnostics immediately
-	stopVKTurnAttachLocked()
-	resetVKTurnAtomicsLocked()
+	vkturnMu.Lock()
+	if drained && vkturnDraining == done {
+		vkturnDraining = nil
+		vkturnRestartNotBefore.Store(0)
+	}
+	if vkturnRunner == runner {
+		vkturnRunner, vkturnCancel, vkturnRunDone = nil, nil, nil
+		vkturnRunning.Store(false)
+	}
+	storeVKTurnStats(0, false)
+	vkturnMu.Unlock()
 }
 
-// StopVKTurnUpstreamAsync performs the cancellation/reset half of stop
+// StopVKTurnUpstreamAsync performs cancellation and transport detachment
 // synchronously, but drains TURN workers and deallocations in the background.
 // Network Extension stopTunnel must return promptly to the iOS watchdog; any
 // replacement start remains gated by vkturnDraining until cleanup completes.
@@ -319,26 +338,32 @@ func StopVKTurnUpstreamAsync() {
 	if done == nil {
 		done = vkturnDraining
 	}
-	if vkturnCancel != nil {
-		vkturnCancel()
+	cancel := vkturnCancel
+	if done != nil {
+		vkturnDraining = done
+	}
+	vkturnGeneration.Add(1)
+	stopVKTurnAttachLocked()
+	vkturnRunning.Store(false)
+	storeVKTurnStats(0, false)
+	if done == nil {
+		vkturnRunner, vkturnCancel, vkturnRunDone = nil, nil, nil
+		vkturnTelemetryOwner = nil
+	}
+	vkturnMu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
 	if runner != nil {
 		runner.Shutdown()
 	}
-	if done != nil {
-		vkturnDraining = done
-	}
-	vkturnRunner = nil
-	vkturnCancel = nil
-	vkturnRunDone = nil
-	vkturnGeneration.Add(1)
-	stopVKTurnAttachLocked()
-	resetVKTurnAtomicsLocked()
-	vkturnMu.Unlock()
-
 	if done == nil || alreadyDraining {
 		return
 	}
+	// Keep vkturnRunner and vkturnTelemetryOwner until Runner.Start returns.
+	// Its final callback can then publish the drained counters before runDone
+	// closes; the owner cleanup goroutine clears the runtime pointers.
 	finishVKTurnDrainAsync(done)
 }
 
@@ -642,6 +667,7 @@ func resetVKTurnAtomicsLocked() {
 	vkturnWGConfig.Store(nil)
 	vkturnStats.Store(nil)
 	vkturnTelemetry.Store(nil)
+	vkturnTelemetryOwner = nil
 	vkturnErr.Store(nil)
 	vkturnRunning.Store(false)
 }
@@ -735,13 +761,14 @@ func storeVKTurnErrorIfCurrent(runner *wgturnclient.Runner, errText string) bool
 
 func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnclient.StatsSnapshot) {
 	vkturnMu.Lock()
-	if runner == nil || vkturnRunner != runner || !vkturnRunning.Load() {
+	if runner == nil || vkturnTelemetryOwner != runner {
 		vkturnMu.Unlock()
 		return
 	}
 	copy := snapshot
 	vkturnTelemetry.Store(&copy)
-	storeVKTurnStats(int(snapshot.ActiveConnections), true)
+	running := vkturnRunner == runner && vkturnRunning.Load()
+	storeVKTurnStats(int(snapshot.ActiveConnections), running)
 	vkturnMu.Unlock()
 
 	if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {

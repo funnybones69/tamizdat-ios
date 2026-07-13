@@ -34,19 +34,38 @@ func TestStopVKTurnUpstreamClearsStaleNetstackWhenNotRunning(t *testing.T) {
 
 func TestStopVKTurnUpstreamWaitsForWorkerDrain(t *testing.T) {
 	done := make(chan struct{})
+	runner := &wgturnclient.Runner{}
 	vkturnMu.Lock()
-	vkturnRunner = &wgturnclient.Runner{}
+	vkturnRunner = runner
+	vkturnTelemetryOwner = runner
 	vkturnCancel = nil
 	vkturnRunDone = done
 	vkturnDraining = nil
 	vkturnAttachStop = nil
 	vkturnRunning.Store(true)
 	vkturnNet.Store(&netstack.Net{})
+	vkturnTelemetry.Store(nil)
+	vkturnStats.Store(nil)
 	beforeGeneration := vkturnGeneration.Load()
 	vkturnMu.Unlock()
+	defer func() {
+		vkturnMu.Lock()
+		vkturnRunner = nil
+		vkturnTelemetryOwner = nil
+		vkturnCancel = nil
+		vkturnRunDone = nil
+		vkturnDraining = nil
+		vkturnRunning.Store(false)
+		vkturnTelemetry.Store(nil)
+		vkturnStats.Store(nil)
+		vkturnMu.Unlock()
+	}()
 
 	go func() {
 		time.Sleep(75 * time.Millisecond)
+		final := wgturnclient.StatsSnapshot{ActiveConnections: 0, BondFramesDown: 7}
+		final.RoomDownBytes[2] = 707
+		storeVKTurnTelemetryIfCurrent(runner, final)
 		close(done)
 	}()
 	started := time.Now()
@@ -60,18 +79,47 @@ func TestStopVKTurnUpstreamWaitsForWorkerDrain(t *testing.T) {
 	if TURNUpstreamRunning() || VKTurnNetstack() != nil {
 		t.Fatal("StopVKTurnUpstream left runtime state active")
 	}
+	var got struct {
+		Running   bool `json:"running"`
+		Telemetry struct {
+			BondFramesDown int64    `json:"bond_frames_down"`
+			RoomDownBytes  [4]int64 `json:"room_down_bytes"`
+		} `json:"telemetry"`
+	}
+	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Running || got.Telemetry.BondFramesDown != 7 || got.Telemetry.RoomDownBytes[2] != 707 {
+		t.Fatalf("final stop telemetry=%+v", got)
+	}
 }
 
 func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
 	done := make(chan struct{})
+	runner := &wgturnclient.Runner{}
 	vkturnMu.Lock()
-	vkturnRunner = &wgturnclient.Runner{}
+	vkturnRunner = runner
+	vkturnTelemetryOwner = runner
 	vkturnCancel = nil
 	vkturnRunDone = done
 	vkturnDraining = nil
 	vkturnAttachStop = nil
 	vkturnRunning.Store(true)
+	vkturnTelemetry.Store(nil)
+	vkturnStats.Store(nil)
 	vkturnMu.Unlock()
+	defer func() {
+		vkturnMu.Lock()
+		vkturnRunner = nil
+		vkturnTelemetryOwner = nil
+		vkturnCancel = nil
+		vkturnRunDone = nil
+		vkturnDraining = nil
+		vkturnRunning.Store(false)
+		vkturnTelemetry.Store(nil)
+		vkturnStats.Store(nil)
+		vkturnMu.Unlock()
+	}()
 
 	started := time.Now()
 	StopVKTurnUpstreamAsync()
@@ -80,6 +128,21 @@ func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
 	}
 	if !TURNUpstreamDraining() {
 		t.Fatal("async stop did not gate replacement start while workers drain")
+	}
+	final := wgturnclient.StatsSnapshot{BondFramesDown: 9}
+	final.RoomDownBytes[1] = 909
+	storeVKTurnTelemetryIfCurrent(runner, final)
+	var got struct {
+		Running   bool `json:"running"`
+		Telemetry struct {
+			RoomDownBytes [4]int64 `json:"room_down_bytes"`
+		} `json:"telemetry"`
+	}
+	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Running || got.Telemetry.RoomDownBytes[1] != 909 {
+		t.Fatalf("async final telemetry=%+v", got)
 	}
 	close(done)
 	time.Sleep(100 * time.Millisecond)
@@ -186,6 +249,7 @@ func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
 	stale := &wgturnclient.Runner{}
 	vkturnMu.Lock()
 	vkturnRunner = current
+	vkturnTelemetryOwner = current
 	vkturnRunning.Store(true)
 	vkturnErr.Store(nil)
 	vkturnStats.Store(nil)
@@ -194,6 +258,7 @@ func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
 	defer func() {
 		vkturnMu.Lock()
 		vkturnRunner = nil
+		vkturnTelemetryOwner = nil
 		vkturnRunning.Store(false)
 		vkturnStats.Store(nil)
 		vkturnTelemetry.Store(nil)
