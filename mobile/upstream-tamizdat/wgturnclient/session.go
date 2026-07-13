@@ -486,14 +486,15 @@ func RunSession(
 	// unchanged when bondV2=false.
 	if bondV2 {
 		conf, confErr := RequestBondV2Bind(dtlsConn, bondBindPayload{
-			DeviceID:   deviceID,
-			RunID:      bondID.RunID,
-			Token:      bondID.Token,
-			Room:       roomID,
-			Worker:     sessionID,
-			LocalPort:  localPort,
-			WantConfig: getConfig,
-			Password:   password,
+			DeviceID:    deviceID,
+			RunID:       bondID.RunID,
+			Token:       bondID.Token,
+			Room:        roomID,
+			Worker:      sessionID,
+			LocalPort:   localPort,
+			WantConfig:  getConfig,
+			Password:    password,
+			LatencyLane: true,
 		}, getConfig)
 		if confErr != nil {
 			emitEvent(onEvent, "error", "bond bind error worker=%d room=%d wantConfig=%t err=%s", sessionID, roomID, getConfig, sanitizeErrForEvent(confErr))

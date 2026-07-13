@@ -29,13 +29,15 @@ type Dispatcher struct {
 	wg         sync.WaitGroup
 	stats      *Stats
 
-	bondV2        bool
-	bondSeq       atomic.Uint64
-	bondSched     *bondScheduler
-	bondReorder   *bondReorderBuffer
-	bondEvent     EventFunc
-	bondRooms     int
-	reorderTicker *time.Ticker
+	bondV2             bool
+	bondSeq            atomic.Uint64
+	bondLatencySeq     atomic.Uint64
+	bondSched          *bondScheduler
+	bondReorder        *bondReorderBuffer
+	bondLatencyReorder *bondReorderBuffer
+	bondEvent          EventFunc
+	bondRooms          int
+	reorderTicker      *time.Ticker
 }
 
 func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
@@ -60,6 +62,7 @@ func NewDispatcherWithOptions(ctx context.Context, localConn net.PacketConn, sta
 	if bondV2 {
 		d.bondSched = newBondScheduler()
 		d.bondReorder = newBondReorderBuffer(d.stats)
+		d.bondLatencyReorder = newBondReorderBuffer(d.stats)
 		d.reorderTicker = time.NewTicker(bondReorderHold / 2)
 	}
 
@@ -166,8 +169,13 @@ func (d *Dispatcher) dispatchLegacy(pkt []byte) {
 }
 
 func (d *Dispatcher) dispatchBond(payload []byte) {
+	flags := uint16(0)
 	seq := d.bondSeq.Add(1)
-	frame, err := encodeBondFrame(bondFrame{Type: bondFrameData, Seq: seq, Payload: payload})
+	if len(payload) <= bondSmallPacketMax {
+		flags = bondFlagLatency
+		seq = d.bondLatencySeq.Add(1)
+	}
+	frame, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: flags, Seq: seq, Payload: payload})
 	if err != nil {
 		emitEvent(d.bondEvent, "error", "bond encode data error err=%s", sanitizeErrForEvent(err))
 		return
@@ -218,6 +226,9 @@ func (d *Dispatcher) writeLoop() {
 			for _, payload := range d.bondReorder.flushExpired() {
 				d.writeWGPacket(payload)
 			}
+			for _, payload := range d.bondLatencyReorder.flushExpired() {
+				d.writeWGPacket(payload)
+			}
 		}
 	}
 }
@@ -240,9 +251,18 @@ func (d *Dispatcher) handleBondReturn(pkt []byte) {
 		emitEvent(d.bondEvent, "warn", "bond downlink unexpected type=%d", frame.Type)
 		return
 	}
+	if frame.Flags & ^bondKnownDataFlags != 0 {
+		atomic.AddInt64(&d.stats.BondReorderLate, 1)
+		emitEvent(d.bondEvent, "warn", "bond downlink unknown flags=%d", frame.Flags)
+		return
+	}
 	atomic.AddInt64(&d.stats.BondFramesDown, 1)
 	atomic.AddInt64(&d.stats.BondBytesDown, int64(len(frame.Payload)))
-	for _, payload := range d.bondReorder.push(frame.Seq, frame.Payload) {
+	reorder := d.bondReorder
+	if frame.Flags&bondFlagLatency != 0 {
+		reorder = d.bondLatencyReorder
+	}
+	for _, payload := range reorder.push(frame.Seq, frame.Payload) {
 		d.writeWGPacket(payload)
 	}
 }

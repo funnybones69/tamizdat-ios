@@ -138,6 +138,28 @@ func TestBondBindWaitRetryAndExplicitErrors(t *testing.T) {
 	}
 }
 
+func TestBondLatencyLaneNegotiationRequired(t *testing.T) {
+	probe := func(flags uint16) error {
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go func() {
+			buf := make([]byte, 8192)
+			_, _ = server.Read(buf)
+			response, _ := encodeBondFrame(bondFrame{Type: bondFrameBindOK, Flags: flags})
+			_, _ = server.Write(response)
+		}()
+		_, err := RequestBondV2Bind(client, bondBindPayload{DeviceID: "d", RunID: "r", Token: "t", LatencyLane: true}, false)
+		return err
+	}
+	if err := probe(0); err == nil || !strings.Contains(err.Error(), "latency-lane") {
+		t.Fatalf("old server capability was accepted: %v", err)
+	}
+	if err := probe(bondFlagLatency); err != nil {
+		t.Fatalf("latency-lane capability rejected: %v", err)
+	}
+}
+
 func TestBondSchedulerLargeRRSmallPinnedFailover(t *testing.T) {
 	s := newBondScheduler()
 	workers := []*WorkerSlot{
@@ -176,6 +198,27 @@ func TestBondSchedulerLargeRRSmallPinnedFailover(t *testing.T) {
 	}
 }
 
+func TestBondDispatcherUsesIndependentLaneSequences(t *testing.T) {
+	worker := &WorkerSlot{ID: 1, RoomID: 0, SendCh: make(chan []byte, 2)}
+	d := &Dispatcher{workers: []*WorkerSlot{worker}, stats: NewStats(), bondSched: newBondScheduler()}
+	d.dispatchBond(bytes.Repeat([]byte{'b'}, bondSmallPacketMax+1))
+	d.dispatchBond([]byte("small"))
+	bulk, err := decodeBondFrame(<-worker.SendCh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latency, err := decodeBondFrame(<-worker.SendCh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bulk.Flags != 0 || bulk.Seq != 1 {
+		t.Fatalf("bulk flags=%d seq=%d want 0/1", bulk.Flags, bulk.Seq)
+	}
+	if latency.Flags != bondFlagLatency || latency.Seq != 1 {
+		t.Fatalf("latency flags=%d seq=%d want %d/1", latency.Flags, latency.Seq, bondFlagLatency)
+	}
+}
+
 func TestBondReorderContiguousTimeoutLateDuplicateWindow(t *testing.T) {
 	stats := NewStats()
 	now := time.Unix(0, 0)
@@ -202,6 +245,25 @@ func TestBondReorderContiguousTimeoutLateDuplicateWindow(t *testing.T) {
 	}
 	if out := r.push(400, []byte("pressure")); len(out) != 1 || string(out[0]) != "pressure" {
 		t.Fatalf("window pressure out=%q", out)
+	}
+}
+
+func TestBondLatencyLaneDoesNotWaitBehindBulkGap(t *testing.T) {
+	stats := NewStats()
+	now := time.Unix(0, 0)
+	bulk := newBondReorderBuffer(stats)
+	latency := newBondReorderBuffer(stats)
+	bulk.now = func() time.Time { return now }
+	latency.now = func() time.Time { return now }
+
+	if out := bulk.push(2, []byte("bulk-2")); len(out) != 0 {
+		t.Fatalf("bulk gap emitted early: %q", out)
+	}
+	if out := latency.push(1, []byte("latency-1")); len(out) != 1 || string(out[0]) != "latency-1" {
+		t.Fatalf("latency packet blocked by bulk gap: %q", out)
+	}
+	if out := bulk.flushExpired(); len(out) != 0 {
+		t.Fatalf("bulk gap flushed before hold: %q", out)
 	}
 }
 

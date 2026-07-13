@@ -12,15 +12,17 @@ import (
 )
 
 const (
-	bondMagic                   = "TZB2"
-	bondVersion            byte = 2
-	bondHeaderLen               = 16
-	bondMaxBindJSON             = 4096
-	bondSmallPacketMax          = 384
-	bondReorderWindow           = 256
-	bondReorderHold             = 30 * time.Millisecond
-	bondBindMaxAttempts         = 8
-	bondBindInitialBackoff      = 125 * time.Millisecond
+	bondMagic                     = "TZB2"
+	bondVersion            byte   = 2
+	bondHeaderLen                 = 16
+	bondMaxBindJSON               = 4096
+	bondSmallPacketMax            = 384
+	bondReorderWindow             = 256
+	bondReorderHold               = 30 * time.Millisecond
+	bondBindMaxAttempts           = 8
+	bondBindInitialBackoff        = 125 * time.Millisecond
+	bondFlagLatency        uint16 = 1 << 0
+	bondKnownDataFlags            = bondFlagLatency
 )
 
 type bondFrameType byte
@@ -43,14 +45,15 @@ type bondFrame struct {
 }
 
 type bondBindPayload struct {
-	DeviceID   string `json:"device_id"`
-	RunID      string `json:"run_id"`
-	Token      string `json:"token"`
-	Room       int    `json:"room"`
-	Worker     int    `json:"worker"`
-	LocalPort  string `json:"local_port"`
-	WantConfig bool   `json:"want_config"`
-	Password   string `json:"password,omitempty"`
+	DeviceID    string `json:"device_id"`
+	RunID       string `json:"run_id"`
+	Token       string `json:"token"`
+	Room        int    `json:"room"`
+	Worker      int    `json:"worker"`
+	LocalPort   string `json:"local_port"`
+	WantConfig  bool   `json:"want_config"`
+	Password    string `json:"password,omitempty"`
+	LatencyLane bool   `json:"latency_lane,omitempty"`
 }
 
 type bondRunnerIdentity struct {

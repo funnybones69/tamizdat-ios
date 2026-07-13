@@ -97,10 +97,16 @@ func RequestBondV2Bind(conn net.Conn, bind bondBindPayload, wantConfig bool) (st
 			}
 			continue
 		case bondFrameBindOK:
+			if bind.LatencyLane && resp.Flags&bondFlagLatency == 0 {
+				return "", bondNegotiationError{Reason: "server lacks latency-lane support"}
+			}
 			return "", nil
 		case bondFrameBindConfig:
 			if !wantConfig {
 				return "", bondNegotiationError{Reason: "unexpected config on token-only join"}
+			}
+			if bind.LatencyLane && resp.Flags&bondFlagLatency == 0 {
+				return "", bondNegotiationError{Reason: "server lacks latency-lane support"}
 			}
 			return string(resp.Payload), nil
 		case bondFrameError:
