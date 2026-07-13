@@ -356,6 +356,38 @@ func TestBondFourRoomAsymmetricDelayLossReorders(t *testing.T) {
 	}
 }
 
+func TestDispatcherFinalizeAccountsQueuedDownlinkAndReorderTail(t *testing.T) {
+	stats := NewStats()
+	d := &Dispatcher{
+		ReturnCh:           make(chan []byte, 2),
+		stats:              stats,
+		bondV2:             true,
+		bondReorder:        newBondReorderBuffer(stats),
+		bondLatencyReorder: newBondReorderBuffer(stats),
+	}
+	data, err := encodeBondFrame(bondFrame{Type: bondFrameData, Seq: 2, Payload: []byte("tail")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: 1 << 15, Seq: 3, Payload: []byte("reject")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordBondRoomDown(stats, 1, data)
+	recordBondRoomDown(stats, 1, unknown)
+	d.ReturnCh <- data
+	d.ReturnCh <- unknown
+
+	d.Finalize()
+	snapshot := stats.Snapshot()
+	if snapshot.BondFramesDown != 1 || snapshot.BondBytesDown != int64(len("tail")) || snapshot.RoomDownBytes[1] != int64(len("tail")) || snapshot.TotalBytesDown != 0 {
+		t.Fatalf("final aggregate/per-room/delivered counters=%+v", snapshot)
+	}
+	if snapshot.BondReorderGaps != 1 || snapshot.BondReorderLate != 1 || len(d.ReturnCh) != 0 {
+		t.Fatalf("final reorder tail gaps=%d late=%d queued=%d", snapshot.BondReorderGaps, snapshot.BondReorderLate, len(d.ReturnCh))
+	}
+}
+
 func TestDispatcherShutdownUnblocksReadLoop(t *testing.T) {
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {

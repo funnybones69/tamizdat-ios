@@ -148,16 +148,16 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 
 	go func() {
 		err := runner.Start(ctx)
-		// Signal that all worker groups, TURN allocations and dispatcher loops
-		// have exited before attempting global-state cleanup. Stop can wait on
-		// this while holding vkturnMu, preventing a replacement runner from
-		// racing old allocation teardown.
-		close(runDone)
-		vkturnMu.Lock()
-		defer vkturnMu.Unlock()
-		if vkturnRunner != runner {
-			return
-		}
+		finishVKTurnRunner(runner, runDone, err)
+	}()
+	rt.appendLog(fmt.Sprintf("info: vkturn runner started generation=%d; waiting for GETCONF rooms=%d workers=%d", generation, maxInt(1, len(hashes)), workers))
+	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh, attachOnce)
+	return ""
+}
+
+func finishVKTurnRunner(runner *wgturnclient.Runner, runDone chan struct{}, err error) {
+	vkturnMu.Lock()
+	if vkturnRunner == runner {
 		if err != nil {
 			errText := err.Error()
 			vkturnErr.Store(&errText)
@@ -170,10 +170,12 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 		storeVKTurnStats(0, false)
 		vkturnRestartNotBefore.Store(time.Now().Add(vkturnAllocationReleaseWait).UnixNano())
 		vkturnRunner, vkturnCancel, vkturnRunDone = nil, nil, nil
-	}()
-	rt.appendLog(fmt.Sprintf("info: vkturn runner started generation=%d; waiting for GETCONF rooms=%d workers=%d", generation, maxInt(1, len(hashes)), workers))
-	go finishVKTurnAttach(ctx, runner, cancel, runDone, configCh, attachOnce)
-	return ""
+	}
+	vkturnMu.Unlock()
+	// Completion means both Runner.Start and owner bookkeeping are finished.
+	// Stop paths can wait without holding vkturnMu, and a replacement cannot
+	// race the old error/final-telemetry publication.
+	close(runDone)
 }
 
 func maxInt(a, b int) int {
@@ -288,13 +290,21 @@ func StopVKTurnUpstream() {
 		vkturnMu.Unlock()
 		return
 	}
+	if vkturnDraining == done {
+		// Another sync/async stop already owns this exact drain. Do not wait a
+		// second timeout or launch another release watcher.
+		vkturnMu.Unlock()
+		return
+	}
 	vkturnDraining = done
 	vkturnGeneration.Add(1) // invalidate detached Swift diagnostics immediately
 	stopVKTurnAttachLocked()
+	vkturnRunning.Store(false)
+	storeVKTurnStats(0, false)
 	vkturnMu.Unlock()
 
-	// Never hold vkturnMu while waiting: Runner.Start emits its final stats
-	// callback before closing done, and that callback is serialized by vkturnMu.
+	// Never hold vkturnMu while waiting: Runner.Start emits its final stats and
+	// owner error state before finishVKTurnRunner closes done.
 	if cancel != nil {
 		cancel()
 	}
@@ -318,10 +328,8 @@ func StopVKTurnUpstream() {
 		vkturnDraining = nil
 		vkturnRestartNotBefore.Store(0)
 	}
-	if vkturnRunner == runner {
-		vkturnRunner, vkturnCancel, vkturnRunDone = nil, nil, nil
-		vkturnRunning.Store(false)
-	}
+	// On timeout keep vkturnRunner until finishVKTurnRunner publishes the old
+	// runner's final error/telemetry and closes done. The drain gate blocks starts.
 	storeVKTurnStats(0, false)
 	vkturnMu.Unlock()
 }
@@ -334,9 +342,12 @@ func StopVKTurnUpstreamAsync() {
 	vkturnMu.Lock()
 	runner := vkturnRunner
 	done := vkturnRunDone
-	alreadyDraining := done == nil && vkturnDraining != nil
 	if done == nil {
 		done = vkturnDraining
+	}
+	if done != nil && vkturnDraining == done {
+		vkturnMu.Unlock()
+		return
 	}
 	cancel := vkturnCancel
 	if done != nil {
@@ -358,7 +369,7 @@ func StopVKTurnUpstreamAsync() {
 	if runner != nil {
 		runner.Shutdown()
 	}
-	if done == nil || alreadyDraining {
+	if done == nil {
 		return
 	}
 	// Keep vkturnRunner and vkturnTelemetryOwner until Runner.Start returns.

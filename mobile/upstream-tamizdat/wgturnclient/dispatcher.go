@@ -73,14 +73,60 @@ func NewDispatcherWithOptions(ctx context.Context, localConn net.PacketConn, sta
 }
 
 func (d *Dispatcher) Shutdown() {
-	d.cancel()
+	if d == nil {
+		return
+	}
+	if d.cancel != nil {
+		d.cancel()
+	}
 	// ReadFrom is otherwise allowed to block forever while Runner still owns
 	// the socket (defer ordering calls Dispatcher.Shutdown before Close).
-	_ = d.localConn.SetReadDeadline(time.Now())
+	if d.localConn != nil {
+		_ = d.localConn.SetReadDeadline(time.Now())
+	}
 	if d.reorderTicker != nil {
 		d.reorderTicker.Stop()
 	}
 	d.wg.Wait()
+}
+
+// Finalize stops the live loops, then consumes the now producer-free tail.
+// Aggregate DATA accounting already happens at the worker boundary; this pass
+// completes validation and reorder gap/late accounting before final telemetry.
+func (d *Dispatcher) Finalize() {
+	if d == nil {
+		return
+	}
+	d.Shutdown()
+	for {
+		select {
+		case pkt, ok := <-d.ReturnCh:
+			if !ok {
+				d.finalizeReorderTail()
+				return
+			}
+			if d.bondV2 {
+				d.handleBondReturn(pkt)
+			} else {
+				d.writeWGPacket(pkt)
+			}
+		default:
+			d.finalizeReorderTail()
+			return
+		}
+	}
+}
+
+func (d *Dispatcher) finalizeReorderTail() {
+	if !d.bondV2 {
+		return
+	}
+	for _, payload := range d.bondReorder.flushAll() {
+		d.writeWGPacket(payload)
+	}
+	for _, payload := range d.bondLatencyReorder.flushAll() {
+		d.writeWGPacket(payload)
+	}
 }
 
 func (d *Dispatcher) Register(w *WorkerSlot) {
@@ -253,13 +299,11 @@ func (d *Dispatcher) handleBondReturn(pkt []byte) {
 		emitEvent(d.bondEvent, "warn", "bond downlink unexpected type=%d", frame.Type)
 		return
 	}
-	if frame.Flags & ^bondKnownDataFlags != 0 {
+	if frame.Flags&^bondKnownDataFlags != 0 {
 		atomic.AddInt64(&d.stats.BondReorderLate, 1)
 		emitEvent(d.bondEvent, "warn", "bond downlink unknown flags=%d", frame.Flags)
 		return
 	}
-	atomic.AddInt64(&d.stats.BondFramesDown, 1)
-	atomic.AddInt64(&d.stats.BondBytesDown, int64(len(frame.Payload)))
 	reorder := d.bondReorder
 	if frame.Flags&bondFlagLatency != 0 {
 		reorder = d.bondLatencyReorder

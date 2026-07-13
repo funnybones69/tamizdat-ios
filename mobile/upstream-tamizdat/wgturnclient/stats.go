@@ -82,9 +82,14 @@ func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {
 		return
 	}
 	frame, err := decodeBondFrame(packet)
-	if err != nil || frame.Type != bondFrameData || frame.Flags & ^bondKnownDataFlags != 0 {
+	if err != nil || frame.Type != bondFrameData || frame.Flags&^bondKnownDataFlags != 0 {
 		return
 	}
+	// Count accepted transport DATA at the worker boundary after successful
+	// ReturnCh enqueue. This keeps the final aggregate/per-room snapshot
+	// complete even when the dispatcher is cancelled with valid frames queued.
+	atomic.AddInt64(&stats.BondFramesDown, 1)
+	atomic.AddInt64(&stats.BondBytesDown, int64(len(frame.Payload)))
 	atomic.AddInt64(&stats.BondRoomDownPackets[roomID], 1)
 	atomic.AddInt64(&stats.BondRoomDownBytes[roomID], int64(len(frame.Payload)))
 }

@@ -34,7 +34,7 @@ func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	recordBondRoomDown(stats, maxRooms, dataFrame)
 
 	snapshot := stats.Snapshot()
-	if snapshot.ActiveConnections != 7 || snapshot.BondFramesUp != 11 || snapshot.BondFramesDown != 13 {
+	if snapshot.ActiveConnections != 7 || snapshot.BondFramesUp != 11 || snapshot.BondFramesDown != 14 || snapshot.BondBytesDown != int64(len("room-one")) {
 		t.Fatalf("snapshot counters=%+v", snapshot)
 	}
 	if snapshot.RoomUpBytes[2] != 101 || snapshot.RoomDownBytes[2] != 202 || snapshot.RoomDownPackets[2] != 3 {

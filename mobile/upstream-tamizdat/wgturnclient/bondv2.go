@@ -296,6 +296,33 @@ func (r *bondReorderBuffer) flushExpired() [][]byte {
 	return out
 }
 
+func (r *bondReorderBuffer) flushAll() [][]byte {
+	if len(r.buf) == 0 {
+		return nil
+	}
+	seqs := make([]uint64, 0, len(r.buf))
+	for seq := range r.buf {
+		seqs = append(seqs, seq)
+	}
+	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
+	out := make([][]byte, 0, len(seqs))
+	for _, seq := range seqs {
+		if seq < r.expect {
+			delete(r.buf, seq)
+			atomic.AddInt64(&r.stats.BondReorderLate, 1)
+			continue
+		}
+		if seq > r.expect {
+			atomic.AddInt64(&r.stats.BondReorderGaps, int64(seq-r.expect))
+		}
+		out = append(out, r.buf[seq])
+		delete(r.buf, seq)
+		r.expect = seq + 1
+	}
+	r.first = time.Time{}
+	return out
+}
+
 func (r *bondReorderBuffer) drainContiguous() [][]byte {
 	var out [][]byte
 	for {

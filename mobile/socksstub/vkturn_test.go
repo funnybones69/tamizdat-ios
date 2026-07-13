@@ -66,7 +66,7 @@ func TestStopVKTurnUpstreamWaitsForWorkerDrain(t *testing.T) {
 		final := wgturnclient.StatsSnapshot{ActiveConnections: 0, BondFramesDown: 7}
 		final.RoomDownBytes[2] = 707
 		storeVKTurnTelemetryIfCurrent(runner, final)
-		close(done)
+		finishVKTurnRunner(runner, done, nil)
 	}()
 	started := time.Now()
 	StopVKTurnUpstream()
@@ -144,7 +144,7 @@ func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
 	if got.Running || got.Telemetry.RoomDownBytes[1] != 909 {
 		t.Fatalf("async final telemetry=%+v", got)
 	}
-	close(done)
+	finishVKTurnRunner(runner, done, nil)
 	time.Sleep(100 * time.Millisecond)
 	if !TURNUpstreamDraining() {
 		t.Fatal("async stop cleared gate before TURN allocation release grace elapsed")
@@ -155,6 +155,107 @@ func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
 	}
 	if TURNUpstreamDraining() {
 		t.Fatal("async stop did not clear drain gate after completion")
+	}
+}
+
+func TestStopVKTurnUpstreamSyncIsSingleflightPerDrain(t *testing.T) {
+	done := make(chan struct{})
+	runner := &wgturnclient.Runner{}
+	vkturnMu.Lock()
+	vkturnRunner = runner
+	vkturnTelemetryOwner = runner
+	vkturnCancel = nil
+	vkturnRunDone = done
+	vkturnDraining = nil
+	vkturnRunning.Store(true)
+	vkturnStats.Store(nil)
+	vkturnErr.Store(nil)
+	vkturnMu.Unlock()
+	defer func() {
+		vkturnMu.Lock()
+		vkturnRunner = nil
+		vkturnTelemetryOwner = nil
+		vkturnCancel = nil
+		vkturnRunDone = nil
+		vkturnDraining = nil
+		vkturnRunning.Store(false)
+		vkturnStats.Store(nil)
+		vkturnErr.Store(nil)
+		vkturnMu.Unlock()
+	}()
+
+	firstDone := make(chan struct{})
+	go func() {
+		StopVKTurnUpstream()
+		close(firstDone)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for !TURNUpstreamDraining() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !TURNUpstreamDraining() {
+		t.Fatal("first sync stop did not claim drain")
+	}
+	started := time.Now()
+	StopVKTurnUpstream()
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("second sync stop waited on an already-owned drain: %v", elapsed)
+	}
+	finishVKTurnRunner(runner, done, nil)
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first sync stop did not finish after owner cleanup")
+	}
+}
+
+func TestFinishVKTurnRunnerPreservesErrorForTimedOutDrain(t *testing.T) {
+	done := make(chan struct{})
+	runner := &wgturnclient.Runner{}
+	vkturnMu.Lock()
+	vkturnRunner = runner
+	vkturnTelemetryOwner = runner
+	vkturnCancel = nil
+	vkturnRunDone = done
+	vkturnDraining = done // models a sync stop that already timed out
+	vkturnRunning.Store(false)
+	vkturnStats.Store(nil)
+	vkturnErr.Store(nil)
+	vkturnMu.Unlock()
+	defer func() {
+		vkturnMu.Lock()
+		vkturnRunner = nil
+		vkturnTelemetryOwner = nil
+		vkturnCancel = nil
+		vkturnRunDone = nil
+		vkturnDraining = nil
+		vkturnRunning.Store(false)
+		vkturnStats.Store(nil)
+		vkturnErr.Store(nil)
+		vkturnMu.Unlock()
+	}()
+
+	finishVKTurnRunner(runner, done, fmt.Errorf("drain failure"))
+	select {
+	case <-done:
+	default:
+		t.Fatal("runDone was not closed after owner cleanup completed")
+	}
+	var got struct {
+		Running bool   `json:"running"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Running || got.Error != "drain failure" {
+		t.Fatalf("timed-out drain final state=%+v", got)
+	}
+	vkturnMu.Lock()
+	remaining := vkturnRunner
+	vkturnMu.Unlock()
+	if remaining != nil {
+		t.Fatal("owner cleanup did not clear the finished runner")
 	}
 }
 

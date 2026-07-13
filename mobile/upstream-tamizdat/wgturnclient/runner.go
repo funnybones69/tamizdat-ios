@@ -265,7 +265,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		// The callback emitted when statsShutdown closes is the final snapshot.
 		// Stop every producer first so worker/session tail counters and dispatcher
 		// downlink attribution cannot race that snapshot.
-		disp.Shutdown()
+		disp.Finalize()
 		close(statsShutdown)
 		<-statsDone
 	}()
