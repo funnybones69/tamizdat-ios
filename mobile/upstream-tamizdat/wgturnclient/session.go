@@ -278,6 +278,9 @@ func RunSession(
 	stats *Stats,
 	onEvent EventFunc,
 	memoryProfile sessionMemoryProfile,
+	bondV2 bool,
+	bondID bondRunnerIdentity,
+	roomID int,
 ) (bool, error) {
 	configDelivered := false
 
@@ -469,11 +472,44 @@ func RunSession(
 		return false, err
 	}
 
+	// Cancellation must interrupt Bond BIND negotiation as well as the later
+	// proxy loops; otherwise shutdown can wait for the full negotiation timeout.
+	stopDTLS := context.AfterFunc(sessCtx, func() {
+		_ = dtlsConn.SetDeadline(time.Now())
+	})
+	defer stopDTLS()
+
 	atomic.AddInt32(&stats.ActiveConnections, 1)
 	defer atomic.AddInt32(&stats.ActiveConnections, -1)
 
-	// Запрос конфига
-	if getConfig && configCh != nil {
+	// Запрос конфига / Bond v2 BIND. Legacy raw GETCONF stays byte-for-byte
+	// unchanged when bondV2=false.
+	if bondV2 {
+		conf, confErr := RequestBondV2Bind(dtlsConn, bondBindPayload{
+			DeviceID:   deviceID,
+			RunID:      bondID.RunID,
+			Token:      bondID.Token,
+			Room:       roomID,
+			Worker:     sessionID,
+			LocalPort:  localPort,
+			WantConfig: getConfig,
+			Password:   password,
+		}, getConfig)
+		if confErr != nil {
+			emitEvent(onEvent, "error", "bond bind error worker=%d room=%d wantConfig=%t err=%s", sessionID, roomID, getConfig, sanitizeErrForEvent(confErr))
+			return false, confErr
+		}
+		if conf != "" && configCh != nil {
+			select {
+			case configCh <- conf:
+				configDelivered = true
+				emitEvent(onEvent, "info", "bond config delivered worker=%d room=%d confLen=%d", sessionID, roomID, len(conf))
+			default:
+				configDelivered = true
+				emitEvent(onEvent, "info", "bond config already-delivered worker=%d room=%d confLen=%d", sessionID, roomID, len(conf))
+			}
+		}
+	} else if getConfig && configCh != nil {
 		emitEvent(onEvent, "info", "GETCONF request worker=%d localPort=%s deviceIDLen=%d passwordLen=%d", sessionID, localPort, len(deviceID), len(password))
 		conf, confErr := RequestConfig(dtlsConn, localPort, deviceID, password)
 		if confErr != nil {
@@ -506,6 +542,7 @@ func RunSession(
 	// Регистрация в диспетчере
 	slot := &WorkerSlot{
 		ID:     sessionID,
+		RoomID: roomID,
 		SendCh: make(chan []byte, memoryProfile.workerSendBuffer),
 	}
 	d.Register(slot)
@@ -514,11 +551,6 @@ func RunSession(
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup
 	proxyWg.Add(2)
-
-	stopDTLS := context.AfterFunc(sessCtx, func() {
-		_ = dtlsConn.SetDeadline(time.Now())
-	})
-	defer stopDTLS()
 
 	// Writer: dispatcher → DTLS
 	go func() {
@@ -535,7 +567,13 @@ func RunSession(
 				now := time.Now()
 				_ = dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
 				lastWriteDeadline = now
-				if _, writeErr := dtlsConn.Write([]byte("WAKEUP")); writeErr != nil {
+				wake := []byte("WAKEUP")
+				if bondV2 {
+					if encoded, encErr := bondFramePayload(bondFrameKeepalive, nil); encErr == nil {
+						wake = encoded
+					}
+				}
+				if _, writeErr := dtlsConn.Write(wake); writeErr != nil {
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer (WAKEUP): %v", sessionID, writeErr)
 					return
 				}

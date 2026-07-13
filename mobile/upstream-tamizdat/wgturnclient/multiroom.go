@@ -7,6 +7,7 @@ import (
 
 type workerGroupPlan struct {
 	hashIndex   int
+	roomID      int
 	workerCount int
 }
 
@@ -27,7 +28,7 @@ func buildWorkerGroupPlans(totalWorkers, roomCount, workersPerRoom int) []worker
 			// Legacy/preloaded single-room mode has no explicit VKHashes list.
 			// Every partial group belongs to the same logical room so runner
 			// startup can cascade 12+8 and never index an empty room slice.
-			plans = append(plans, workerGroupPlan{hashIndex: 0, workerCount: count})
+			plans = append(plans, workerGroupPlan{hashIndex: 0, roomID: 0, workerCount: count})
 			remaining -= count
 		}
 		return plans
@@ -40,7 +41,7 @@ func buildWorkerGroupPlans(totalWorkers, roomCount, workersPerRoom int) []worker
 			if count > workersPerGroup {
 				count = workersPerGroup
 			}
-			plans = append(plans, workerGroupPlan{hashIndex: room, workerCount: count})
+			plans = append(plans, workerGroupPlan{hashIndex: room, roomID: room, workerCount: count})
 			remaining -= count
 		}
 	}

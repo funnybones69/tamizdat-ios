@@ -116,6 +116,7 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 		Workers: workers, WorkersPerRoom: workersPerRoom, UseUDP: useUDP,
 		VKHashes: hashes, DeviceID: deviceID, ConnPassword: wgPassword,
 		PreloadedCreds: singleCreds, PreloadedCredsByHash: credsByHash,
+		BondV2: workersPerRoom > 0 && len(hashes) >= 2,
 		OnConfig: func(conf string) {
 			select {
 			case configCh <- conf:

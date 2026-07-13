@@ -43,6 +43,7 @@ type Config struct {
 	NoDNS                bool
 	PreloadedCreds       *Credentials
 	PreloadedCredsByHash map[string]*Credentials
+	BondV2               bool
 	OnConfig             func(string)
 	OnEvent              EventFunc
 
@@ -115,6 +116,9 @@ func New(cfg Config) (*Runner, error) {
 		if len(cfg.VKHashes) < 1 || len(cfg.VKHashes) > maxRooms {
 			return nil, fmt.Errorf("multi-room mode requires 1-%d unique rooms", maxRooms)
 		}
+		if cfg.BondV2 && len(cfg.VKHashes) < 2 {
+			return nil, fmt.Errorf("Bond v2 requires multi-room mode with at least 2 rooms")
+		}
 		if cfg.WorkersPerRoom < 1 || cfg.WorkersPerRoom > maxWorkersPerRoom {
 			return nil, fmt.Errorf("workers per room must be between 1 and %d", maxWorkersPerRoom)
 		}
@@ -134,6 +138,9 @@ func New(cfg Config) (*Runner, error) {
 			return nil, fmt.Errorf("multi-room worker count exceeds %d", maxMultiRoomWorkers)
 		}
 	} else {
+		if cfg.BondV2 {
+			return nil, fmt.Errorf("Bond v2 requires WorkersPerRoom multi-room mode")
+		}
 		cfg.Workers = normalizeWorkerCount(cfg.Workers)
 	}
 	if len(cfg.VKHashes) == 0 && cfg.PreloadedCreds != nil {
@@ -236,6 +243,15 @@ func (r *Runner) Start(ctx context.Context) error {
 	r.eventf("info", "runner start workers=%d groups=%d workersPerGroup=%d proto=%s socketBuf=%d sendQueue=%d preloaded=%t %s deviceIDLen=%d", r.cfg.Workers, numGroups, workersPerGroup, proto, memoryProfile.socketBufferSize, memoryProfile.workerSendBuffer, r.preloadedCreds.Load() != nil, credentialsSummary(r.preloadedCreds.Load()), len(r.cfg.DeviceID))
 
 	stats := NewStats()
+	bondID := bondRunnerIdentity{}
+	if r.cfg.BondV2 {
+		var idErr error
+		bondID, idErr = newBondRunnerIdentity()
+		if idErr != nil {
+			return idErr
+		}
+		r.eventf("info", "bond v2 enabled rooms=%d runIDLen=%d tokenLen=%d", len(r.cfg.VKHashes), len(bondID.RunID), len(bondID.Token))
+	}
 	shutdownCh := make(chan struct{})
 	go func() {
 		<-runCtx.Done()
@@ -243,7 +259,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	}()
 	go stats.RunLoop(shutdownCh)
 
-	disp := NewDispatcher(runCtx, localConn, stats)
+	disp := NewDispatcherWithOptions(runCtx, localConn, stats, r.cfg.BondV2, len(r.cfg.VKHashes), r.cfg.OnEvent)
 	defer disp.Shutdown()
 
 	configCh := make(chan string, 1)
@@ -291,11 +307,11 @@ func (r *Runner) Start(ctx context.Context) error {
 		gID := g + 1
 		cycle := time.Duration(defaultCycleSecs) * time.Second
 		wg.Add(1)
-		go func(groupID int, cycleDir time.Duration, workerIDs []int, startHashIndex int, waitR <-chan struct{}, sigR chan<- struct{}) {
+		go func(groupID int, cycleDir time.Duration, workerIDs []int, startHashIndex int, startRoomID int, waitR <-chan struct{}, sigR chan<- struct{}) {
 			defer wg.Done()
-			r.workerGroup(runCtx, groupID, startHashIndex, tp, peer, disp, localPort, r.cfg.UseUDP,
-				broker, workerIDs, cycleDir, &r.pauseFlag, r.cfg.DeviceID, r.cfg.ConnPassword, stats, waitR, sigR)
-		}(gID, cycle, ids, plan.hashIndex, myWaitReady, mySignalReady)
+			r.workerGroup(runCtx, groupID, startHashIndex, startRoomID, tp, peer, disp, localPort, r.cfg.UseUDP,
+				broker, workerIDs, cycleDir, &r.pauseFlag, r.cfg.DeviceID, r.cfg.ConnPassword, stats, waitR, sigR, r.cfg.BondV2, bondID)
+		}(gID, cycle, ids, plan.hashIndex, plan.roomID, myWaitReady, mySignalReady)
 	}
 
 	wg.Wait()
