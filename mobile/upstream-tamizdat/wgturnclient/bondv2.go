@@ -128,7 +128,14 @@ func encodeBondBind(p bondBindPayload) ([]byte, error) {
 	if len(b) > bondMaxBindJSON {
 		return nil, fmt.Errorf("bind json too large")
 	}
-	return encodeBondFrame(bondFrame{Type: bondFrameBind, Payload: b})
+	flags := uint16(0)
+	if p.LatencyLane {
+		// The OpenWrt production server negotiates the independent latency
+		// lane in the binary BIND header. Keep the JSON capability as well so
+		// canonical servers that negotiate from the payload remain compatible.
+		flags = bondFlagLatency
+	}
+	return encodeBondFrame(bondFrame{Type: bondFrameBind, Flags: flags, Payload: b})
 }
 
 func bondFramePayload(ft bondFrameType, payload []byte) ([]byte, error) {

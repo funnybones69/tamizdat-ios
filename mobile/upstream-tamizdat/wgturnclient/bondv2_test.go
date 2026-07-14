@@ -47,6 +47,29 @@ func TestBondFrameEncodeDecodeValidation(t *testing.T) {
 	}
 }
 
+func TestBondBindAdvertisesLatencyLaneInHeaderAndPayload(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		encoded, err := encodeBondBind(bondBindPayload{LatencyLane: want})
+		if err != nil {
+			t.Fatalf("encode bind latency=%t: %v", want, err)
+		}
+		frame, err := decodeBondFrame(encoded)
+		if err != nil {
+			t.Fatalf("decode bind latency=%t: %v", want, err)
+		}
+		if got := frame.Flags&bondFlagLatency != 0; got != want {
+			t.Fatalf("BIND header latency flag=%t want=%t flags=%#x", got, want, frame.Flags)
+		}
+		var payload bondBindPayload
+		if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+			t.Fatalf("decode BIND payload latency=%t: %v", want, err)
+		}
+		if payload.LatencyLane != want {
+			t.Fatalf("BIND payload latency_lane=%t want=%t", payload.LatencyLane, want)
+		}
+	}
+}
+
 func TestBondBindConfigAndTokenOnlyJoin(t *testing.T) {
 	client, server := net.Pipe()
 	defer client.Close()

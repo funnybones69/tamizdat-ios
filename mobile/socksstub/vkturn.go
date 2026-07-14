@@ -379,6 +379,10 @@ func StopVKTurnUpstreamAsync() {
 }
 
 func finishVKTurnDrainAsync(drain <-chan struct{}) {
+	// Capture the runtime before spawning. Tests replace the package runtime
+	// between cases, and a late global read after the drain gate clears races
+	// with that replacement (and can log into the wrong runtime instance).
+	runtime := rt
 	go func() {
 		<-drain
 		time.Sleep(vkturnAllocationReleaseWait)
@@ -388,7 +392,7 @@ func finishVKTurnDrainAsync(drain <-chan struct{}) {
 			vkturnRestartNotBefore.Store(0)
 		}
 		vkturnMu.Unlock()
-		rt.appendLog("info: vkturn async shutdown drained worker sessions and released allocations")
+		runtime.appendLog("info: vkturn async shutdown drained worker sessions and released allocations")
 	}()
 }
 

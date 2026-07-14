@@ -138,6 +138,14 @@ struct ContentView: View {
             if pendingSwitch { return .reconnecting }
             if lampStore.isReconnecting { return .reconnecting }
             if lampStore.snapshot.pingFailed { return .failed }
+            // NEVPNStatus becomes connected as soon as the local utun/hev
+            // path is installed. In TURN mode that is not data-plane proof:
+            // keep the surface amber until Bond has delivered WG config and
+            // the extension reports a ready TURN netstack. A successful H2
+            // ping can otherwise make a failed TURN attach look connected.
+            if lampStore.snapshot.desiredUpstream == "turn" && !lampStore.turnNetstackReady {
+                return .connecting
+            }
             // IPA-D27: green "Connected" normally waits for a successful
             // real-internet ping. TURN is different: once the WireGuard
             // netstack is ready, user traffic can already flow while the
@@ -145,7 +153,7 @@ struct ContentView: View {
             // HEAD. Do not leave the UI stuck on Connecting when TURN is
             // definitively attached.
             if lampStore.snapshot.pingMs < 0 {
-                if lampStore.turnNetstackReady || lampStore.snapshot.upstreamKind == "turn" {
+                if lampStore.turnNetstackReady {
                     return .connected
                 }
                 return .connecting
