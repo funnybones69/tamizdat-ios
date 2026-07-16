@@ -523,3 +523,47 @@ func TestParseVKTurnCredsJSONNormalizesV2SchemeAndTransport(t *testing.T) {
 		t.Fatalf("TurnURLs should remain legacy host:port values, got %#v", creds.TurnURLs)
 	}
 }
+
+func TestWaitForVKTurnConfigContinuesAfterDiagnosticTimeout(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	configCh := make(chan string, 1)
+	runDone := make(chan struct{})
+	timeoutSeen := make(chan struct{}, 1)
+
+	type waitResult struct {
+		conf   string
+		result vkturnAttachWaitResult
+	}
+	resultCh := make(chan waitResult, 1)
+	go func() {
+		conf, result := waitForVKTurnConfig(ctx, runDone, configCh, 10*time.Millisecond, func() {
+			select {
+			case timeoutSeen <- struct{}{}:
+			default:
+			}
+		})
+		resultCh <- waitResult{conf: conf, result: result}
+	}()
+
+	select {
+	case <-timeoutSeen:
+	case <-time.After(time.Second):
+		t.Fatal("diagnostic timeout did not fire")
+	}
+	select {
+	case result := <-resultCh:
+		t.Fatalf("wait ended at diagnostic timeout: %+v", result)
+	default:
+	}
+
+	configCh <- "config-ready"
+	select {
+	case result := <-resultCh:
+		if result.result != vkturnAttachConfigReady || result.conf == "" {
+			t.Fatalf("result=%+v, want later config delivery", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("wait did not accept config after timeout")
+	}
+}

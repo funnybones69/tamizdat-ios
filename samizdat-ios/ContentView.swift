@@ -143,8 +143,18 @@ struct ContentView: View {
             // keep the surface amber until Bond has delivered WG config and
             // the extension reports a ready TURN netstack. A successful H2
             // ping can otherwise make a failed TURN attach look connected.
-            if lampStore.snapshot.desiredUpstream == "turn" && !lampStore.turnNetstackReady {
-                return .connecting
+            if lampStore.snapshot.desiredUpstream == "turn" {
+                if !lampStore.turnNetstackReady {
+                    return .connecting
+                }
+                // A GETCONF-capable subset can make the netstack usable while
+                // other quota-blocked workers are still recovering. Do not
+                // render that degraded 8/40 state as fully green/Connected.
+                let active = lampStore.snapshot.turnActiveWorkers
+                let expected = lampStore.snapshot.turnExpectedWorkers
+                if expected > 0 && active < expected {
+                    return .reconnecting
+                }
             }
             // IPA-D27: green "Connected" normally waits for a successful
             // real-internet ping. TURN is different: once the WireGuard

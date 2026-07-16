@@ -769,28 +769,57 @@ func isCurrentVKTurnRunner(runner *wgturnclient.Runner) bool {
 	return runner != nil && vkturnRunner == runner && vkturnRunning.Load()
 }
 
-func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel context.CancelFunc, runDone <-chan struct{}, configCh <-chan string, attachOnce *sync.Once) {
-	timer := time.NewTimer(vkturnConfigAttachTimeout)
-	defer timer.Stop()
+type vkturnAttachWaitResult uint8
 
-	select {
-	case conf := <-configCh:
+const (
+	vkturnAttachConfigReady vkturnAttachWaitResult = iota
+	vkturnAttachRunnerDone
+	vkturnAttachCancelled
+)
+
+// waitForVKTurnConfig treats the timeout as diagnostics, not runner death.
+// TURN allocations released by a previous generation can remain quota-bound
+// for several minutes; workers must be allowed to retry until GETCONF arrives.
+func waitForVKTurnConfig(ctx context.Context, runDone <-chan struct{}, configCh <-chan string, timeout time.Duration, onTimeout func()) (string, vkturnAttachWaitResult) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case conf, ok := <-configCh:
+			if !ok {
+				configCh = nil
+				continue
+			}
+			return conf, vkturnAttachConfigReady
+		case <-runDone:
+			return "", vkturnAttachRunnerDone
+		case <-ctx.Done():
+			return "", vkturnAttachCancelled
+		case <-timer.C:
+			if onTimeout != nil {
+				onTimeout()
+			}
+			timer.Reset(timeout)
+		}
+	}
+}
+
+func finishVKTurnAttach(ctx context.Context, runner *wgturnclient.Runner, cancel context.CancelFunc, runDone <-chan struct{}, configCh <-chan string, attachOnce *sync.Once) {
+	conf, result := waitForVKTurnConfig(ctx, runDone, configCh, vkturnConfigAttachTimeout, func() {
+		if isCurrentVKTurnRunner(runner) {
+			rt.appendLog(fmt.Sprintf("warn: vkturn GETCONF pending after %s; workers retrying", vkturnConfigAttachTimeout))
+		}
+	})
+
+	switch result {
+	case vkturnAttachConfigReady:
 		attachVKTurnConfig(runner, cancel, conf, attachOnce)
-	case <-runDone:
+	case vkturnAttachRunnerDone:
 		if ctx.Err() == nil && vkturnErr.Load() == nil && storeVKTurnErrorIfCurrent(runner, "not running before GETCONF") {
 			rt.appendLog("warn: vkturn runner stopped before GETCONF")
 		}
-	case <-ctx.Done():
+	case vkturnAttachCancelled:
 		rt.appendLog("info: vkturn attach wait cancelled")
-	case <-timer.C:
-		errText := fmt.Sprintf("GETCONF timeout after %s", vkturnConfigAttachTimeout)
-		if !storeVKTurnErrorIfCurrent(runner, errText) {
-			rt.appendLog("info: vkturn GETCONF timeout ignored for stale runner")
-			return
-		}
-		rt.appendLog("error: vkturn " + errText)
-		cancel()
-		runner.Shutdown()
 	}
 }
 

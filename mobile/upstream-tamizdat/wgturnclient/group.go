@@ -15,6 +15,9 @@ import (
 const (
 	workersPerGroup  = 12
 	defaultCycleSecs = 36000
+	quotaRetryBase   = 10 * time.Second
+	quotaRetryMax    = 60 * time.Second
+	quotaRetrySpread = 10 * time.Second
 )
 
 type configBroker struct {
@@ -42,6 +45,33 @@ func (b *configBroker) channel() chan<- string {
 		return nil
 	}
 	return b.ch
+}
+
+func isTURNQuotaError(errText string) bool {
+	lower := strings.ToLower(errText)
+	return strings.Contains(lower, "turn квота") ||
+		strings.Contains(lower, "allocation quota reached") ||
+		strings.Contains(lower, "error 486")
+}
+
+// quotaRetryDelay keeps quota-blocked workers alive until the TURN server has
+// released old allocations. Exponential backoff avoids hammering VK, while a
+// stable per-worker spread prevents all 20 workers in a room retrying together.
+func quotaRetryDelay(attempt, workerID int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	base := quotaRetryBase
+	for i := 1; i < attempt && base < quotaRetryMax; i++ {
+		base *= 2
+		if base > quotaRetryMax {
+			base = quotaRetryMax
+		}
+	}
+	spreadMillis := quotaRetrySpread.Milliseconds()
+	seed := uint64(workerID)*1103515245 + uint64(attempt)*12345
+	spread := time.Duration(seed%uint64(spreadMillis)) * time.Millisecond
+	return base + spread
 }
 
 // workerGroup:
@@ -170,9 +200,7 @@ func (r *Runner) workerGroup(
 		batchCtx, batchCancel := context.WithCancel(ctx)
 
 		refreshCh := make(chan struct{}, 1)
-		quotaBackoffCh := make(chan struct{}, 1)
 		doneChs := make([]chan struct{}, len(workerIDs))
-		var quotaErrorWorkers sync.Map
 		var notFoundErrorWorkers sync.Map
 
 		// Сигнализируем следующей группе, что мы успешно запустились (креды получены + 2 сек форы)
@@ -206,6 +234,7 @@ func (r *Runner) workerGroup(
 
 				// Retry loop: воркер переподключается при ошибке
 				attempt := 0
+				quotaAttempt := 0
 				for {
 					if batchCtx.Err() != nil {
 						return
@@ -248,35 +277,23 @@ func (r *Runner) workerGroup(
 							return
 						}
 
-						// Исчерпана ли квота TURN? Do not sleep-and-retry the same
-						// credential batch: that hammers VK allocations and keeps gate in
-						// a restart loop. iOS behavior is important here: partial quota
-						// after GETCONF/attach is degraded capacity, not a fatal tunnel
-						// condition. Only pre-GETCONF quota should trigger process-level
-						// backoff because there is no usable tunnel yet.
-						if strings.Contains(errStrLower, "turn квота") || strings.Contains(errStrLower, "quota") {
-							quotaErrorWorkers.Store(wid, true)
-							qCount := 0
-							quotaErrorWorkers.Range(func(k, v any) bool { qCount++; return true })
-							threshold := len(workerIDs)
-							if threshold <= 0 || threshold > 5 {
-								threshold = 5
+						// 486 means the previous runner's allocations still occupy the
+						// server quota. A worker must stay alive and retry; returning here
+						// permanently stranded the pool at 8/40 in the device incident.
+						if isTURNQuotaError(errStr) {
+							quotaAttempt++
+							delay := quotaRetryDelay(quotaAttempt, wid)
+							log.Printf("[ВОРКЕР #%d] Ошибка квоты TURN; повтор через %v: %s", wid, delay, errStr)
+							r.eventf("warn", "quota retry scheduled worker=%d room=%d attempt=%d delay_ms=%d", wid, roomID, quotaAttempt, delay.Milliseconds())
+							select {
+							case <-time.After(delay):
+								continue
+							case <-batchCtx.Done():
+								return
 							}
-							log.Printf("[ВОРКЕР #%d] Ошибка квоты TURN: %s", wid, errStr)
-							if qCount >= threshold {
-								if broker != nil && !broker.sent.Load() {
-									log.Printf("[ГРУППА #%d] TURN quota у %d/%d воркеров до GETCONF; backoff без hammer", groupID, qCount, len(workerIDs))
-									select {
-									case quotaBackoffCh <- struct{}{}:
-									default:
-									}
-								} else {
-									log.Printf("[ГРУППА #%d] TURN quota у %d/%d воркеров после GETCONF; degraded, без ротации", groupID, qCount, len(workerIDs))
-								}
-							}
-							return
 						}
 
+						quotaAttempt = 0
 						attempt++
 						log.Printf("[ВОРКЕР #%d] Ошибка (попытка %d): %s", wid, attempt, errStr)
 
@@ -337,14 +354,6 @@ func (r *Runner) workerGroup(
 			log.Printf("[ГРУППА #%d] TTL %v истёк, ротация", groupID, cycleDurationLocal)
 		case <-refreshCh:
 			log.Printf("[ГРУППА #%d] Вызвана досрочная ротация (креды не отвечали)", groupID)
-		case <-quotaBackoffCh:
-			log.Printf("[ГРУППА #%d] TURN quota backoff: останавливаем batch и ждём очистки allocations", groupID)
-			killBatch()
-			select {
-			case <-time.After(10 * time.Minute):
-			case <-ctx.Done():
-				return
-			}
 		case <-ctx.Done():
 			return
 		}

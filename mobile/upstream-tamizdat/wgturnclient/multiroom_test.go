@@ -1,9 +1,11 @@
 package wgturnclient
 
 import (
+	"errors"
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func testRoomCreds(label string) *Credentials {
@@ -172,6 +174,31 @@ func TestConfigBrokerRetriesThenDeliversOnce(t *testing.T) {
 	broker.complete(true)
 	if broker.claim() {
 		t.Fatal("claim after successful delivery succeeded")
+	}
+}
+
+func TestTURNQuotaErrorsRemainRetryableWithBoundedStagger(t *testing.T) {
+	errText := "TURN allocate: Allocate error response (error 486: Allocation Quota Reached)"
+	if !isTURNQuotaError(errText) {
+		t.Fatalf("486 error was not classified as retryable quota: %q", errText)
+	}
+	if !isTURNQuotaError("TURN квота исчерпана") {
+		t.Fatal("localized TURN quota error was not classified as retryable")
+	}
+	if isTURNQuotaError(errors.New("connection refused").Error()) {
+		t.Fatal("non-quota error was classified as TURN quota")
+	}
+
+	first := quotaRetryDelay(1, 1)
+	if first < 10*time.Second || first >= 20*time.Second {
+		t.Fatalf("first quota retry=%v, want [10s,20s)", first)
+	}
+	steady := quotaRetryDelay(20, 1)
+	if steady < 60*time.Second || steady >= 70*time.Second {
+		t.Fatalf("steady quota retry=%v, want [60s,70s)", steady)
+	}
+	if other := quotaRetryDelay(20, 2); other == steady {
+		t.Fatalf("worker retry staggering collapsed: worker1=%v worker2=%v", steady, other)
 	}
 }
 
