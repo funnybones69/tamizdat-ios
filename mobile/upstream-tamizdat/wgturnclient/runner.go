@@ -12,15 +12,13 @@ import (
 )
 
 const (
-	defaultListen       = "127.0.0.1:9000"
-	defaultWorkers      = workersPerGroup
-	maxWorkers          = 72 // legacy single-room compatibility
-	maxRooms            = 4
-	maxWorkersPerRoom   = 20
-	maxMultiRoomWorkers = maxRooms * maxWorkersPerRoom
-	defaultVKAppID      = "6287487"
-	defaultVKAppSecret  = "QbYic1K3lEV5kTGiqlq2"
-	defaultUserAgent    = "Mozilla/5.0"
+	defaultListen      = "127.0.0.1:9000"
+	defaultWorkers     = workersPerGroup
+	maxWorkers         = 72 // legacy single-room compatibility
+	maxWorkersPerRoom  = 20
+	defaultVKAppID     = "6287487"
+	defaultVKAppSecret = "QbYic1K3lEV5kTGiqlq2"
+	defaultUserAgent   = "Mozilla/5.0"
 )
 
 type EventFunc func(level, message string)
@@ -45,6 +43,7 @@ type Config struct {
 	PreloadedCredsByHash map[string]*Credentials
 	BondV2               bool
 	OnConfig             func(string)
+	OnWorkerCount        func(int)
 	OnEvent              EventFunc
 	OnStats              func(StatsSnapshot)
 
@@ -114,8 +113,8 @@ func New(cfg Config) (*Runner, error) {
 	}
 	cfg.VKHashes = normalizeHashes(cfg.VKHashes)
 	if cfg.WorkersPerRoom > 0 {
-		if len(cfg.VKHashes) < 1 || len(cfg.VKHashes) > maxRooms {
-			return nil, fmt.Errorf("multi-room mode requires 1-%d unique rooms", maxRooms)
+		if len(cfg.VKHashes) < 1 {
+			return nil, fmt.Errorf("multi-room mode requires at least one unique room")
 		}
 		if cfg.BondV2 && len(cfg.VKHashes) < 2 {
 			return nil, fmt.Errorf("Bond v2 requires multi-room mode with at least 2 rooms")
@@ -134,10 +133,10 @@ func New(cfg Config) (*Runner, error) {
 				return nil, fmt.Errorf("multi-room credentials missing configured room")
 			}
 		}
-		cfg.Workers = len(cfg.VKHashes) * cfg.WorkersPerRoom
-		if cfg.Workers > maxMultiRoomWorkers {
-			return nil, fmt.Errorf("multi-room worker count exceeds %d", maxMultiRoomWorkers)
+		if len(cfg.VKHashes) > int(^uint(0)>>1)/cfg.WorkersPerRoom {
+			return nil, fmt.Errorf("multi-room worker count overflows int")
 		}
+		cfg.Workers = len(cfg.VKHashes) * cfg.WorkersPerRoom
 	} else {
 		if cfg.BondV2 {
 			return nil, fmt.Errorf("Bond v2 requires WorkersPerRoom multi-room mode")
@@ -243,7 +242,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	memoryProfile := memoryProfileForWorkers(r.cfg.Workers)
 	r.eventf("info", "runner start workers=%d groups=%d workersPerGroup=%d proto=%s socketBuf=%d sendQueue=%d preloaded=%t %s deviceIDLen=%d", r.cfg.Workers, numGroups, workersPerGroup, proto, memoryProfile.socketBufferSize, memoryProfile.workerSendBuffer, r.preloadedCreds.Load() != nil, credentialsSummary(r.preloadedCreds.Load()), len(r.cfg.DeviceID))
 
-	stats := NewStats()
+	stats := NewStats(logicalRoomCount)
 	bondID := bondRunnerIdentity{}
 	if r.cfg.BondV2 {
 		var idErr error
@@ -261,6 +260,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	}()
 
 	disp := NewDispatcherWithOptions(runCtx, localConn, stats, r.cfg.BondV2, len(r.cfg.VKHashes), r.cfg.OnEvent)
+	disp.onWorkerCount = r.cfg.OnWorkerCount
 	defer func() {
 		// The callback emitted when statsShutdown closes is the final snapshot.
 		// Stop every producer first so worker/session tail counters and dispatcher

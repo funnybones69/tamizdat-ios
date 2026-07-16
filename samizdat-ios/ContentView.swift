@@ -370,7 +370,16 @@ struct ContentView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
 
-                if homeState.showsPingChip {
+                if lampStore.snapshot.desiredUpstream == "turn",
+                   lampStore.snapshot.turnExpectedWorkers > 0,
+                   bridge.state != .disconnected {
+                    Text("\(lampStore.snapshot.turnActiveWorkers) / \(lampStore.snapshot.turnExpectedWorkers) workers")
+                        .font(.geistMono(.semibold, size: 13))
+                        .foregroundStyle(theme.textDim)
+                        .monospacedDigit()
+                }
+
+                if homeState.showsPingChip && lampStore.snapshot.desiredUpstream != "turn" {
                     PingChip(
                         pingMs: lampStore.snapshot.pingMs >= 0 ? lampStore.snapshot.pingMs : nil
                     )

@@ -25,6 +25,10 @@ const (
 	readBufSize             = 1600
 	singleRoomSocketBufSize = 625 * 1024
 	multiRoomSocketBufSize  = 128 * 1024
+	multiRoomSocketBudget   = 20 * 1024 * 1024
+	multiRoomQueueBudget    = 2 * 1024 * 1024
+	minWorkerSocketBufSize  = 8 * 1024
+	minWorkerSendBuf        = 4
 	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696.
 	// Cap concurrent DTLS handshakes to 3 to stop the OK CDN TURN
 	// server from rate-limiting the whole worker group when many
@@ -42,9 +46,21 @@ type sessionMemoryProfile struct {
 
 func memoryProfileForWorkers(workers int) sessionMemoryProfile {
 	if workers > maxWorkersPerRoom {
+		socketBuffer := multiRoomSocketBufSize
+		sendBuffer := multiRoomWorkerSendBuf
+		if workers > 80 {
+			socketBuffer = multiRoomSocketBudget / workers / 2
+			if socketBuffer < minWorkerSocketBufSize {
+				socketBuffer = minWorkerSocketBufSize
+			}
+			sendBuffer = multiRoomQueueBudget / workers / readBufSize
+			if sendBuffer < minWorkerSendBuf {
+				sendBuffer = minWorkerSendBuf
+			}
+		}
 		return sessionMemoryProfile{
-			socketBufferSize: multiRoomSocketBufSize,
-			workerSendBuffer: multiRoomWorkerSendBuf,
+			socketBufferSize: socketBuffer,
+			workerSendBuffer: sendBuffer,
 		}
 	}
 	return sessionMemoryProfile{
@@ -494,9 +510,6 @@ func RunSession(
 	})
 	defer stopDTLS()
 
-	atomic.AddInt32(&stats.ActiveConnections, 1)
-	defer atomic.AddInt32(&stats.ActiveConnections, -1)
-
 	// Запрос конфига / Bond v2 BIND. Legacy raw GETCONF stays byte-for-byte
 	// unchanged when bondV2=false.
 	if bondV2 {
@@ -563,6 +576,11 @@ func RunSession(
 	}
 	d.Register(slot)
 	defer d.Unregister(slot)
+	// "active" means data-plane usable: DTLS alone is not enough. Count only
+	// after successful Bond BIND and dispatcher registration so invalid_bind or
+	// startup handshakes never inflate the UI worker numerator.
+	atomic.AddInt32(&stats.ActiveConnections, 1)
+	defer atomic.AddInt32(&stats.ActiveConnections, -1)
 
 	// Proxy DTLS ↔ Dispatcher
 	var proxyWg sync.WaitGroup

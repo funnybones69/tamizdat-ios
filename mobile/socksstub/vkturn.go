@@ -3,6 +3,7 @@ package socksstub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -39,6 +40,9 @@ var (
 	vkturnErr              atomic.Pointer[string]
 	vkturnNet              atomic.Pointer[netstack.Net]
 	vkturnRunning          atomic.Bool
+	vkturnRequired         atomic.Bool
+	vkturnActiveWorkers    atomic.Int64
+	vkturnExpectedWorkers  atomic.Int64
 	vkturnGeneration       atomic.Int64
 	vkturnRestartNotBefore atomic.Int64
 	vkturnRunDone          <-chan struct{}
@@ -46,6 +50,36 @@ var (
 	vkturnAttachStop       func()
 	vkturnMu               sync.Mutex
 )
+
+var errVKTurnRequiredNotReady = errors.New("TURN required but netstack is not ready")
+
+// SetVKTurnRequired makes TURN selection fail closed. When enabled, the SOCKS
+// data path must never fall through to the dormant H2 client or to a direct
+// socket while the TURN/WireGuard netstack is starting, draining, or failed.
+// It also stops H2 health probes; SetSamizdatConfig suppresses H2 warm-up while
+// this flag is set, so TURN mode produces no hidden H2 traffic.
+func SetVKTurnRequired(required bool) {
+	wasRequired := vkturnRequired.Swap(required)
+	if required {
+		stopPingProber()
+		if !wasRequired {
+			rt.appendLog("info: upstream policy = TURN required (H2/direct fallback disabled)")
+		}
+		return
+	}
+	if wasRequired {
+		rt.appendLog("info: upstream policy = H2 allowed")
+		rt.mu.Lock()
+		client := rt.samizdatClient
+		rt.mu.Unlock()
+		if client != nil {
+			startPingProber(client)
+		}
+	}
+}
+
+// VKTurnRequired is exposed for status and regression tests.
+func VKTurnRequired() bool { return vkturnRequired.Load() }
 
 const (
 	vkturnConfigAttachTimeout   = 60 * time.Second
@@ -80,6 +114,9 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 	if workersPerRoom != 20 {
 		return "workersPerRoom must be 20"
 	}
+	if len(hashes) > int(^uint(0)>>1)/workersPerRoom {
+		return "multi-room worker count overflows int"
+	}
 	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, len(hashes)*workersPerRoom, workersPerRoom, hashes, credsByHash, nil, len(bundleJSON))
 }
 
@@ -105,6 +142,7 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 	}
 
 	resetVKTurnAtomicsLocked()
+	vkturnExpectedWorkers.Store(int64(workers))
 	attachOnce := &sync.Once{}
 	firstCreds := singleCreds
 	if firstCreds == nil && len(hashes) > 0 {
@@ -120,6 +158,9 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 		VKHashes: hashes, DeviceID: deviceID, ConnPassword: wgPassword,
 		PreloadedCreds: singleCreds, PreloadedCredsByHash: credsByHash,
 		BondV2: workersPerRoom > 0 && len(hashes) >= 2,
+		OnWorkerCount: func(active int) {
+			storeVKTurnWorkerCountIfCurrent(runner, active)
+		},
 		OnConfig: func(conf string) {
 			select {
 			case configCh <- conf:
@@ -292,7 +333,8 @@ func StopVKTurnUpstream() {
 	}
 	if vkturnDraining == done {
 		// Another sync/async stop already owns this exact drain. Do not wait a
-		// second timeout or launch another release watcher.
+		// second timeout or launch another release watcher. The first owner has
+		// already cleared the live netstack and new starts remain gated.
 		vkturnMu.Unlock()
 		return
 	}
@@ -429,6 +471,19 @@ func TURNUpstreamStatsJSON() string {
 	}
 	return ""
 }
+
+// TURNUpstreamActiveWorkers is the current data-plane-ready worker count.
+// A stopped/draining runner always reports zero even if final telemetry remains
+// cached for diagnostics.
+func TURNUpstreamActiveWorkers() int {
+	if !vkturnRunning.Load() {
+		return 0
+	}
+	return int(vkturnActiveWorkers.Load())
+}
+
+// TURNUpstreamExpectedWorkers is the effective runner pool size (rooms × 20).
+func TURNUpstreamExpectedWorkers() int64 { return vkturnExpectedWorkers.Load() }
 
 // TURNUpstreamRunning reports whether the VK TURN runner goroutine is alive.
 func TURNUpstreamRunning() bool {
@@ -685,6 +740,7 @@ func resetVKTurnAtomicsLocked() {
 	vkturnTelemetryOwner = nil
 	vkturnErr.Store(nil)
 	vkturnRunning.Store(false)
+	vkturnActiveWorkers.Store(0)
 }
 
 func isCurrentVKTurnRunner(runner *wgturnclient.Runner) bool {
@@ -774,6 +830,16 @@ func storeVKTurnErrorIfCurrent(runner *wgturnclient.Runner, errText string) bool
 	return true
 }
 
+func storeVKTurnWorkerCountIfCurrent(runner *wgturnclient.Runner, active int) {
+	vkturnMu.Lock()
+	defer vkturnMu.Unlock()
+	if runner == nil || vkturnRunner != runner || !vkturnRunning.Load() {
+		return
+	}
+	vkturnActiveWorkers.Store(int64(active))
+	storeVKTurnStats(active, true)
+}
+
 func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnclient.StatsSnapshot) {
 	vkturnMu.Lock()
 	if runner == nil || vkturnTelemetryOwner != runner {
@@ -781,8 +847,14 @@ func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnc
 		return
 	}
 	copy := snapshot
+	copy.RoomUpPackets = append([]int64(nil), snapshot.RoomUpPackets...)
+	copy.RoomUpBytes = append([]int64(nil), snapshot.RoomUpBytes...)
+	copy.RoomDrops = append([]int64(nil), snapshot.RoomDrops...)
+	copy.RoomDownPackets = append([]int64(nil), snapshot.RoomDownPackets...)
+	copy.RoomDownBytes = append([]int64(nil), snapshot.RoomDownBytes...)
 	vkturnTelemetry.Store(&copy)
 	running := vkturnRunner == runner && vkturnRunning.Load()
+	vkturnActiveWorkers.Store(int64(snapshot.ActiveConnections))
 	storeVKTurnStats(int(snapshot.ActiveConnections), running)
 	vkturnMu.Unlock()
 
@@ -801,18 +873,19 @@ func storeVKTurnStats(active int, running bool) {
 		errText = *p
 	}
 	telemetry := vkturnTelemetry.Load()
-	if telemetry != nil {
-		active = int(telemetry.ActiveConnections)
+	if running {
+		active = int(vkturnActiveWorkers.Load())
 	}
 	payload := struct {
 		Active    int                         `json:"active"`
+		Expected  int64                       `json:"expected"`
 		Running   bool                        `json:"running"`
 		Error     string                      `json:"error,omitempty"`
 		Telemetry *wgturnclient.StatsSnapshot `json:"telemetry,omitempty"`
-	}{Active: active, Running: running, Error: errText, Telemetry: telemetry}
+	}{Active: active, Expected: vkturnExpectedWorkers.Load(), Running: running, Error: errText, Telemetry: telemetry}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		snapshot := fmt.Sprintf(`{"active":%d,"running":%t}`, active, running)
+		snapshot := fmt.Sprintf(`{"active":%d,"expected":%d,"running":%t}`, active, vkturnExpectedWorkers.Load(), running)
 		vkturnStats.Store(&snapshot)
 		return
 	}

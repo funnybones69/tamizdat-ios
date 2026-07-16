@@ -262,6 +262,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // immediately after SetSamizdatConfig, so a user who is already
         // over-quota at connect time still gets the notification.
         SocksstubSetNotificationCallback(NotificationBridge.shared)
+        // Policy must be visible to the Go dial path before the H2 client is
+        // built. In TURN mode this suppresses H2 ping/warm-up and makes every
+        // TCP/UDP flow fail closed until the TURN/WG netstack is ready.
+        if policy.usesTURN {
+            SocksstubSetVKTurnRequired(true)
+        } else {
+            // Clear any stale TURN netstack before permitting H2 again. The
+            // synchronous stop waits for an already-owned drain to finish.
+            SocksstubStopVKTurnUpstream()
+            SocksstubSetVKTurnRequired(false)
+        }
         var cfgErr: NSError?
         SocksstubSetSamizdatConfig(configBlob, &cfgErr)
         if let cfgErr {
@@ -283,7 +294,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
             ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
         } else {
-            SocksstubStopVKTurnUpstream()
             log("info: [vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
             ExtLog.info("[vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
         }
@@ -706,6 +716,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func rewireUpstream() {
         let generation = nextRewireGeneration()
         isRewiring = true
+        // Close the policy race before the serialized rewire queue runs.
+        // A user switch to TURN must block new H2/direct flows immediately.
+        let requestedPolicy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+        if requestedPolicy.usesTURN {
+            SocksstubSetVKTurnRequired(true)
+        }
         appendExtLog("info: rewire gen=\(generation) queued")
 
         rewireQueue.async { [weak self] in
@@ -725,12 +741,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             self.appendExtLog("info: rewire gen=\(generation) start mode=\(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue)")
 
+            // TURN closes its fallback gate before detach. H2 opens the gate
+            // only after stale TURN is detached, so neither transition has a
+            // window on the wrong data plane.
+            if policy.usesTURN {
+                SocksstubSetVKTurnRequired(true)
+            }
+
             // Every authoritative rewire owns the current data-plane lifecycle.
             // H2 must clear a stale TURN netstack; TURN must drain and recreate
             // its relay sockets on the new NWPath instead of "rewiring" only
             // the dormant H2 client. Ping-prober callbacks never reach here in
             // TURN mode, so this cannot create the old 11-second restart loop.
             SocksstubStopVKTurnUpstream()
+            if !policy.usesTURN {
+                SocksstubSetVKTurnRequired(false)
+            }
             guard self.rewireGeneration == generation else {
                 self.appendExtLog("info: rewire gen=\(generation) stopped after TURN drain — superseded")
                 return
@@ -938,10 +964,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
             guard policy.usesTURN else {
                 SocksstubStopVKTurnUpstream()
+                SocksstubSetVKTurnRequired(false)
                 appendExtLog("info: VK TURN creds refresh ignored by policy — effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw), H2 active")
                 completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
                 return
             }
+            SocksstubSetVKTurnRequired(true)
 
             let result = Self.refreshVKTurnCredsFromAppGroup()
             if result == "not running" {
@@ -966,9 +994,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested VK TURN restart → rooms=\(VKCredsPreferences.roomHashes.count) workersPerRoom=20 effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
             guard policy.usesTURN else {
                 SocksstubStopVKTurnUpstream()
+                SocksstubSetVKTurnRequired(false)
                 completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
                 return
             }
+            SocksstubSetVKTurnRequired(true)
             SocksstubStopVKTurnUpstream()
             let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
             let hasBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)?.isEmpty == false
@@ -1014,17 +1044,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let policy = Self.upstreamPolicy(mode: mode, backup: backupBlob)
             let turnRunning = SocksstubTURNUpstreamRunning()
             let turnNetstackReady = !SocksstubTURNUpstreamWGConfig().isEmpty
-            let actualUpstream = turnNetstackReady ? "turn" : "h2"
+            let actualUpstream = policy.usesTURN
+                ? (turnNetstackReady ? "turn" : "turn-pending")
+                : "h2"
+            let turnStats: (active: Int, expected: Int) = {
+                let fallbackExpected = VKCredsPreferences.roomHashes.count * VKCredsPreferences.workersPerRoom
+                let raw = SocksstubTURNUpstreamStatsJSON()
+                guard let data = raw.data(using: .utf8),
+                      let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+                else { return (0, fallbackExpected) }
+                let active = object["active"] as? Int ?? 0
+                let reportedExpected = object["expected"] as? Int ?? 0
+                let expected = reportedExpected > 0 ? reportedExpected : fallbackExpected
+                return (max(0, active), max(0, expected))
+            }()
+            // H2 ping state is irrelevant in TURN-only mode and can be stale
+            // from a previous policy. Keep it neutral instead of letting an
+            // old H2 failure paint the TURN connection as failed.
+            let pingMs = policy.usesTURN ? -1 : Int(pingSnap?.lastMs ?? -1)
+            let pingOK = policy.usesTURN ? false : (pingSnap?.ok ?? false)
+            let pingFailed = policy.usesTURN ? false : (pingSnap?.failed ?? false)
             let payload: [String: Any] = [
-                "realShape":   SocksstubRealShapeMode(),
+                "realShape":   policy.usesTURN ? "turn" : SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
                 "liteAlive":   Int(SocksstubLiteAlive()),
                 "rttLiteMs":   Int(SocksstubRTTLiteP50Ms()),
                 "rttBulkMs":   Int(SocksstubRTTBulkP50Ms()),
                 // IPA-D21 ping-prober fields.
-                "pingMs":      Int(pingSnap?.lastMs ?? -1),
-                "pingOK":      pingSnap?.ok ?? false,
-                "pingFailed":  pingSnap?.failed ?? false,
+                "pingMs":      pingMs,
+                "pingOK":      pingOK,
+                "pingFailed":  pingFailed,
                 "pingURL":     pingSnap?.url ?? "",
                 // IPA-D22 stat-tile + reconnecting fields.
                 "rxBytes":     Int64(rx_bytes),
@@ -1038,7 +1087,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "upstreamKind": actualUpstream,
                 "turnRunning": turnRunning ? 1 : 0,
                 "turnNetstackReady": turnNetstackReady ? 1 : 0,
-                "turnWorkers": VKCredsPreferences.workers,
+                "turnActiveWorkers": turnStats.active,
+                "turnExpectedWorkers": turnStats.expected,
+                "turnWorkers": turnStats.expected,
                 // VK TURN relay session parameter status. IPA-D65b: the main
                 // app now acquires session params itself via WKWebView verification challenge
                 // solving and writes them to App Group UserDefaults

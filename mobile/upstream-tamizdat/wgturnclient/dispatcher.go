@@ -18,16 +18,20 @@ type WorkerSlot struct {
 }
 
 type Dispatcher struct {
-	localConn  net.PacketConn
-	clientAddr atomic.Pointer[net.Addr]
-	mu         sync.Mutex
-	workers    []*WorkerSlot
-	rrIndex    int
-	ReturnCh   chan []byte
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	stats      *Stats
+	localConn       net.PacketConn
+	clientAddr      atomic.Pointer[net.Addr]
+	mu              sync.Mutex
+	workers         []*WorkerSlot
+	rrIndex         int
+	ReturnCh        chan []byte
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	stats           *Stats
+	onWorkerCount   func(int)
+	countGeneration uint64 // guarded by mu
+	notifyMu        sync.Mutex
+	lastNotified    uint64 // guarded by notifyMu
 
 	bondV2             bool
 	bondSeq            atomic.Uint64
@@ -129,11 +133,27 @@ func (d *Dispatcher) finalizeReorderTail() {
 	}
 }
 
+func (d *Dispatcher) notifyWorkerCount(generation uint64, count int) {
+	if d.onWorkerCount == nil {
+		return
+	}
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	if generation <= d.lastNotified {
+		return
+	}
+	d.lastNotified = generation
+	d.onWorkerCount(count)
+}
+
 func (d *Dispatcher) Register(w *WorkerSlot) {
 	d.mu.Lock()
 	d.workers = append(d.workers, w)
 	count := len(d.workers)
+	d.countGeneration++
+	generation := d.countGeneration
 	d.mu.Unlock()
+	d.notifyWorkerCount(generation, count)
 	if d.bondV2 {
 		log.Printf("[ДИСП] Bond v2 воркер #%d room=%d зарегистрирован (всего: %d)", w.ID, w.RoomID, count)
 		return
@@ -143,14 +163,23 @@ func (d *Dispatcher) Register(w *WorkerSlot) {
 
 func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 	d.mu.Lock()
+	removed := false
 	for i, w := range d.workers {
 		if w == slot {
 			d.workers = append(d.workers[:i], d.workers[i+1:]...)
+			removed = true
 			break
 		}
 	}
 	remaining := len(d.workers)
+	if removed {
+		d.countGeneration++
+	}
+	generation := d.countGeneration
 	d.mu.Unlock()
+	if removed {
+		d.notifyWorkerCount(generation, remaining)
+	}
 	log.Printf("[ДИСП] Воркер #%d отключён (осталось: %d)", slot.ID, remaining)
 }
 

@@ -64,7 +64,7 @@ func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	recordBondRoomDown(stats, 1, controlFrame)
 	recordBondRoomDown(stats, 1, unknownFlagsFrame)
 	recordBondRoomDown(stats, 1, []byte("invalid"))
-	recordBondRoomDown(stats, maxRooms, dataFrame)
+	recordBondRoomDown(stats, len(stats.BondRoomDownPackets), dataFrame)
 
 	snapshot := stats.Snapshot()
 	if snapshot.ActiveConnections != 7 || snapshot.BondFramesUp != 11 || snapshot.BondFramesDown != 14 || snapshot.BondBytesDown != int64(len("room-one")) {
@@ -97,5 +97,14 @@ func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	})
 	if callbacks != 1 {
 		t.Fatalf("callbacks=%d want=1", callbacks)
+	}
+}
+
+func TestStatsSupportsRoomsBeyondLegacyFour(t *testing.T) {
+	stats := NewStats(7)
+	atomic.StoreInt64(&stats.BondRoomBytes[6], 606)
+	snapshot := stats.Snapshot()
+	if len(snapshot.RoomUpBytes) != 7 || snapshot.RoomUpBytes[6] != 606 {
+		t.Fatalf("dynamic room telemetry=%v", snapshot.RoomUpBytes)
 	}
 }

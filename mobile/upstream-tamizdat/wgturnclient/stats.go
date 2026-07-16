@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+const defaultStatsRoomCount = 4
+
 type Stats struct {
 	ActiveConnections int32
 	Reconnects        int64
@@ -20,39 +22,57 @@ type Stats struct {
 	BondQueueDrops      int64
 	BondReorderGaps     int64
 	BondReorderLate     int64
-	BondRoomPackets     [maxRooms]int64
-	BondRoomBytes       [maxRooms]int64
-	BondRoomDrops       [maxRooms]int64
-	BondRoomDownPackets [maxRooms]int64
-	BondRoomDownBytes   [maxRooms]int64
+	BondRoomPackets     []int64
+	BondRoomBytes       []int64
+	BondRoomDrops       []int64
+	BondRoomDownPackets []int64
+	BondRoomDownBytes   []int64
 }
 
-// StatsSnapshot is an atomic, gomobile-safe view used by physical A/B telemetry.
+// StatsSnapshot is an atomic view used by physical A/B telemetry.
+// Per-room arrays are sized to the configured room count instead of a protocol
+// constant, so adding rooms does not silently discard telemetry after room 4.
 type StatsSnapshot struct {
-	ActiveConnections int32           `json:"active_connections"`
-	Reconnects        int64           `json:"reconnects"`
-	TotalBytesUp      int64           `json:"total_bytes_up"`
-	TotalBytesDown    int64           `json:"total_bytes_down"`
-	CredsErrors       int64           `json:"credential_errors"`
-	BondFramesUp      int64           `json:"bond_frames_up"`
-	BondFramesDown    int64           `json:"bond_frames_down"`
-	BondBytesUp       int64           `json:"bond_bytes_up"`
-	BondBytesDown     int64           `json:"bond_bytes_down"`
-	BondQueueDrops    int64           `json:"bond_queue_drops"`
-	BondReorderGaps   int64           `json:"bond_reorder_gaps_down"`
-	BondReorderLate   int64           `json:"bond_reorder_late_down"`
-	RoomUpPackets     [maxRooms]int64 `json:"room_up_packets"`
-	RoomUpBytes       [maxRooms]int64 `json:"room_up_bytes"`
-	RoomDrops         [maxRooms]int64 `json:"room_drops"`
-	RoomDownPackets   [maxRooms]int64 `json:"room_down_packets"`
-	RoomDownBytes     [maxRooms]int64 `json:"room_down_bytes"`
+	ActiveConnections int32   `json:"active_connections"`
+	Reconnects        int64   `json:"reconnects"`
+	TotalBytesUp      int64   `json:"total_bytes_up"`
+	TotalBytesDown    int64   `json:"total_bytes_down"`
+	CredsErrors       int64   `json:"credential_errors"`
+	BondFramesUp      int64   `json:"bond_frames_up"`
+	BondFramesDown    int64   `json:"bond_frames_down"`
+	BondBytesUp       int64   `json:"bond_bytes_up"`
+	BondBytesDown     int64   `json:"bond_bytes_down"`
+	BondQueueDrops    int64   `json:"bond_queue_drops"`
+	BondReorderGaps   int64   `json:"bond_reorder_gaps_down"`
+	BondReorderLate   int64   `json:"bond_reorder_late_down"`
+	RoomUpPackets     []int64 `json:"room_up_packets"`
+	RoomUpBytes       []int64 `json:"room_up_bytes"`
+	RoomDrops         []int64 `json:"room_drops"`
+	RoomDownPackets   []int64 `json:"room_down_packets"`
+	RoomDownBytes     []int64 `json:"room_down_bytes"`
 }
 
-func NewStats() *Stats {
-	return &Stats{}
+// NewStats accepts an optional configured room count. The variadic form keeps
+// existing unit-test and legacy single-room call sites source-compatible.
+func NewStats(roomCounts ...int) *Stats {
+	rooms := defaultStatsRoomCount
+	if len(roomCounts) > 0 {
+		rooms = roomCounts[0]
+		if rooms < 1 {
+			rooms = 1
+		}
+	}
+	return &Stats{
+		BondRoomPackets:     make([]int64, rooms),
+		BondRoomBytes:       make([]int64, rooms),
+		BondRoomDrops:       make([]int64, rooms),
+		BondRoomDownPackets: make([]int64, rooms),
+		BondRoomDownBytes:   make([]int64, rooms),
+	}
 }
 
 func (s *Stats) Snapshot() StatsSnapshot {
+	rooms := len(s.BondRoomPackets)
 	out := StatsSnapshot{
 		ActiveConnections: atomic.LoadInt32(&s.ActiveConnections),
 		Reconnects:        atomic.LoadInt64(&s.Reconnects),
@@ -66,8 +86,13 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		BondQueueDrops:    atomic.LoadInt64(&s.BondQueueDrops),
 		BondReorderGaps:   atomic.LoadInt64(&s.BondReorderGaps),
 		BondReorderLate:   atomic.LoadInt64(&s.BondReorderLate),
+		RoomUpPackets:     make([]int64, rooms),
+		RoomUpBytes:       make([]int64, rooms),
+		RoomDrops:         make([]int64, rooms),
+		RoomDownPackets:   make([]int64, rooms),
+		RoomDownBytes:     make([]int64, rooms),
 	}
-	for i := 0; i < maxRooms; i++ {
+	for i := 0; i < rooms; i++ {
 		out.RoomUpPackets[i] = atomic.LoadInt64(&s.BondRoomPackets[i])
 		out.RoomUpBytes[i] = atomic.LoadInt64(&s.BondRoomBytes[i])
 		out.RoomDrops[i] = atomic.LoadInt64(&s.BondRoomDrops[i])
@@ -78,7 +103,7 @@ func (s *Stats) Snapshot() StatsSnapshot {
 }
 
 func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {
-	if stats == nil || roomID < 0 || roomID >= maxRooms {
+	if stats == nil || roomID < 0 || roomID >= len(stats.BondRoomDownPackets) {
 		return
 	}
 	frame, err := decodeBondFrame(packet)

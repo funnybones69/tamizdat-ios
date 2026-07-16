@@ -573,33 +573,35 @@ func SetSamizdatConfig(blob string) error {
 	if old != nil {
 		_ = old.Close()
 	}
-	// IPA-D21: (re)start the real-internet ping prober bound to the new
-	// samizdat client. startPingProber stops any prior prober first;
-	// in-flight HTTP probes against the closed `old` client just fail
-	// naturally and don't crash.
-	startPingProber(client)
+	// IPA-D21: (re)start the real-internet ping prober only when H2 is
+	// allowed. TURN-required mode must not emit hidden H2 health traffic.
+	if vkturnRequired.Load() {
+		stopPingProber()
+		rt.appendLog("info: H2 ping prober disabled — TURN is required")
+	} else {
+		startPingProber(client)
+	}
 	rt.appendLog(fmt.Sprintf("info: dial mode = samizdat → %s:%d (sni=%s)", cfg.ServerHost, cfg.ServerPort, cfg.SNI))
 
-	// Warm-up dial: kick off the uTLS+H2 handshake in the background so
-	// the FIRST real user flow does not eat ~1-2 s of TLS handshake on
-	// top of hev's 2 s connect-timeout. Audit recommendation: target
-	// the upstream proxy itself (1.1.1.1:443 won't reach upstream from
-	// the test runner; we use the samizdat server's own port instead).
-	go func() {
-		// IPA-K: 8s was too tight for Russian cellular (Megafon TLS handshake
-		// got eaten by DPI delay). 30s gives the warm-up a real chance to
-		// complete on slow links; if it still fails, the log line tells us
-		// whether it was TCP dial, TLS handshake, or H2 settings that died.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		conn, err := client.DialContext(ctx, "tcp", "1.1.1.1:443")
-		if err != nil {
-			rt.appendLog(fmt.Sprintf("warn: samizdat warm-up dial: %v (cold start will be slower)", err))
-			return
-		}
-		_ = conn.Close()
-		rt.appendLog("info: samizdat warm-up handshake done")
-	}()
+	// Warm-up is H2 traffic too. Do not even launch it while TURN owns the
+	// policy; the samizdat client remains dormant for a later explicit switch.
+	if !vkturnRequired.Load() {
+		go func() {
+			// IPA-K: 8s was too tight for slow cellular. 30s gives the warm-up
+			// a real chance to complete; failure only means a cold H2 start.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			conn, err := client.DialContext(ctx, "tcp", "1.1.1.1:443")
+			if err != nil {
+				rt.appendLog(fmt.Sprintf("warn: samizdat warm-up dial: %v (cold start will be slower)", err))
+				return
+			}
+			_ = conn.Close()
+			rt.appendLog("info: samizdat warm-up handshake done")
+		}()
+	} else {
+		rt.appendLog("info: H2 warm-up disabled — TURN is required")
+	}
 
 	return nil
 }
@@ -1047,6 +1049,9 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	if n := VKTurnNetstack(); n != nil {
 		return n.DialContext(ctx, "tcp", dest)
 	}
+	if vkturnRequired.Load() {
+		return nil, errVKTurnRequiredNotReady
+	}
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
@@ -1074,6 +1079,9 @@ func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 		// connectedNetConnUDPAdapter promotes a connected net.Conn into the
 		// PacketConn interface our callers expect.
 		return newConnectedNetConnUDPAdapter(c, dest), nil
+	}
+	if vkturnRequired.Load() {
+		return nil, errVKTurnRequiredNotReady
 	}
 	rt.mu.Lock()
 	client := rt.samizdatClient

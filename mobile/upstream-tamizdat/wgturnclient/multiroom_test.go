@@ -1,6 +1,10 @@
 package wgturnclient
 
-import "testing"
+import (
+	"reflect"
+	"sync"
+	"testing"
+)
 
 func testRoomCreds(label string) *Credentials {
 	return &Credentials{
@@ -53,6 +57,14 @@ func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T)
 	if got := 80 * multi.socketBufferSize * 2; got > 20*1024*1024 {
 		t.Fatalf("multi-room requested socket memory=%d, want <=20MiB", got)
 	}
+
+	scaled := memoryProfileForWorkers(120)
+	if got := 120 * scaled.socketBufferSize * 2; got > multiRoomSocketBudget {
+		t.Fatalf("scaled socket memory=%d, budget=%d", got, multiRoomSocketBudget)
+	}
+	if scaled.workerSendBuffer >= multi.workerSendBuffer {
+		t.Fatalf("scaled queue=%d, want below legacy %d", scaled.workerSendBuffer, multi.workerSendBuffer)
+	}
 }
 
 func TestMultiRoomPlannerFourByTwenty(t *testing.T) {
@@ -97,6 +109,24 @@ func TestNewRequiresCompleteDistinctMultiRoomCredentials(t *testing.T) {
 	}
 }
 
+func TestNewSupportsRoomsBeyondLegacyFour(t *testing.T) {
+	hashes := []string{"room-a", "room-b", "room-c", "room-d", "room-e", "room-f"}
+	creds := make(map[string]*Credentials, len(hashes))
+	for _, hash := range hashes {
+		creds[hash] = testRoomCreds(hash)
+	}
+	runner, err := New(Config{
+		PeerAddr: "127.0.0.1:443", UseUDP: true, BondV2: true,
+		WorkersPerRoom: 20, VKHashes: hashes, PreloadedCredsByHash: creds,
+	})
+	if err != nil {
+		t.Fatalf("New 6x20: %v", err)
+	}
+	if runner.cfg.Workers != 120 {
+		t.Fatalf("workers=%d, want 120", runner.cfg.Workers)
+	}
+}
+
 func TestConfigBrokerRetriesThenDeliversOnce(t *testing.T) {
 	broker := &configBroker{ch: make(chan string, 1)}
 	if !broker.claim() {
@@ -112,5 +142,23 @@ func TestConfigBrokerRetriesThenDeliversOnce(t *testing.T) {
 	broker.complete(true)
 	if broker.claim() {
 		t.Fatal("claim after successful delivery succeeded")
+	}
+}
+
+func TestDispatcherDropsStaleWorkerCountNotifications(t *testing.T) {
+	d := &Dispatcher{}
+	var mu sync.Mutex
+	var got []int
+	d.onWorkerCount = func(count int) {
+		mu.Lock()
+		got = append(got, count)
+		mu.Unlock()
+	}
+	d.notifyWorkerCount(2, 2)
+	d.notifyWorkerCount(1, 1)
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(got, []int{2}) {
+		t.Fatalf("notifications=%v want=[2]", got)
 	}
 }

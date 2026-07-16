@@ -420,12 +420,11 @@ enum VKCredsPreferences {
     }
 
     static let workersPerRoom = 20
-    static let maxRooms = 4
 
     static var roomHashes: [String] {
         get {
             if let stored = defaults?.stringArray(forKey: roomHashesKey) {
-                return Array(normalizeRoomHashes(stored).prefix(maxRooms))
+                return normalizeRoomHashes(stored)
             }
             // One-time migration: only the previous primary room becomes room 1.
             // The old secondary value was fallback/rotation semantics, not a
@@ -433,7 +432,7 @@ enum VKCredsPreferences {
             return normalizeRoomHashes([primaryCallHash])
         }
         set {
-            let normalized = Array(normalizeRoomHashes(newValue).prefix(maxRooms))
+            let normalized = normalizeRoomHashes(newValue)
             defaults?.set(normalized, forKey: roomHashesKey)
             defaults?.set(normalized.first ?? "", forKey: primaryHashKey)
             // Explicit multi-room semantics do not reuse the legacy secondary

@@ -222,7 +222,7 @@ struct SettingsView: View {
                         Text("VK TURN rooms")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("Paste 1–4 invite links, one per line")
+                        Text("Paste invite links, one per line")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
@@ -248,7 +248,7 @@ struct SettingsView: View {
                         .font(.geist(.medium, size: 12))
                         .foregroundStyle(theme.textMuted)
                     Spacer()
-                    Text("\(roomCount)/4 · \(roomCount * VKCredsPreferences.workersPerRoom) workers")
+                    Text("\(roomCount) · \(roomCount * VKCredsPreferences.workersPerRoom) workers")
                         .font(.geistMono(.semibold, size: 12))
                         .foregroundStyle(theme.text)
                         .padding(.horizontal, 10)
@@ -303,10 +303,6 @@ struct SettingsView: View {
         let oldRooms = VKCredsPreferences.roomHashes
         let derived = syncVKDerivedH2Config()
         let rooms = Self.roomHashes(from: vkRoomsDraft)
-        guard rooms.count <= VKCredsPreferences.maxRooms else {
-            vkCallHashFeedback = "Можно сохранить максимум 4 уникальные комнаты"
-            return
-        }
         VKCredsPreferences.roomHashes = rooms
         VKCredsPreferences.workers = VKCredsPreferences.workersPerRoom
         vkRoomsDraft = rooms.joined(separator: "\n")

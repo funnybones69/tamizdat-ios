@@ -1,7 +1,9 @@
 package socksstub
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -63,7 +65,7 @@ func TestStopVKTurnUpstreamWaitsForWorkerDrain(t *testing.T) {
 
 	go func() {
 		time.Sleep(75 * time.Millisecond)
-		final := wgturnclient.StatsSnapshot{ActiveConnections: 0, BondFramesDown: 7}
+		final := wgturnclient.StatsSnapshot{ActiveConnections: 0, BondFramesDown: 7, RoomDownBytes: make([]int64, 3)}
 		final.RoomDownBytes[2] = 707
 		storeVKTurnTelemetryIfCurrent(runner, final)
 		finishVKTurnRunner(runner, done, nil)
@@ -129,7 +131,7 @@ func TestStopVKTurnUpstreamAsyncReturnsBeforeWorkerDrain(t *testing.T) {
 	if !TURNUpstreamDraining() {
 		t.Fatal("async stop did not gate replacement start while workers drain")
 	}
-	final := wgturnclient.StatsSnapshot{BondFramesDown: 9}
+	final := wgturnclient.StatsSnapshot{BondFramesDown: 9, RoomDownBytes: make([]int64, 2)}
 	final.RoomDownBytes[1] = 909
 	storeVKTurnTelemetryIfCurrent(runner, final)
 	var got struct {
@@ -366,28 +368,51 @@ func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
 		vkturnMu.Unlock()
 	}()
 
-	snapshot := wgturnclient.StatsSnapshot{ActiveConnections: 80, BondFramesUp: 12, BondFramesDown: 13}
+	vkturnExpectedWorkers.Store(120)
+	snapshot := wgturnclient.StatsSnapshot{
+		ActiveConnections: 80,
+		BondFramesUp:      12,
+		BondFramesDown:    13,
+		RoomUpBytes:       make([]int64, 6),
+		RoomDownBytes:     make([]int64, 6),
+	}
 	snapshot.RoomUpBytes[3] = 404
 	snapshot.RoomDownBytes[3] = 505
 	storeVKTurnTelemetryIfCurrent(current, snapshot)
 	staleSnapshot := snapshot
 	staleSnapshot.RoomDownBytes[3] = 999
 	storeVKTurnTelemetryIfCurrent(stale, staleSnapshot)
+	storeVKTurnWorkerCountIfCurrent(current, 44)
+	storeVKTurnWorkerCountIfCurrent(stale, 99)
 
 	var got struct {
-		Active    int  `json:"active"`
-		Running   bool `json:"running"`
+		Active    int   `json:"active"`
+		Expected  int64 `json:"expected"`
+		Running   bool  `json:"running"`
 		Telemetry struct {
-			BondFramesUp  int64    `json:"bond_frames_up"`
-			RoomUpBytes   [4]int64 `json:"room_up_bytes"`
-			RoomDownBytes [4]int64 `json:"room_down_bytes"`
+			BondFramesUp  int64   `json:"bond_frames_up"`
+			RoomUpBytes   []int64 `json:"room_up_bytes"`
+			RoomDownBytes []int64 `json:"room_down_bytes"`
 		} `json:"telemetry"`
 	}
 	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
 		t.Fatal(err)
 	}
-	if !got.Running || got.Active != 80 || got.Telemetry.BondFramesUp != 12 || got.Telemetry.RoomUpBytes[3] != 404 || got.Telemetry.RoomDownBytes[3] != 505 {
+	if !got.Running || got.Active != 44 || got.Expected != 120 || got.Telemetry.BondFramesUp != 12 || got.Telemetry.RoomUpBytes[3] != 404 || got.Telemetry.RoomDownBytes[3] != 505 {
 		t.Fatalf("telemetry JSON=%+v", got)
+	}
+}
+
+func TestVKTurnRequiredFailsClosedWithoutNetstack(t *testing.T) {
+	vkturnNet.Store(nil)
+	SetVKTurnRequired(true)
+	defer SetVKTurnRequired(false)
+
+	if _, err := dialUpstream(context.Background(), "127.0.0.1:9"); !errors.Is(err, errVKTurnRequiredNotReady) {
+		t.Fatalf("TCP error=%v, want fail-closed sentinel", err)
+	}
+	if _, err := dialUpstreamUDP(context.Background(), "127.0.0.1:9"); !errors.Is(err, errVKTurnRequiredNotReady) {
+		t.Fatalf("UDP error=%v, want fail-closed sentinel", err)
 	}
 }
 

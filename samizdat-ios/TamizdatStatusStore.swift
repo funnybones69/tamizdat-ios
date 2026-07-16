@@ -88,6 +88,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     let upstreamKind: String
     let turnRunning: Int
     let turnNetstackReady: Int
+    let turnActiveWorkers: Int
+    let turnExpectedWorkers: Int
 
     /// VK TURN relay session parameters available from the server.
     let hasTURNCreds: Bool
@@ -99,6 +101,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0,
         rewireGeneration: 0, endpointMode: "primary", effectiveEndpoint: "primary",
         desiredUpstream: "h2", upstreamKind: "h2", turnRunning: 0, turnNetstackReady: 0,
+        turnActiveWorkers: 0, turnExpectedWorkers: 0,
         hasTURNCreds: false
     )
 
@@ -112,7 +115,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
         case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
-        case turnRunning, turnNetstackReady
+        case turnRunning, turnNetstackReady, turnActiveWorkers, turnExpectedWorkers
         case hasTURNCreds
     }
 
@@ -127,6 +130,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
          upstreamKind: String = "h2",
          turnRunning: Int = 0,
          turnNetstackReady: Int = 0,
+         turnActiveWorkers: Int = 0,
+         turnExpectedWorkers: Int = 0,
          hasTURNCreds: Bool = false) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
@@ -148,6 +153,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.upstreamKind = upstreamKind
         self.turnRunning = turnRunning
         self.turnNetstackReady = turnNetstackReady
+        self.turnActiveWorkers = turnActiveWorkers
+        self.turnExpectedWorkers = turnExpectedWorkers
         self.hasTURNCreds = hasTURNCreds
     }
 
@@ -173,6 +180,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.upstreamKind = (try? c.decode(String.self, forKey: .upstreamKind)) ?? "h2"
         self.turnRunning = (try? c.decode(Int.self, forKey: .turnRunning)) ?? 0
         self.turnNetstackReady = (try? c.decode(Int.self, forKey: .turnNetstackReady)) ?? 0
+        self.turnActiveWorkers = (try? c.decode(Int.self, forKey: .turnActiveWorkers)) ?? 0
+        self.turnExpectedWorkers = (try? c.decode(Int.self, forKey: .turnExpectedWorkers)) ?? 0
         self.hasTURNCreds = (try? c.decode(Bool.self, forKey: .hasTURNCreds)) ?? false
     }
 }
