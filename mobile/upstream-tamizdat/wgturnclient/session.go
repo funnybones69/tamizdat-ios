@@ -3,12 +3,14 @@ package wgturnclient
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cbeuw/connutil"
@@ -276,6 +278,50 @@ type turnInboundHandler interface {
 	HandleInbound([]byte, net.Addr) (bool, error)
 }
 
+var errTURNInboundFrameTooLarge = errors.New("TURN inbound frame exceeds bounded buffer")
+
+type turnUDPMessageConn interface {
+	ReadMsgUDP([]byte, []byte) (n, oobn, flags int, addr *net.UDPAddr, err error)
+}
+
+type remoteAddrConn interface {
+	RemoteAddr() net.Addr
+}
+
+func readTURNInboundFrame(conn net.PacketConn, buf []byte) (int, net.Addr, error) {
+	// A UDP ReadFrom silently truncates oversized datagrams. ReadMsgUDP exposes
+	// MSG_TRUNC so malformed/oversized server traffic fails the worker cleanly
+	// instead of feeding a partial TURN frame to Pion.
+	if udpConn, ok := conn.(turnUDPMessageConn); ok {
+		n, _, flags, from, err := udpConn.ReadMsgUDP(buf, nil)
+		if err != nil {
+			return 0, nil, err
+		}
+		if n < 0 || n > len(buf) || flags&syscall.MSG_TRUNC != 0 {
+			return 0, nil, fmt.Errorf("%w: n=%d capacity=%d", errTURNInboundFrameTooLarge, n, len(buf))
+		}
+		var addr net.Addr = from
+		if addr == nil {
+			if connected, ok := conn.(remoteAddrConn); ok {
+				addr = connected.RemoteAddr()
+			}
+		}
+		return n, addr, nil
+	}
+
+	// Pion STUNConn may report the complete stream-frame length even when the
+	// caller's buffer is smaller. Check before slicing to avoid a panic on a
+	// large ChannelData frame.
+	n, from, err := conn.ReadFrom(buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	if n < 0 || n > len(buf) {
+		return 0, nil, fmt.Errorf("%w: n=%d capacity=%d", errTURNInboundFrameTooLarge, n, len(buf))
+	}
+	return n, from, nil
+}
+
 // listenTURNInbound is the memory-bounded equivalent of pion/turn Client.Listen.
 // Pion's helper always retains a 65535-byte buffer per worker; our overlay has a
 // much smaller, explicit frame ceiling. Keeping this loop local also makes the
@@ -284,7 +330,7 @@ type turnInboundHandler interface {
 func listenTURNInbound(conn net.PacketConn, handler turnInboundHandler) error {
 	buf := make([]byte, turnInboundReadBufferSize)
 	for {
-		n, from, err := conn.ReadFrom(buf)
+		n, from, err := readTURNInboundFrame(conn, buf)
 		if err != nil {
 			return err
 		}
@@ -486,6 +532,10 @@ func RunSession(
 		listenErr := listenTURNInbound(turnConn, tc)
 		if ctx.Err() == nil && listenErr != nil {
 			emitEvent(onEvent, "warn", "TURN inbound loop stopped worker=%d err=%s", sessionID, sanitizeErrForEvent(listenErr))
+			// Make a bounded-reader failure terminate this worker promptly. Without
+			// closing the transport, Allocate/relay reads could linger until their
+			// next timeout with no inbound loop left to service transactions.
+			_ = turnConn.Close()
 		}
 	}()
 

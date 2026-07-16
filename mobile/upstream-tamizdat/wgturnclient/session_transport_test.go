@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -128,6 +129,64 @@ func TestListenTURNInboundUsesBoundedBuffer(t *testing.T) {
 	}
 	if err := <-errCh; !errors.Is(err, io.EOF) {
 		t.Fatalf("listenTURNInbound error=%v, want EOF", err)
+	}
+}
+
+func TestListenTURNInboundRejectsOversizedSTUNConnFrameWithoutPanic(t *testing.T) {
+	clientSide, serverSide := net.Pipe()
+	defer clientSide.Close()
+	defer serverSide.Close()
+
+	const payloadSize = turnInboundReadBufferSize + 1024
+	frame := make([]byte, 4+payloadSize)
+	binary.BigEndian.PutUint16(frame[0:2], 0x4000) // valid TURN ChannelData number
+	binary.BigEndian.PutUint16(frame[2:4], payloadSize)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := serverSide.Write(frame)
+		writeErr <- err
+	}()
+
+	handler := &recordingTURNInboundHandler{payload: make(chan []byte, 1)}
+	err := listenTURNInbound(turn.NewSTUNConn(clientSide), handler)
+	if !errors.Is(err, errTURNInboundFrameTooLarge) {
+		t.Fatalf("oversized STUNConn frame error=%v, want %v", err, errTURNInboundFrameTooLarge)
+	}
+	select {
+	case got := <-handler.payload:
+		t.Fatalf("oversized frame reached handler: %d bytes", len(got))
+	default:
+	}
+	if err := <-writeErr; err != nil {
+		t.Fatalf("write oversized ChannelData frame: %v", err)
+	}
+}
+
+func TestListenTURNInboundRejectsTruncatedUDPDatagram(t *testing.T) {
+	server, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen UDP server: %v", err)
+	}
+	defer server.Close()
+	client, err := net.DialUDP("udp4", nil, server.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("dial UDP server: %v", err)
+	}
+	defer client.Close()
+
+	payload := make([]byte, turnInboundReadBufferSize+1)
+	if _, err := server.WriteToUDP(payload, client.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("write oversized UDP datagram: %v", err)
+	}
+	handler := &recordingTURNInboundHandler{payload: make(chan []byte, 1)}
+	err = listenTURNInbound(&connectedUDPConn{client}, handler)
+	if !errors.Is(err, errTURNInboundFrameTooLarge) {
+		t.Fatalf("oversized UDP datagram error=%v, want %v", err, errTURNInboundFrameTooLarge)
+	}
+	select {
+	case got := <-handler.payload:
+		t.Fatalf("truncated UDP datagram reached handler: %d bytes", len(got))
+	default:
 	}
 }
 

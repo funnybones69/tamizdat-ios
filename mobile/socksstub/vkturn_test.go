@@ -473,30 +473,6 @@ func TestParseVKTurnRoomCredsJSONRejectsPartialDuplicateAndStaleBundles(t *testi
 	}
 }
 
-func TestParseVKTurnRoomCredsJSONSupportsSixRooms(t *testing.T) {
-	fresh := time.Now().Unix()
-	room := func(hash string) string {
-		return fmt.Sprintf(`{"hash":%q,"credentials":{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600,"acquired_at_unix":%d}}`, hash, fresh)
-	}
-	bundle := `{"rooms":[` + strings.Join([]string{
-		room("room-a"), room("room-b"), room("room-c"),
-		room("room-d"), room("room-e"), room("room-f"),
-	}, ",") + `]}`
-
-	hashes, creds, err := parseVKTurnRoomCredsJSON(bundle)
-	if err != nil {
-		t.Fatalf("six-room gomobile bundle: %v", err)
-	}
-	if len(hashes) != 6 || len(creds) != 6 {
-		t.Fatalf("six-room bundle sizes hashes=%d creds=%d", len(hashes), len(creds))
-	}
-	for i, want := range []string{"room-a", "room-b", "room-c", "room-d", "room-e", "room-f"} {
-		if hashes[i] != want || creds[want] == nil {
-			t.Fatalf("room %d: hash=%q hasCreds=%t", i, hashes[i], creds[want] != nil)
-		}
-	}
-}
-
 func TestParseVKTurnRoomCredsJSONEnforcesIOSResourceRoomLimit(t *testing.T) {
 	fresh := time.Now().Unix()
 	room := func(index int) string {
@@ -510,13 +486,13 @@ func TestParseVKTurnRoomCredsJSONEnforcesIOSResourceRoomLimit(t *testing.T) {
 		return `{"rooms":[` + strings.Join(rooms, ",") + `]}`
 	}
 
-	if VKTurnMaxRooms() != 8 {
-		t.Fatalf("VKTurnMaxRooms()=%d, want 8", VKTurnMaxRooms())
+	if VKTurnMaxRooms() != 4 {
+		t.Fatalf("VKTurnMaxRooms()=%d, want 4", VKTurnMaxRooms())
 	}
 	if hashes, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms())); err != nil || len(hashes) != VKTurnMaxRooms() {
 		t.Fatalf("max-room bundle rejected: hashes=%d err=%v", len(hashes), err)
 	}
-	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 8") {
+	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 4") {
 		t.Fatalf("max+1 bundle error = %v, want iOS room-limit rejection", err)
 	}
 }

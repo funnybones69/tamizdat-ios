@@ -81,9 +81,19 @@ func SetVKTurnRequired(required bool) {
 // VKTurnRequired is exposed for status and regression tests.
 func VKTurnRequired() bool { return vkturnRequired.Load() }
 
-// VKTurnMaxRooms exposes the resource-derived iOS room limit to Swift so the
-// settings UI and the gomobile data-plane gate cannot drift.
-func VKTurnMaxRooms() int { return wgturnclient.MaxBudgetedRooms(vkturnWorkersPerRoom) }
+const vkturnIOSDeviceMaxRooms = 4
+
+// VKTurnMaxRooms exposes the iOS-only room limit to Swift so Settings, App
+// Group storage and the gomobile data-plane gate cannot drift. The generic
+// wgturn protocol remains dynamic; this stricter ceiling is a Network Extension
+// resource gate proven by a real 5x20 memory-pressure incident.
+func VKTurnMaxRooms() int {
+	budgeted := wgturnclient.MaxBudgetedRooms(vkturnWorkersPerRoom)
+	if budgeted < vkturnIOSDeviceMaxRooms {
+		return budgeted
+	}
+	return vkturnIOSDeviceMaxRooms
+}
 
 const (
 	vkturnConfigAttachTimeout   = 60 * time.Second

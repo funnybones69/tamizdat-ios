@@ -135,12 +135,18 @@ const (
 )
 
 var (
+	fwdUDPIdleTimeout   = 60 * time.Second
+	fwdUDPSweepInterval = 15 * time.Second
+)
+
+var (
 	// The historical 128-entry cap lives inside each FWD_UDP session. Modern
 	// browsers open many such sessions, so that local cap did not bound the
 	// process: a production heap contained ~93 simultaneous 64 KiB reverse
 	// buffers. This semaphore is the actual process-wide 4 MiB buffer budget.
 	fwdUDPGlobalSlots = make(chan struct{}, fwdUDPGlobalMaxEntries)
 	fwdUDPBudgetLogAt atomic.Int64
+	fwdUDPBudgetDrops atomic.Uint64
 )
 
 func tryAcquireFwdUDPGlobalEntry() bool {
@@ -153,7 +159,13 @@ func tryAcquireFwdUDPGlobalEntry() bool {
 }
 
 func releaseFwdUDPGlobalEntry() {
-	<-fwdUDPGlobalSlots
+	// Defensive non-blocking release: every owned entry uses sync.Once, while
+	// dial/race failures release their unowned reservation directly. If a future
+	// invariant regression double-releases, do not deadlock the Network Extension.
+	select {
+	case <-fwdUDPGlobalSlots:
+	default:
+	}
 }
 
 func logFwdUDPGlobalBudgetExhausted(idx uint64) {
@@ -162,7 +174,7 @@ func logFwdUDPGlobalBudgetExhausted(idx uint64) {
 	if now-last < int64(5*time.Second) || !fwdUDPBudgetLogAt.CompareAndSwap(last, now) {
 		return
 	}
-	rt.appendLog(fmt.Sprintf("warn: udp#%d global target budget exhausted active=%d max=%d; dropping new target", idx, len(fwdUDPGlobalSlots), fwdUDPGlobalMaxEntries))
+	rt.appendLog(fmt.Sprintf("warn: udp#%d global target budget exhausted active=%d max=%d drops=%d; dropping new target", idx, len(fwdUDPGlobalSlots), fwdUDPGlobalMaxEntries, fwdUDPBudgetDrops.Load()))
 }
 
 // Log file mirror — same App Group file the extension writes to. The
@@ -1218,7 +1230,13 @@ func (a *udpDestAddr) String() string  { return a.s }
 // Now: a process-wide 4 MiB / 64-entry reverse-buffer budget, per-entry idle
 // timer (60 s, reset on every forward/reverse datagram), and a lazy sweep of
 // expired entries on each forward datagram.
+type fwdUDPDialFunc func(context.Context, string) (net.PacketConn, error)
+
 func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
+	handleFwdUDPWithDial(ctx, client, idx, dialUpstreamUDP)
+}
+
+func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial fwdUDPDialFunc) {
 	if err := sendReply(client, socksReplySuccess); err != nil {
 		rt.appendLog(fmt.Sprintf("warn: udp#%d reply write: %v", idx, err))
 		return
@@ -1239,7 +1257,6 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		lastActive  atomic.Int64 // unix nanos, reset on every forward/reverse activity
 		releaseOnce sync.Once    // release exactly one process-wide target slot
 	}
-	const fwdUDPIdleNanos = 60 * 1_000_000_000 // 60 s idle → evict
 	var (
 		pcMu      sync.Mutex
 		pcs       = make(map[pcKey]*pcEntry)
@@ -1269,10 +1286,10 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 	}
 	defer closeAll()
 
-	// Sweep entries idle longer than fwdUDPIdleNanos. Caller holds pcMu.
+	// Sweep entries idle longer than fwdUDPIdleTimeout. Caller holds pcMu.
 	sweepIdleLocked := func(nowNano int64) {
 		for k, e := range pcs {
-			if nowNano-e.lastActive.Load() > fwdUDPIdleNanos {
+			if nowNano-e.lastActive.Load() > int64(fwdUDPIdleTimeout) {
 				delete(pcs, k)
 				closeEntry(e)
 				evictions.Add(1)
@@ -1340,7 +1357,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 
 	// Periodic idle sweep so entries that go silent (closed peer with
 	// no further activity) get reaped even when the map isn't full.
-	sweepTicker := time.NewTicker(15 * time.Second)
+	sweepTicker := time.NewTicker(fwdUDPSweepInterval)
 	defer sweepTicker.Stop()
 	go func() {
 		for {
@@ -1406,6 +1423,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			}
 			pcMu.Unlock()
 			if !tryAcquireFwdUDPGlobalEntry() {
+				fwdUDPBudgetDrops.Add(1)
 				logFwdUDPGlobalBudgetExhausted(idx)
 				continue
 			}
@@ -1416,7 +1434,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			// underlying samizdat.DialUDP enough headroom for cold-cache
 			// transport setup (TCP dial + uTLS handshake + H2 settings).
 			dialCtx, dialCancel := context.WithTimeout(subCtx, 20*time.Second)
-			pc, derr := dialUpstreamUDP(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+			pc, derr := dial(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
 			dialCancel()
 			if derr != nil {
 				releaseFwdUDPGlobalEntry()

@@ -270,11 +270,35 @@ final class TURNCredsStore {
               let rooms = try? JSONDecoder.iso8601.decode([VKTURNRoomCredentials].self, from: data)
         else { return [] }
         guard rooms.count <= VKCredsPreferences.maxRooms else {
-            defaults?.removeObject(forKey: Self.roomStorageKey)
-            defaults?.removeObject(forKey: Self.roomJSONKey)
+            clear()
+            VKCredsPreferences.noteRoomLimitReset()
             return []
         }
         return rooms
+    }
+
+    /// The Network Extension consumes the raw App Group JSON directly. Validate
+    /// that process-boundary payload before attach so an old 5+ room bundle
+    /// cannot bypass the current iOS device limit even if decoded storage was
+    /// already removed by the main app.
+    func validatedRoomBundleJSON() -> String? {
+        guard let raw = defaults?.string(forKey: Self.roomJSONKey), !raw.isEmpty else {
+            return nil
+        }
+        guard let data = raw.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rooms = object["rooms"] as? [Any],
+              !rooms.isEmpty
+        else {
+            clear()
+            return nil
+        }
+        guard rooms.count <= VKCredsPreferences.maxRooms else {
+            clear()
+            VKCredsPreferences.noteRoomLimitReset()
+            return nil
+        }
+        return raw
     }
 
     @discardableResult
@@ -420,6 +444,7 @@ enum VKCredsPreferences {
     private static let peerAddrKey = "tamizdat.vkPeerAddr"
     private static let connectPasswordKey = "tamizdat.vkConnectPassword"
     private static let workersKey = "tamizdat.vkWorkers"
+    private static let roomLimitResetNoticeKey = "tamizdat.vkRoomLimitResetNotice"
 
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
@@ -434,7 +459,16 @@ enum VKCredsPreferences {
     static var roomHashes: [String] {
         get {
             if let stored = defaults?.stringArray(forKey: roomHashesKey) {
-                return normalizeRoomHashes(stored)
+                let normalized = normalizeRoomHashes(stored)
+                guard normalized.count <= maxRooms else {
+                    defaults?.removeObject(forKey: roomHashesKey)
+                    defaults?.set("", forKey: primaryHashKey)
+                    defaults?.set("", forKey: secondaryHashKey)
+                    TURNCredsStore.shared.clear()
+                    noteRoomLimitReset()
+                    return []
+                }
+                return normalized
             }
             // One-time migration: only the previous primary room becomes room 1.
             // The old secondary value was fallback/rotation semantics, not a
@@ -443,6 +477,7 @@ enum VKCredsPreferences {
         }
         set {
             let normalized = normalizeRoomHashes(newValue)
+            guard normalized.count <= maxRooms else { return }
             defaults?.set(normalized, forKey: roomHashesKey)
             defaults?.set(normalized.first ?? "", forKey: primaryHashKey)
             // Explicit multi-room semantics do not reuse the legacy secondary
@@ -464,7 +499,19 @@ enum VKCredsPreferences {
     }
 
     static func normalizeRoomHashes(_ raw: [String]) -> [String] {
-        Array(normalizeAllRoomHashes(raw).prefix(maxRooms))
+        normalizeAllRoomHashes(raw)
+    }
+
+    static func noteRoomLimitReset() {
+        defaults?.set(true, forKey: roomLimitResetNoticeKey)
+    }
+
+    static func consumeRoomLimitResetNotice() -> Bool {
+        let pending = defaults?.bool(forKey: roomLimitResetNoticeKey) ?? false
+        if pending {
+            defaults?.removeObject(forKey: roomLimitResetNoticeKey)
+        }
+        return pending
     }
 
     static func normalizeAllRoomHashes(_ raw: [String]) -> [String] {

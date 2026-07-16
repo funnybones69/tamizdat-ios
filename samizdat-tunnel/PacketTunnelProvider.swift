@@ -31,6 +31,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private struct MemoryPressureState {
         var lastNuclearCloseAt = Date.distantPast
         var didDumpHeap = false
+        var criticalEvents = 0
     }
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
@@ -348,7 +349,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // Prefer the atomic multi-room bundle. Legacy single-room JSON remains
         // readable so existing installs can refresh once after upgrading.
-        let roomBundleJSON = defaults?.string(forKey: TURNCredsStore.roomJSONKey)
+        let roomBundleJSON = TURNCredsStore.shared.validatedRoomBundleJSON()
         let legacyCredsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
         guard (roomBundleJSON?.isEmpty == false) || (legacyCredsJSON?.isEmpty == false) else {
             ExtLog.warn("[vkturn] attach SKIPPED — no complete credential bundle in App Group")
@@ -517,7 +518,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func refreshVKTurnCredsFromAppGroup() -> String {
         let groupID = "group.com.anarki.samizdat-test"
         let defaults = UserDefaults(suiteName: groupID)
-        let roomBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)
+        let roomBundle = TURNCredsStore.shared.validatedRoomBundleJSON()
         let legacyJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
 
         let beforeMs = Date()
@@ -1001,7 +1002,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             SocksstubSetVKTurnRequired(true)
             SocksstubStopVKTurnUpstream()
             let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
-            let hasBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)?.isEmpty == false
+            let hasBundle = TURNCredsStore.shared.validatedRoomBundleJSON()?.isEmpty == false
             let hasLegacy = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")?.isEmpty == false
             guard hasBundle || hasLegacy else {
                 appendExtLog("warn: VK TURN restart skipped — no credential payload in App Group")
@@ -1504,14 +1505,15 @@ misc:
 
     private func handleCriticalMemoryPressure(reason: String) -> Bool {
         let now = Date()
-        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool) in
+        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool, stopTURN: Bool) in
             guard now.timeIntervalSince(state.lastNuclearCloseAt) >= Self.memoryPressureCooldown else {
-                return (false, false)
+                return (false, false, false)
             }
             state.lastNuclearCloseAt = now
+            state.criticalEvents += 1
             let shouldDump = !state.didDumpHeap
             state.didDumpHeap = true
-            return (true, shouldDump)
+            return (true, shouldDump, state.criticalEvents >= 2)
         }
         guard decision.run else { return false }
 
@@ -1520,6 +1522,14 @@ misc:
         }
         let closed = SocksstubCloseAllFlows()
         appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — nuclear close (\(closed) flows); cooldown=60s")
+        if decision.stopTURN && SocksstubTURNUpstreamRunning() {
+            // Repeated pressure means closing app flows did not reduce the
+            // long-lived TURN/DTLS footprint. Stop the runner asynchronously;
+            // desired TURN remains fail-closed and status becomes pending
+            // instead of repeatedly shedding flows until iOS jetsams us.
+            SocksstubStopVKTurnUpstreamAsync()
+            appendExtLog("error: memorypressure repeated — TURN runner stopped to prevent jetsam; reconnect required")
+        }
         return true
     }
 
