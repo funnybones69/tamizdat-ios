@@ -25,10 +25,13 @@ const (
 	readBufSize             = 1600
 	singleRoomSocketBufSize = 625 * 1024
 	multiRoomSocketBufSize  = 128 * 1024
-	multiRoomSocketBudget   = 20 * 1024 * 1024
-	multiRoomQueueBudget    = 2 * 1024 * 1024
-	minWorkerSocketBufSize  = 8 * 1024
-	minWorkerSendBuf        = 4
+	// iOS Network Extensions have a tight process + kernel memory budget.
+	// SetReadBuffer/SetWriteBuffer are per worker and the kernel may account
+	// more than the requested size, so keep the aggregate request conservative.
+	multiRoomSocketBudget  = 8 * 1024 * 1024
+	multiRoomQueueBudget   = 1 * 1024 * 1024
+	minWorkerSocketBufSize = 8 * 1024
+	minWorkerSendBuf       = 4
 	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696.
 	// Cap concurrent DTLS handshakes to 3 to stop the OK CDN TURN
 	// server from rate-limiting the whole worker group when many
@@ -46,17 +49,19 @@ type sessionMemoryProfile struct {
 
 func memoryProfileForWorkers(workers int) sessionMemoryProfile {
 	if workers > maxWorkersPerRoom {
-		socketBuffer := multiRoomSocketBufSize
-		sendBuffer := multiRoomWorkerSendBuf
-		if workers > 80 {
-			socketBuffer = multiRoomSocketBudget / workers / 2
-			if socketBuffer < minWorkerSocketBufSize {
-				socketBuffer = minWorkerSocketBufSize
-			}
-			sendBuffer = multiRoomQueueBudget / workers / readBufSize
-			if sendBuffer < minWorkerSendBuf {
-				sendBuffer = minWorkerSendBuf
-			}
+		socketBuffer := multiRoomSocketBudget / workers / 2
+		if socketBuffer > multiRoomSocketBufSize {
+			socketBuffer = multiRoomSocketBufSize
+		}
+		if socketBuffer < minWorkerSocketBufSize {
+			socketBuffer = minWorkerSocketBufSize
+		}
+		sendBuffer := multiRoomQueueBudget / workers / readBufSize
+		if sendBuffer > multiRoomWorkerSendBuf {
+			sendBuffer = multiRoomWorkerSendBuf
+		}
+		if sendBuffer < minWorkerSendBuf {
+			sendBuffer = minWorkerSendBuf
 		}
 		return sessionMemoryProfile{
 			socketBufferSize: socketBuffer,

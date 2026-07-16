@@ -51,11 +51,22 @@ func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T)
 	}
 
 	multi := memoryProfileForWorkers(80)
-	if multi.socketBufferSize != 128*1024 || multi.workerSendBuffer != 32 {
-		t.Fatalf("multi-room profile=%+v, want 128KiB/32", multi)
+	if multi.socketBufferSize != multiRoomSocketBudget/80/2 || multi.workerSendBuffer != multiRoomQueueBudget/80/readBufSize {
+		t.Fatalf("multi-room profile=%+v, want budget-derived profile", multi)
 	}
-	if got := 80 * multi.socketBufferSize * 2; got > 20*1024*1024 {
-		t.Fatalf("multi-room requested socket memory=%d, want <=20MiB", got)
+	if got := 80 * multi.socketBufferSize * 2; got > multiRoomSocketBudget {
+		t.Fatalf("multi-room requested socket memory=%d, budget=%d", got, multiRoomSocketBudget)
+	}
+	if got := 80 * multi.workerSendBuffer * readBufSize; got > multiRoomQueueBudget {
+		t.Fatalf("multi-room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
+	}
+
+	twoRooms := memoryProfileForWorkers(40)
+	if got := 40 * twoRooms.socketBufferSize * 2; got > multiRoomSocketBudget {
+		t.Fatalf("two-room requested socket memory=%d, budget=%d", got, multiRoomSocketBudget)
+	}
+	if got := 40 * twoRooms.workerSendBuffer * readBufSize; got > multiRoomQueueBudget {
+		t.Fatalf("two-room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
 	}
 
 	scaled := memoryProfileForWorkers(120)
@@ -63,7 +74,7 @@ func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T)
 		t.Fatalf("scaled socket memory=%d, budget=%d", got, multiRoomSocketBudget)
 	}
 	if scaled.workerSendBuffer >= multi.workerSendBuffer {
-		t.Fatalf("scaled queue=%d, want below legacy %d", scaled.workerSendBuffer, multi.workerSendBuffer)
+		t.Fatalf("scaled queue=%d, want below 80-worker queue %d", scaled.workerSendBuffer, multi.workerSendBuffer)
 	}
 }
 
