@@ -32,6 +32,11 @@ const (
 	multiRoomQueueBudget   = 1 * 1024 * 1024
 	minWorkerSocketBufSize = 8 * 1024
 	minWorkerSendBuf       = 4
+	// Pion Client.Listen allocates math.MaxUint16 bytes per client. Our TURN
+	// channel carries DTLS records for <=2 KiB overlay frames, so a 4 KiB
+	// inbound buffer preserves protocol headroom while avoiding ~6.1 MiB of
+	// live heap at 100 workers.
+	turnInboundReadBufferSize = 4 * 1024
 	// Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696.
 	// Cap concurrent DTLS handshakes to 3 to stop the OK CDN TURN
 	// server from rate-limiting the whole worker group when many
@@ -267,6 +272,30 @@ func emitEvent(onEvent EventFunc, level, format string, args ...interface{}) {
 	onEvent(level, fmt.Sprintf(format, args...))
 }
 
+type turnInboundHandler interface {
+	HandleInbound([]byte, net.Addr) (bool, error)
+}
+
+// listenTURNInbound is the memory-bounded equivalent of pion/turn Client.Listen.
+// Pion's helper always retains a 65535-byte buffer per worker; our overlay has a
+// much smaller, explicit frame ceiling. Keeping this loop local also makes the
+// allocation visible to tests and prevents a dependency upgrade from silently
+// restoring the per-worker 64 KiB cost.
+func listenTURNInbound(conn net.PacketConn, handler turnInboundHandler) error {
+	buf := make([]byte, turnInboundReadBufferSize)
+	for {
+		n, from, err := conn.ReadFrom(buf)
+		if err != nil {
+			return err
+		}
+		if _, err := handler.HandleInbound(buf[:n], from); err != nil {
+			// Match Client.Listen semantics: an inbound parsing error stops this
+			// worker's listener rather than spinning on a broken packet stream.
+			return err
+		}
+	}
+}
+
 func sanitizeErrForEvent(err error) string {
 	if err == nil {
 		return ""
@@ -453,9 +482,12 @@ func RunSession(
 	}
 	defer tc.Close()
 
-	if err = tc.Listen(); err != nil {
-		return false, fmt.Errorf("TURN Listen: %w", err)
-	}
+	go func() {
+		listenErr := listenTURNInbound(turnConn, tc)
+		if ctx.Err() == nil && listenErr != nil {
+			emitEvent(onEvent, "warn", "TURN inbound loop stopped worker=%d err=%s", sessionID, sanitizeErrForEvent(listenErr))
+		}
+	}()
 
 	emitEvent(onEvent, "info", "allocate start worker=%d proto=%s scheme=%s transport=%s", sessionID, proto, endpoint.Scheme, endpoint.Transport)
 	relay, err := tc.Allocate()

@@ -5,12 +5,15 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pion/turn/v5"
 )
 
 func TestSelectTurnEndpointFiltersV2ByRequestedUDPTransport(t *testing.T) {
@@ -111,6 +114,97 @@ func TestDialTurnStreamTunesRawTCPBeforeTLSWrap(t *testing.T) {
 	}
 }
 
+func TestListenTURNInboundUsesBoundedBuffer(t *testing.T) {
+	conn := &recordingTURNPacketConn{bufferSize: make(chan int, 1)}
+	handler := &recordingTURNInboundHandler{payload: make(chan []byte, 1)}
+	errCh := make(chan error, 1)
+	go func() { errCh <- listenTURNInbound(conn, handler) }()
+
+	if got := <-conn.bufferSize; got != turnInboundReadBufferSize {
+		t.Fatalf("TURN inbound read buffer=%d, want %d", got, turnInboundReadBufferSize)
+	}
+	if got := string(<-handler.payload); got != "packet" {
+		t.Fatalf("TURN inbound payload=%q, want packet", got)
+	}
+	if err := <-errCh; !errors.Is(err, io.EOF) {
+		t.Fatalf("listenTURNInbound error=%v, want EOF", err)
+	}
+}
+
+func TestListenTURNInboundSupportsRealTURNAllocate(t *testing.T) {
+	const (
+		realm    = "bounded-listener.test"
+		username = "test-user"
+		password = "test-password"
+	)
+	serverConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen TURN server: %v", err)
+	}
+	server, err := turn.NewServer(turn.ServerConfig{
+		Realm: realm,
+		AuthHandler: func(attrs *turn.RequestAttributes) (string, []byte, bool) {
+			if attrs.Username != username || attrs.Realm != realm {
+				return "", nil, false
+			}
+			return username, turn.GenerateAuthKey(username, realm, password), true
+		},
+		PacketConnConfigs: []turn.PacketConnConfig{{
+			PacketConn: serverConn,
+			RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
+				RelayAddress: net.ParseIP("127.0.0.1"),
+				Address:      "127.0.0.1",
+			},
+		}},
+		LoggerFactory: &NullLoggerFactory{},
+	})
+	if err != nil {
+		_ = serverConn.Close()
+		t.Fatalf("new TURN server: %v", err)
+	}
+	defer server.Close()
+
+	clientConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen TURN client: %v", err)
+	}
+	defer clientConn.Close()
+	client, err := turn.NewClient(&turn.ClientConfig{
+		STUNServerAddr: serverConn.LocalAddr().String(),
+		TURNServerAddr: serverConn.LocalAddr().String(),
+		Conn:           clientConn,
+		Username:       username,
+		Password:       password,
+		LoggerFactory:  &NullLoggerFactory{},
+	})
+	if err != nil {
+		t.Fatalf("new TURN client: %v", err)
+	}
+	defer client.Close()
+	listenErr := make(chan error, 1)
+	go func() { listenErr <- listenTURNInbound(clientConn, client) }()
+
+	relay, err := client.Allocate()
+	if err != nil {
+		t.Fatalf("TURN Allocate through bounded listener: %v", err)
+	}
+	if relay.LocalAddr() == nil {
+		t.Fatal("TURN Allocate returned no relay address")
+	}
+	if err := relay.Close(); err != nil {
+		t.Fatalf("close TURN relay: %v", err)
+	}
+	_ = clientConn.Close()
+	select {
+	case err := <-listenErr:
+		if err == nil {
+			t.Fatal("bounded listener stopped without close error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded listener did not stop after PacketConn close")
+	}
+}
+
 func TestRunDTLSHandshakeWithThrottleReleasesSlotOnSuccessAndError(t *testing.T) {
 	resetHandshakeSemForTest(t)
 
@@ -143,6 +237,35 @@ func TestRunDTLSHandshakeWithThrottleTimesOutWhenFull(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "DTLS handshake throttle") {
 		t.Fatalf("runDTLSHandshakeWithThrottle full semaphore error = %v", err)
 	}
+}
+
+type recordingTURNPacketConn struct {
+	reads      int
+	bufferSize chan int
+}
+
+func (c *recordingTURNPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	if c.reads > 0 {
+		return 0, nil, io.EOF
+	}
+	c.reads++
+	c.bufferSize <- len(p)
+	return copy(p, "packet"), &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3478}, nil
+}
+func (*recordingTURNPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) { return len(p), nil }
+func (*recordingTURNPacketConn) Close() error                              { return nil }
+func (*recordingTURNPacketConn) LocalAddr() net.Addr                       { return &net.UDPAddr{} }
+func (*recordingTURNPacketConn) SetDeadline(time.Time) error               { return nil }
+func (*recordingTURNPacketConn) SetReadDeadline(time.Time) error           { return nil }
+func (*recordingTURNPacketConn) SetWriteDeadline(time.Time) error          { return nil }
+
+type recordingTURNInboundHandler struct {
+	payload chan []byte
+}
+
+func (h *recordingTURNInboundHandler) HandleInbound(data []byte, _ net.Addr) (bool, error) {
+	h.payload <- append([]byte(nil), data...)
+	return true, nil
 }
 
 type fakeDTLSHandshaker struct {

@@ -128,6 +128,43 @@ type flowState struct {
 
 var flowRegistry sync.Map // idx (uint64) → *flowState
 
+const (
+	fwdUDPReverseBufferSize  = 64 * 1024
+	fwdUDPGlobalBufferBudget = 4 * 1024 * 1024
+	fwdUDPGlobalMaxEntries   = fwdUDPGlobalBufferBudget / fwdUDPReverseBufferSize
+)
+
+var (
+	// The historical 128-entry cap lives inside each FWD_UDP session. Modern
+	// browsers open many such sessions, so that local cap did not bound the
+	// process: a production heap contained ~93 simultaneous 64 KiB reverse
+	// buffers. This semaphore is the actual process-wide 4 MiB buffer budget.
+	fwdUDPGlobalSlots = make(chan struct{}, fwdUDPGlobalMaxEntries)
+	fwdUDPBudgetLogAt atomic.Int64
+)
+
+func tryAcquireFwdUDPGlobalEntry() bool {
+	select {
+	case fwdUDPGlobalSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseFwdUDPGlobalEntry() {
+	<-fwdUDPGlobalSlots
+}
+
+func logFwdUDPGlobalBudgetExhausted(idx uint64) {
+	now := time.Now().UnixNano()
+	last := fwdUDPBudgetLogAt.Load()
+	if now-last < int64(5*time.Second) || !fwdUDPBudgetLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	rt.appendLog(fmt.Sprintf("warn: udp#%d global target budget exhausted active=%d max=%d; dropping new target", idx, len(fwdUDPGlobalSlots), fwdUDPGlobalMaxEntries))
+}
+
 // Log file mirror — same App Group file the extension writes to. The
 // main-app side calls SetLogSink at startup so SocksStub heartbeats
 // appear in the same unified log the user sees in the LogView.
@@ -1178,8 +1215,8 @@ func (a *udpDestAddr) String() string  { return a.s }
 // lasts the whole tunnel session). 9-minute YouTube → ~300 entries
 // → ~30 MiB silent leak → iOS jetsam.
 //
-// Now: hard cap 128 entries (LRU eviction), per-entry idle timer
-// (60 s, reset on every forward/reverse datagram), lazy sweep of
+// Now: a process-wide 4 MiB / 64-entry reverse-buffer budget, per-entry idle
+// timer (60 s, reset on every forward/reverse datagram), and a lazy sweep of
 // expired entries on each forward datagram.
 func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 	if err := sendReply(client, socksReplySuccess); err != nil {
@@ -1200,14 +1237,12 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 		atyp        byte         // remember the atyp for the reverse frame header
 		addrEncoded []byte       // pre-encoded addr+port bytes (without atyp)
 		lastActive  atomic.Int64 // unix nanos, reset on every forward/reverse activity
+		releaseOnce sync.Once    // release exactly one process-wide target slot
 	}
-	const (
-		fwdUDPMaxEntries = 128                // hard cap on pcs map
-		fwdUDPIdleNanos  = 60 * 1_000_000_000 // 60 s idle → evict
-	)
+	const fwdUDPIdleNanos = 60 * 1_000_000_000 // 60 s idle → evict
 	var (
 		pcMu      sync.Mutex
-		pcs       = make(map[pcKey]*pcEntry, fwdUDPMaxEntries)
+		pcs       = make(map[pcKey]*pcEntry)
 		writeMu   sync.Mutex // serialize TCP writes back to hev
 		datagrams atomic.Uint64
 		evictions atomic.Uint64
@@ -1221,6 +1256,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 	// reverse goroutine path).
 	closeEntry := func(e *pcEntry) {
 		_ = e.pc.Close()
+		e.releaseOnce.Do(releaseFwdUDPGlobalEntry)
 	}
 
 	closeAll := func() {
@@ -1266,7 +1302,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 
 	startReverse := func(key pcKey, e *pcEntry) {
 		go func() {
-			buf := make([]byte, 64*1024)
+			buf := make([]byte, fwdUDPReverseBufferSize)
 			for {
 				n, _, err := e.pc.ReadFrom(buf)
 				if err != nil {
@@ -1362,14 +1398,20 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			e.lastActive.Store(nowNano)
 		} else {
 			// Entry not present — open new tunnel. First make room.
-			if len(pcs) >= fwdUDPMaxEntries {
+			if len(pcs) >= fwdUDPGlobalMaxEntries {
 				sweepIdleLocked(nowNano)
-				if len(pcs) >= fwdUDPMaxEntries {
+				if len(pcs) >= fwdUDPGlobalMaxEntries {
 					evictOldestLocked()
 				}
 			}
 			pcMu.Unlock()
-			// Dial outside the lock — TCP+uTLS+H2 setup is slow.
+			if !tryAcquireFwdUDPGlobalEntry() {
+				logFwdUDPGlobalBudgetExhausted(idx)
+				continue
+			}
+			// Dial outside the lock — TCP+uTLS+H2 setup is slow. The process-wide
+			// target slot is reserved first so concurrent FWD_UDP sessions cannot
+			// all allocate their reverse buffers at once.
 			// IPA-K: 5s was too tight for slow cellular. 20s gives the
 			// underlying samizdat.DialUDP enough headroom for cold-cache
 			// transport setup (TCP dial + uTLS handshake + H2 settings).
@@ -1377,6 +1419,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			pc, derr := dialUpstreamUDP(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
 			dialCancel()
 			if derr != nil {
+				releaseFwdUDPGlobalEntry()
 				rt.appendLog(fmt.Sprintf("warn: udp#%d dial %s:%d: %v", idx, host, port, derr))
 				continue
 			}
@@ -1386,6 +1429,7 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 			// forward loop, but cheap to check).
 			if existing, raced := pcs[key]; raced {
 				_ = pc.Close()
+				releaseFwdUDPGlobalEntry()
 				e = existing
 				e.lastActive.Store(nowNano)
 			} else {
