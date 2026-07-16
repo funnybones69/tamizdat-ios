@@ -47,6 +47,21 @@ type sessionMemoryProfile struct {
 	workerSendBuffer int
 }
 
+// MaxBudgetedRooms returns the largest whole room pool that stays within both
+// aggregate multi-room memory budgets after the minimum per-worker floors are
+// applied.
+func MaxBudgetedRooms(workersPerRoom int) int {
+	if workersPerRoom <= 0 {
+		return 0
+	}
+	maxWorkersBySockets := multiRoomSocketBudget / (2 * minWorkerSocketBufSize)
+	maxWorkersByQueues := multiRoomQueueBudget / (minWorkerSendBuf * readBufSize)
+	if maxWorkersByQueues < maxWorkersBySockets {
+		return maxWorkersByQueues / workersPerRoom
+	}
+	return maxWorkersBySockets / workersPerRoom
+}
+
 func memoryProfileForWorkers(workers int) sessionMemoryProfile {
 	if workers > maxWorkersPerRoom {
 		socketBuffer := multiRoomSocketBudget / workers / 2
@@ -299,6 +314,58 @@ func enqueueSessionReturn(ctx context.Context, d *Dispatcher, stats *Stats, room
 	}
 }
 
+type turnStreamSocket interface {
+	SetNoDelay(bool) error
+	SetReadBuffer(int) error
+	SetWriteBuffer(int) error
+}
+
+func applyTurnStreamMemoryProfile(socket turnStreamSocket, profile sessionMemoryProfile) error {
+	if err := socket.SetNoDelay(true); err != nil {
+		return fmt.Errorf("TCP_NODELAY: %w", err)
+	}
+	if err := socket.SetReadBuffer(profile.socketBufferSize); err != nil {
+		return fmt.Errorf("TCP read buffer: %w", err)
+	}
+	if err := socket.SetWriteBuffer(profile.socketBufferSize); err != nil {
+		return fmt.Errorf("TCP write buffer: %w", err)
+	}
+	return nil
+}
+
+// dialTurnStream tunes the raw TCP socket before any TLS wrapper hides it.
+func dialTurnStream(ctx context.Context, turnAddr string, useTLS bool, tlsConfig *tls.Config, profile sessionMemoryProfile) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	raw, err := dialer.DialContext(ctx, "tcp", turnAddr)
+	if err != nil {
+		return nil, err
+	}
+	tcpConn, ok := raw.(*net.TCPConn)
+	if !ok {
+		_ = raw.Close()
+		return nil, fmt.Errorf("unexpected TURN TCP connection type %T", raw)
+	}
+	if err := applyTurnStreamMemoryProfile(tcpConn, profile); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	if !useTLS {
+		return tcpConn, nil
+	}
+	if tlsConfig == nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("missing TURN TLS config")
+	}
+	tlsConn := tls.Client(tcpConn, tlsConfig)
+	handshakeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
 func RunSession(
 	ctx context.Context,
 	tp *TurnParams,
@@ -355,26 +422,18 @@ func RunSession(
 		_ = c.SetWriteBuffer(memoryProfile.socketBufferSize)
 		turnConn = &connectedUDPConn{c}
 	} else {
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
-		var c net.Conn
-		var dialErr error
+		var tlsConfig *tls.Config
 		if endpoint.UseTLS {
-			c, dialErr = tls.DialWithDialer(dialer, "tcp", turnAddr, &tls.Config{
+			tlsConfig = &tls.Config{
 				MinVersion: tls.VersionTLS12,
 				ServerName: strings.Trim(urlhost, "[]"),
-			})
-		} else {
-			c, dialErr = dialer.Dial("tcp", turnAddr)
+			}
 		}
+		c, dialErr := dialTurnStream(ctx, turnAddr, endpoint.UseTLS, tlsConfig, memoryProfile)
 		if dialErr != nil {
 			return false, fmt.Errorf("подключение TURN %s: %w", proto, dialErr)
 		}
 		defer c.Close()
-		if tc, ok := c.(*net.TCPConn); ok {
-			_ = tc.SetNoDelay(true)
-			_ = tc.SetReadBuffer(memoryProfile.socketBufferSize)
-			_ = tc.SetWriteBuffer(memoryProfile.socketBufferSize)
-		}
 		turnConn = turn.NewSTUNConn(c)
 	}
 	log.Printf("[СЕССИЯ #%d] TURN %s (scheme=%s transport=%s proto=%s)", sessionID, turnAddr, endpoint.Scheme, endpoint.Transport, proto)

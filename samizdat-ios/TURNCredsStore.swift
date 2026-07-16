@@ -1,4 +1,5 @@
 import Foundation
+import SamizdatClient
 
 /// App Group-backed cache for VK TURN session parameters acquired by the
 /// main-app WKWebView handler.
@@ -268,12 +269,17 @@ final class TURNCredsStore {
         guard let data = defaults?.data(forKey: Self.roomStorageKey),
               let rooms = try? JSONDecoder.iso8601.decode([VKTURNRoomCredentials].self, from: data)
         else { return [] }
+        guard rooms.count <= VKCredsPreferences.maxRooms else {
+            defaults?.removeObject(forKey: Self.roomStorageKey)
+            defaults?.removeObject(forKey: Self.roomJSONKey)
+            return []
+        }
         return rooms
     }
 
     @discardableResult
     func saveRooms(_ rooms: [VKTURNRoomCredentials]) -> Bool {
-        guard let defaults, !rooms.isEmpty,
+        guard let defaults, !rooms.isEmpty, rooms.count <= VKCredsPreferences.maxRooms,
               let data = try? JSONEncoder.iso8601.encode(rooms) else { return false }
         let bundleJSON = vkRoomCredsAsJSON(rooms)
         guard !bundleJSON.isEmpty else { return false }
@@ -287,7 +293,7 @@ final class TURNCredsStore {
 
     /// All configured rooms must have a fresh credential snapshot. A partial
     /// bundle is deliberately stale: silently running fewer rooms would make
-    /// the UI claim 4×20 while the data plane used less capacity.
+    /// the UI claim N×20 while the data plane used less capacity.
     var roomsAreFresh: Bool {
         let configured = VKCredsPreferences.roomHashes
         var saved: [String: VKTURNCredentials] = [:]
@@ -420,6 +426,10 @@ enum VKCredsPreferences {
     }
 
     static let workersPerRoom = 20
+    /// Go derives this from the iOS Network Extension's aggregate socket and
+    /// worker-queue budgets. Reading the gomobile value keeps Swift storage
+    /// and the data-plane rejection gate in lockstep.
+    static let maxRooms = Int(SocksstubVKTurnMaxRooms())
 
     static var roomHashes: [String] {
         get {
@@ -454,6 +464,10 @@ enum VKCredsPreferences {
     }
 
     static func normalizeRoomHashes(_ raw: [String]) -> [String] {
+        Array(normalizeAllRoomHashes(raw).prefix(maxRooms))
+    }
+
+    static func normalizeAllRoomHashes(_ raw: [String]) -> [String] {
         var result: [String] = []
         var seen = Set<String>()
         for item in raw {
@@ -463,6 +477,7 @@ enum VKCredsPreferences {
         }
         return result
     }
+
 
     static var primaryCallHash: String {
         get { defaults?.string(forKey: primaryHashKey) ?? "" }

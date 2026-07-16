@@ -2,7 +2,12 @@ package wgturnclient
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +69,48 @@ func TestSelectTurnEndpointFallsBackToLegacyURLsWhenV2Absent(t *testing.T) {
 	}
 }
 
+func TestApplyTurnStreamMemoryProfileTunesRawSocket(t *testing.T) {
+	socket := &recordingTurnStreamSocket{}
+	profile := sessionMemoryProfile{socketBufferSize: 24 * 1024}
+	if err := applyTurnStreamMemoryProfile(socket, profile); err != nil {
+		t.Fatalf("applyTurnStreamMemoryProfile: %v", err)
+	}
+	if !socket.noDelay || socket.readBuffer != profile.socketBufferSize || socket.writeBuffer != profile.socketBufferSize {
+		t.Fatalf("socket tuning = noDelay:%t read:%d write:%d", socket.noDelay, socket.readBuffer, socket.writeBuffer)
+	}
+}
+
+func TestDialTurnStreamTunesRawTCPBeforeTLSWrap(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer server.Close()
+	certificate := server.Certificate()
+	roots := x509.NewCertPool()
+	roots.AddCert(certificate)
+	serverName := ""
+	if len(certificate.DNSNames) > 0 {
+		serverName = certificate.DNSNames[0]
+	} else if len(certificate.IPAddresses) > 0 {
+		serverName = certificate.IPAddresses[0].String()
+	}
+	if serverName == "" {
+		t.Fatal("httptest certificate has no verifiable name")
+	}
+	profile := sessionMemoryProfile{socketBufferSize: 24 * 1024}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, ServerName: serverName}
+	conn, err := dialTurnStream(context.Background(), server.Listener.Addr().String(), true, tlsConfig, profile)
+	if err != nil {
+		t.Fatalf("dialTurnStream TLS: %v", err)
+	}
+	defer conn.Close()
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		t.Fatalf("connection type=%T, want *tls.Conn", conn)
+	}
+	if _, ok := tlsConn.NetConn().(*net.TCPConn); !ok {
+		t.Fatalf("wrapped connection type=%T, want raw *net.TCPConn", tlsConn.NetConn())
+	}
+}
+
 func TestRunDTLSHandshakeWithThrottleReleasesSlotOnSuccessAndError(t *testing.T) {
 	resetHandshakeSemForTest(t)
 
@@ -100,6 +147,27 @@ func TestRunDTLSHandshakeWithThrottleTimesOutWhenFull(t *testing.T) {
 
 type fakeDTLSHandshaker struct {
 	err error
+}
+
+type recordingTurnStreamSocket struct {
+	noDelay     bool
+	readBuffer  int
+	writeBuffer int
+}
+
+func (s *recordingTurnStreamSocket) SetNoDelay(value bool) error {
+	s.noDelay = value
+	return nil
+}
+
+func (s *recordingTurnStreamSocket) SetReadBuffer(value int) error {
+	s.readBuffer = value
+	return nil
+}
+
+func (s *recordingTurnStreamSocket) SetWriteBuffer(value int) error {
+	s.writeBuffer = value
+	return nil
 }
 
 func (f fakeDTLSHandshaker) HandshakeContext(context.Context) error {

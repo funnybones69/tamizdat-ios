@@ -78,6 +78,25 @@ func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T)
 	}
 }
 
+func TestMaxBudgetedRoomsHonorsPerWorkerFloors(t *testing.T) {
+	if got := MaxBudgetedRooms(20); got != 8 {
+		t.Fatalf("MaxBudgetedRooms(20)=%d, want 8", got)
+	}
+	maxWorkers := MaxBudgetedRooms(20) * 20
+	maxProfile := memoryProfileForWorkers(maxWorkers)
+	if got := maxWorkers * maxProfile.socketBufferSize * 2; got > multiRoomSocketBudget {
+		t.Fatalf("max-room socket request=%d, budget=%d", got, multiRoomSocketBudget)
+	}
+	if got := maxWorkers * maxProfile.workerSendBuffer * readBufSize; got > multiRoomQueueBudget {
+		t.Fatalf("max-room queue=%d, budget=%d", got, multiRoomQueueBudget)
+	}
+	maxPlusOneWorkers := (MaxBudgetedRooms(20) + 1) * 20
+	maxPlusOneProfile := memoryProfileForWorkers(maxPlusOneWorkers)
+	if got := maxPlusOneWorkers * maxPlusOneProfile.workerSendBuffer * readBufSize; got <= multiRoomQueueBudget {
+		t.Fatalf("max+1 queue=%d unexpectedly fits budget=%d", got, multiRoomQueueBudget)
+	}
+}
+
 func TestMultiRoomPlannerFourByTwenty(t *testing.T) {
 	plans := buildWorkerGroupPlans(80, 4, 20)
 	if len(plans) != 8 {

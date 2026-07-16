@@ -35,7 +35,7 @@ struct SettingsView: View {
     @State private var pingURL: String = PingURLPreferences.url
     @State private var pingURLDraft: String = PingURLPreferences.url
 
-    // One VK invite per line, up to four rooms. Each room automatically gets
+    // One VK invite per line, up to the resource-derived iOS limit. Each room automatically gets
     // the verified pool size of 20 workers; peer/password still derive from Main.
     @State private var vkRoomsDraft: String = VKCredsPreferences.roomHashes.joined(separator: "\n")
     @State private var vkCallHashFeedback: String = ""
@@ -257,7 +257,7 @@ struct SettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
 
-                Text("Rooms cannot be discovered automatically: VK does not expose the required private calls. Add each invite once; links are normalized and duplicates removed. Every room uses 20 workers automatically.")
+                Text("Rooms cannot be discovered automatically: VK does not expose the required private calls. Add each invite once; links are normalized and duplicates removed. Every room uses 20 workers automatically; iOS allows up to \(VKCredsPreferences.maxRooms) rooms within the tunnel memory budget.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
 
@@ -287,7 +287,7 @@ struct SettingsView: View {
     }
 
     private static func roomHashes(from draft: String) -> [String] {
-        VKCredsPreferences.normalizeRoomHashes(
+        VKCredsPreferences.normalizeAllRoomHashes(
             draft.components(separatedBy: .newlines)
         )
     }
@@ -301,8 +301,12 @@ struct SettingsView: View {
 
     private func saveVKTurnSettings() {
         let oldRooms = VKCredsPreferences.roomHashes
-        let derived = syncVKDerivedH2Config()
         let rooms = Self.roomHashes(from: vkRoomsDraft)
+        guard rooms.count <= VKCredsPreferences.maxRooms else {
+            vkCallHashFeedback = "Максимум \(VKCredsPreferences.maxRooms) комнат (\(VKCredsPreferences.maxRooms * VKCredsPreferences.workersPerRoom) workers) для безопасного лимита памяти"
+            return
+        }
+        let derived = syncVKDerivedH2Config()
         VKCredsPreferences.roomHashes = rooms
         VKCredsPreferences.workers = VKCredsPreferences.workersPerRoom
         vkRoomsDraft = rooms.joined(separator: "\n")

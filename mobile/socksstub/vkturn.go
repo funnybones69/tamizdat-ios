@@ -81,6 +81,10 @@ func SetVKTurnRequired(required bool) {
 // VKTurnRequired is exposed for status and regression tests.
 func VKTurnRequired() bool { return vkturnRequired.Load() }
 
+// VKTurnMaxRooms exposes the resource-derived iOS room limit to Swift so the
+// settings UI and the gomobile data-plane gate cannot drift.
+func VKTurnMaxRooms() int { return wgturnclient.MaxBudgetedRooms(vkturnWorkersPerRoom) }
+
 const (
 	vkturnConfigAttachTimeout   = 60 * time.Second
 	vkturnShutdownWaitTimeout   = 15 * time.Second
@@ -115,8 +119,9 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 	if workersPerRoom != vkturnWorkersPerRoom {
 		return "workersPerRoom must be 20"
 	}
-	if len(hashes) > int(^uint(0)>>1)/workersPerRoom {
-		return "multi-room worker count overflows int"
+	maxRooms := VKTurnMaxRooms()
+	if len(hashes) > maxRooms {
+		return fmt.Sprintf("room count exceeds memory-safe maximum %d", maxRooms)
 	}
 	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, len(hashes)*workersPerRoom, workersPerRoom, hashes, credsByHash, nil, len(bundleJSON))
 }
@@ -621,8 +626,9 @@ func parseVKTurnRoomCredsJSON(bundleJSON string) ([]string, map[string]*wgturncl
 	if len(bundle.Rooms) < 1 {
 		return nil, nil, fmt.Errorf("room count must be at least 1")
 	}
-	if len(bundle.Rooms) > int(^uint(0)>>1)/vkturnWorkersPerRoom {
-		return nil, nil, fmt.Errorf("multi-room worker count overflows int")
+	maxRooms := VKTurnMaxRooms()
+	if len(bundle.Rooms) > maxRooms {
+		return nil, nil, fmt.Errorf("room count exceeds memory-safe maximum %d", maxRooms)
 	}
 	hashes := make([]string, 0, len(bundle.Rooms))
 	credsByHash := make(map[string]*wgturnclient.Credentials, len(bundle.Rooms))
