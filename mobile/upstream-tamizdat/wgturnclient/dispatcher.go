@@ -149,6 +149,9 @@ func (d *Dispatcher) notifyWorkerCount(generation uint64, count int) {
 func (d *Dispatcher) Register(w *WorkerSlot) {
 	d.mu.Lock()
 	d.workers = append(d.workers, w)
+	if d.bondV2 {
+		d.bondSched.invalidateTopology()
+	}
 	count := len(d.workers)
 	d.countGeneration++
 	generation := d.countGeneration
@@ -173,6 +176,9 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 	}
 	remaining := len(d.workers)
 	if removed {
+		if d.bondV2 {
+			d.bondSched.invalidateTopology()
+		}
 		d.countGeneration++
 	}
 	generation := d.countGeneration

@@ -184,6 +184,17 @@ func (s *bondScheduler) ensureTopology(workers []*WorkerSlot) {
 	sort.Ints(s.rooms)
 }
 
+func (s *bondScheduler) invalidateTopology() {
+	clear(s.workers)
+	s.workers = s.workers[:0]
+	s.workerRooms = s.workerRooms[:0]
+	s.rooms = s.rooms[:0]
+	for room, workers := range s.roomWorkers {
+		clear(workers)
+		delete(s.roomWorkers, room)
+	}
+}
+
 func (s *bondScheduler) sameWorkerTopology(current []*WorkerSlot) bool {
 	if len(s.workers) != len(current) || len(s.workerRooms) != len(current) {
 		return false

@@ -295,6 +295,28 @@ func TestBondSchedulerRefreshesChangedTopology(t *testing.T) {
 	}
 }
 
+func TestBondSchedulerInvalidationReleasesCachedWorkers(t *testing.T) {
+	s := newBondScheduler()
+	workers := []*WorkerSlot{
+		{ID: 1, RoomID: 0, SendCh: make(chan []byte, 1)},
+		{ID: 2, RoomID: 1, SendCh: make(chan []byte, 1)},
+	}
+	s.ensureTopology(workers)
+	if len(s.workers) != 2 || len(s.roomWorkers) != 2 {
+		t.Fatalf("topology was not cached: workers=%d rooms=%d", len(s.workers), len(s.roomWorkers))
+	}
+	cachedBacking := s.workers
+	s.invalidateTopology()
+	if len(s.workers) != 0 || len(s.workerRooms) != 0 || len(s.rooms) != 0 || len(s.roomWorkers) != 0 {
+		t.Fatalf("topology was not invalidated: workers=%d workerRooms=%d rooms=%d roomMap=%d", len(s.workers), len(s.workerRooms), len(s.rooms), len(s.roomWorkers))
+	}
+	for i, worker := range cachedBacking {
+		if worker != nil {
+			t.Fatalf("cached worker pointer %d retained after invalidation", i)
+		}
+	}
+}
+
 func TestBondDispatcherUsesIndependentLaneSequences(t *testing.T) {
 	worker := &WorkerSlot{ID: 1, RoomID: 0, SendCh: make(chan []byte, 3)}
 	d := &Dispatcher{workers: []*WorkerSlot{worker}, stats: NewStats(), bondSched: newBondScheduler()}
