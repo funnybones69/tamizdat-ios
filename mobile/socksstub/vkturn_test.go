@@ -473,6 +473,30 @@ func TestParseVKTurnRoomCredsJSONRejectsPartialDuplicateAndStaleBundles(t *testi
 	}
 }
 
+func TestParseVKTurnRoomCredsJSONSupportsSixRooms(t *testing.T) {
+	fresh := time.Now().Unix()
+	room := func(hash string) string {
+		return fmt.Sprintf(`{"hash":%q,"credentials":{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600,"acquired_at_unix":%d}}`, hash, fresh)
+	}
+	bundle := `{"rooms":[` + strings.Join([]string{
+		room("room-a"), room("room-b"), room("room-c"),
+		room("room-d"), room("room-e"), room("room-f"),
+	}, ",") + `]}`
+
+	hashes, creds, err := parseVKTurnRoomCredsJSON(bundle)
+	if err != nil {
+		t.Fatalf("six-room gomobile bundle: %v", err)
+	}
+	if len(hashes) != 6 || len(creds) != 6 {
+		t.Fatalf("six-room bundle sizes hashes=%d creds=%d", len(hashes), len(creds))
+	}
+	for i, want := range []string{"room-a", "room-b", "room-c", "room-d", "room-e", "room-f"} {
+		if hashes[i] != want || creds[want] == nil {
+			t.Fatalf("room %d: hash=%q hasCreds=%t", i, hashes[i], creds[want] != nil)
+		}
+	}
+}
+
 func TestParseVKTurnCredsJSONNormalizesV2SchemeAndTransport(t *testing.T) {
 	creds, err := parseVKTurnCredsJSON(`{
 		"username":"user",

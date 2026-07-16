@@ -85,6 +85,7 @@ const (
 	vkturnConfigAttachTimeout   = 60 * time.Second
 	vkturnShutdownWaitTimeout   = 15 * time.Second
 	vkturnAllocationReleaseWait = 500 * time.Millisecond
+	vkturnWorkersPerRoom        = 20
 	vkturnDefaultWorkers        = 24
 	vkturnMinWorkers            = 12
 	vkturnMaxWorkers            = 72
@@ -111,7 +112,7 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 	if err != nil {
 		return "roomCredsJSON: " + err.Error()
 	}
-	if workersPerRoom != 20 {
+	if workersPerRoom != vkturnWorkersPerRoom {
 		return "workersPerRoom must be 20"
 	}
 	if len(hashes) > int(^uint(0)>>1)/workersPerRoom {
@@ -617,8 +618,11 @@ func parseVKTurnRoomCredsJSON(bundleJSON string) ([]string, map[string]*wgturncl
 	if err := json.Unmarshal([]byte(bundleJSON), &bundle); err != nil {
 		return nil, nil, err
 	}
-	if len(bundle.Rooms) < 1 || len(bundle.Rooms) > 4 {
-		return nil, nil, fmt.Errorf("room count must be 1-4")
+	if len(bundle.Rooms) < 1 {
+		return nil, nil, fmt.Errorf("room count must be at least 1")
+	}
+	if len(bundle.Rooms) > int(^uint(0)>>1)/vkturnWorkersPerRoom {
+		return nil, nil, fmt.Errorf("multi-room worker count overflows int")
 	}
 	hashes := make([]string, 0, len(bundle.Rooms))
 	credsByHash := make(map[string]*wgturnclient.Credentials, len(bundle.Rooms))
