@@ -143,15 +143,65 @@ func bondFramePayload(ft bondFrameType, payload []byte) ([]byte, error) {
 }
 
 type bondScheduler struct {
-	roomRR   int
-	primary  int
-	workerRR map[int]int
+	roomRR      int
+	primary     int
+	workerRR    map[int]int
+	workers     []*WorkerSlot
+	workerRooms []int
+	rooms       []int
+	roomWorkers map[int][]*WorkerSlot
 }
 
-func newBondScheduler() *bondScheduler { return &bondScheduler{workerRR: make(map[int]int)} }
+func newBondScheduler() *bondScheduler {
+	return &bondScheduler{
+		workerRR:    make(map[int]int),
+		roomWorkers: make(map[int][]*WorkerSlot),
+	}
+}
+
+func (s *bondScheduler) ensureTopology(workers []*WorkerSlot) {
+	if s.sameWorkerTopology(workers) {
+		return
+	}
+
+	s.workers = append(s.workers[:0], workers...)
+	s.workerRooms = s.workerRooms[:0]
+	s.rooms = s.rooms[:0]
+	for room := range s.roomWorkers {
+		delete(s.roomWorkers, room)
+	}
+	for _, w := range workers {
+		if w == nil {
+			s.workerRooms = append(s.workerRooms, 0)
+			continue
+		}
+		s.workerRooms = append(s.workerRooms, w.RoomID)
+		if _, ok := s.roomWorkers[w.RoomID]; !ok {
+			s.rooms = append(s.rooms, w.RoomID)
+		}
+		s.roomWorkers[w.RoomID] = append(s.roomWorkers[w.RoomID], w)
+	}
+	sort.Ints(s.rooms)
+}
+
+func (s *bondScheduler) sameWorkerTopology(current []*WorkerSlot) bool {
+	if len(s.workers) != len(current) || len(s.workerRooms) != len(current) {
+		return false
+	}
+	for i := range current {
+		if s.workers[i] != current[i] {
+			return false
+		}
+		if current[i] != nil && s.workerRooms[i] != current[i].RoomID {
+			return false
+		}
+	}
+	return true
+}
 
 func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*WorkerSlot, bool) {
-	rooms := activeRooms(workers)
+	s.ensureTopology(workers)
+	rooms := s.rooms
 	if len(rooms) == 0 {
 		return nil, false
 	}
@@ -165,7 +215,7 @@ func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*Wo
 		}
 		for i := 0; i < len(rooms); i++ {
 			room := rooms[(start+i)%len(rooms)]
-			if w, ok := s.chooseInRoom(workers, room, pkt); ok {
+			if w, ok := s.chooseInRoom(room, pkt); ok {
 				s.primary = room
 				return w, true
 			}
@@ -176,7 +226,7 @@ func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*Wo
 	for i := 0; i < len(rooms); i++ {
 		roomIdx := (start + i) % len(rooms)
 		room := rooms[roomIdx]
-		if w, ok := s.chooseInRoom(workers, room, pkt); ok {
+		if w, ok := s.chooseInRoom(room, pkt); ok {
 			s.roomRR = (roomIdx + 1) % len(rooms)
 			return w, true
 		}
@@ -184,28 +234,13 @@ func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*Wo
 	return nil, false
 }
 
-func activeRooms(workers []*WorkerSlot) []int {
-	seen := make(map[int]struct{}, 4)
-	for _, w := range workers {
-		if w != nil {
-			seen[w.RoomID] = struct{}{}
-		}
-	}
-	rooms := make([]int, 0, len(seen))
-	for room := range seen {
-		rooms = append(rooms, room)
-	}
-	sort.Ints(rooms)
-	return rooms
+func (s *bondScheduler) activeRooms(workers []*WorkerSlot) []int {
+	s.ensureTopology(workers)
+	return s.rooms
 }
 
-func (s *bondScheduler) chooseInRoom(workers []*WorkerSlot, room int, pkt []byte) (*WorkerSlot, bool) {
-	var roomWorkers []*WorkerSlot
-	for _, w := range workers {
-		if w != nil && w.RoomID == room {
-			roomWorkers = append(roomWorkers, w)
-		}
-	}
+func (s *bondScheduler) chooseInRoom(room int, pkt []byte) (*WorkerSlot, bool) {
+	roomWorkers := s.roomWorkers[room]
 	if len(roomWorkers) == 0 {
 		return nil, false
 	}

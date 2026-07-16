@@ -272,7 +272,7 @@ func (d *Dispatcher) dispatchBond(payload []byte) {
 		}
 	} else {
 		atomic.AddInt64(&d.stats.BondQueueDrops, 1)
-		for _, room := range activeRooms(d.workers) {
+		for _, room := range d.bondSched.activeRooms(d.workers) {
 			if room >= 0 && room < len(d.stats.BondRoomDrops) {
 				atomic.AddInt64(&d.stats.BondRoomDrops[room], 1)
 			}

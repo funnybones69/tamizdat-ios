@@ -221,6 +221,80 @@ func TestBondSchedulerLargeRRSmallPinnedFailover(t *testing.T) {
 	}
 }
 
+func TestBondSchedulerSteadyStateDoesNotAllocate(t *testing.T) {
+	s := newBondScheduler()
+	workers := make([]*WorkerSlot, 0, 80)
+	for room := 0; room < 4; room++ {
+		for worker := 0; worker < 20; worker++ {
+			workers = append(workers, &WorkerSlot{
+				ID:     len(workers) + 1,
+				RoomID: room,
+				SendCh: make(chan []byte, 1),
+			})
+		}
+	}
+	pkt := []byte("pre-encoded-bond-frame")
+	// Warm scheduler topology and every room's round-robin map entry before
+	// measuring the steady-state packet path.
+	for i := 0; i < 4; i++ {
+		w, ok := s.chooseAndSend(workers, pkt, bondSmallPacketMax+1)
+		if !ok {
+			t.Fatal("warmup packet not scheduled")
+		}
+		<-w.SendCh
+	}
+
+	allocs := testing.AllocsPerRun(1000, func() {
+		w, ok := s.chooseAndSend(workers, pkt, bondSmallPacketMax+1)
+		if !ok {
+			panic("packet not scheduled")
+		}
+		<-w.SendCh
+	})
+	if allocs != 0 {
+		t.Fatalf("steady-state scheduler allocations=%v, want 0", allocs)
+	}
+}
+
+func TestBondSchedulerRefreshesChangedTopology(t *testing.T) {
+	s := newBondScheduler()
+	first := &WorkerSlot{ID: 1, RoomID: 0, SendCh: make(chan []byte, 1)}
+	second := &WorkerSlot{ID: 2, RoomID: 1, SendCh: make(chan []byte, 1)}
+	workers := []*WorkerSlot{first, second}
+
+	w, ok := s.chooseAndSend(workers, []byte("warm"), bondSmallPacketMax+1)
+	if !ok || w.RoomID != 0 {
+		t.Fatalf("warmup room=%v ok=%t, want room 0", w, ok)
+	}
+	<-w.SendCh
+
+	// Same pointer, changed immutable-at-runtime metadata: the cache still
+	// refreshes defensively instead of pinning traffic to the old room.
+	first.RoomID = 2
+	rooms := s.activeRooms(workers)
+	if len(rooms) != 2 || rooms[0] != 1 || rooms[1] != 2 {
+		t.Fatalf("room metadata refresh rooms=%v, want [1 2]", rooms)
+	}
+	w, ok = s.chooseAndSend(workers, []byte("room-change"), bondSmallPacketMax+1)
+	if !ok || (w.RoomID != 1 && w.RoomID != 2) {
+		t.Fatalf("room metadata refresh scheduled stale room=%v ok=%t", w, ok)
+	}
+	<-w.SendCh
+
+	// Same slice length, replaced worker pointer: catches unregister/register
+	// churn even when the total active count does not change.
+	replacement := &WorkerSlot{ID: 3, RoomID: 3, SendCh: make(chan []byte, 1)}
+	workers[1] = replacement
+	rooms = s.activeRooms(workers)
+	if len(rooms) != 2 || rooms[0] != 2 || rooms[1] != 3 {
+		t.Fatalf("worker replacement refresh rooms=%v, want [2 3]", rooms)
+	}
+	w, ok = s.chooseAndSend(workers, []byte("worker-change"), bondSmallPacketMax+1)
+	if !ok || (w.RoomID != 2 && w.RoomID != 3) {
+		t.Fatalf("worker replacement scheduled stale room=%v ok=%t", w, ok)
+	}
+}
+
 func TestBondDispatcherUsesIndependentLaneSequences(t *testing.T) {
 	worker := &WorkerSlot{ID: 1, RoomID: 0, SendCh: make(chan []byte, 3)}
 	d := &Dispatcher{workers: []*WorkerSlot{worker}, stats: NewStats(), bondSched: newBondScheduler()}
