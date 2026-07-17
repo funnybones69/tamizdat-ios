@@ -145,11 +145,11 @@ const (
 	// More sessions cannot obtain a target while all target slots are occupied.
 	fwdUDPGlobalMaxSessions = fwdUDPGlobalMaxEntries
 	// Preserve more app-flow concurrency for smaller TURN pools, but trade part
-	// of it for worker/socket headroom as rooms are added. The physical build-316
-	// 4x20 incident filled the old 64-target budget before kernel-critical
-	// pressure. Four rooms now use 16 reverse buffers (1 MiB), while three use
-	// 24. The same values bound outer HEV sessions, loopback sockets, goroutines
-	// and sweep tickers until physical-device soak provides a tighter profile.
+	// of it for worker/socket headroom as rooms are added. The first physical
+	// 4x20 soak still reached kernel-critical pressure with the old 32-session
+	// cap. Four rooms therefore use 16 reverse buffers (1 MiB), while three
+	// rooms use 24. The same values bound outer HEV sessions, loopback sockets,
+	// goroutines and sweep tickers.
 	fwdUDPFourRoomLimit  = 16
 	fwdUDPThreeRoomLimit = 24
 	fwdUDPTwoRoomLimit   = 48
@@ -1467,6 +1467,12 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 
 	subCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// A parent stop/pressure detach must release the outer session slot even if
+	// HEV leaves the loopback stream open and this goroutine is blocked in
+	// io.ReadFull below. Closing the server side wakes the read; on a normal
+	// return stopClientOnCancel prevents the deferred cancel from closing early.
+	stopClientOnCancel := context.AfterFunc(subCtx, func() { _ = client.Close() })
+	defer stopClientOnCancel()
 
 	type pcKey struct {
 		host string
