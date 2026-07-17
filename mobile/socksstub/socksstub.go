@@ -139,6 +139,12 @@ const (
 	// was already full, so target slots alone are not a process memory bound.
 	// More sessions cannot obtain a target while all target slots are occupied.
 	fwdUDPGlobalMaxSessions = fwdUDPGlobalMaxEntries
+	// Preserve more app-flow concurrency for smaller TURN pools, but trade part
+	// of it for worker/socket headroom as rooms are added. At 4x20, 32 reverse
+	// buffers cap the Go side at 2 MiB instead of 4 MiB; the same cap bounds
+	// outer HEV sessions, loopback sockets, goroutines and sweep tickers.
+	fwdUDPThreePlusRoomLimit = 32
+	fwdUDPTwoRoomLimit       = 48
 )
 
 var (
@@ -152,15 +158,39 @@ var (
 	// process: a production heap contained ~93 simultaneous 64 KiB reverse
 	// buffers. This semaphore is the actual process-wide 4 MiB buffer budget.
 	fwdUDPGlobalSlots = make(chan struct{}, fwdUDPGlobalMaxEntries)
+	fwdUDPGlobalMu    sync.Mutex
 	fwdUDPBudgetLogAt atomic.Int64
 	fwdUDPBudgetDrops atomic.Uint64
 
 	fwdUDPGlobalSessionSlots = make(chan struct{}, fwdUDPGlobalMaxSessions)
+	fwdUDPSessionGlobalMu    sync.Mutex
 	fwdUDPSessionBudgetLogAt atomic.Int64
 	fwdUDPSessionBudgetDrops atomic.Uint64
 )
 
+func currentFwdUDPGlobalLimit() int {
+	// Expected worker count intentionally survives parts of runner teardown for
+	// status diagnostics. Do not let that stale TURN value throttle ordinary H2
+	// traffic after the policy gate has been reopened.
+	if !vkturnRequired.Load() {
+		return fwdUDPGlobalMaxEntries
+	}
+	expected := vkturnExpectedWorkers.Load()
+	if expected > 2*vkturnWorkersPerRoom {
+		return fwdUDPThreePlusRoomLimit
+	}
+	if expected > vkturnWorkersPerRoom {
+		return fwdUDPTwoRoomLimit
+	}
+	return fwdUDPGlobalMaxEntries
+}
+
 func tryAcquireFwdUDPGlobalSession() bool {
+	fwdUDPSessionGlobalMu.Lock()
+	defer fwdUDPSessionGlobalMu.Unlock()
+	if len(fwdUDPGlobalSessionSlots) >= currentFwdUDPGlobalLimit() {
+		return false
+	}
 	select {
 	case fwdUDPGlobalSessionSlots <- struct{}{}:
 		return true
@@ -170,6 +200,8 @@ func tryAcquireFwdUDPGlobalSession() bool {
 }
 
 func releaseFwdUDPGlobalSession() {
+	fwdUDPSessionGlobalMu.Lock()
+	defer fwdUDPSessionGlobalMu.Unlock()
 	select {
 	case <-fwdUDPGlobalSessionSlots:
 	default:
@@ -177,6 +209,11 @@ func releaseFwdUDPGlobalSession() {
 }
 
 func tryAcquireFwdUDPGlobalEntry() bool {
+	fwdUDPGlobalMu.Lock()
+	defer fwdUDPGlobalMu.Unlock()
+	if len(fwdUDPGlobalSlots) >= currentFwdUDPGlobalLimit() {
+		return false
+	}
 	select {
 	case fwdUDPGlobalSlots <- struct{}{}:
 		return true
@@ -189,6 +226,8 @@ func releaseFwdUDPGlobalEntry() {
 	// Defensive non-blocking release: every owned entry uses sync.Once, while
 	// dial/race failures release their unowned reservation directly. If a future
 	// invariant regression double-releases, do not deadlock the Network Extension.
+	fwdUDPGlobalMu.Lock()
+	defer fwdUDPGlobalMu.Unlock()
 	select {
 	case <-fwdUDPGlobalSlots:
 	default:
@@ -201,7 +240,7 @@ func logFwdUDPGlobalBudgetExhausted(idx uint64) {
 	if now-last < int64(5*time.Second) || !fwdUDPBudgetLogAt.CompareAndSwap(last, now) {
 		return
 	}
-	rt.appendLog(fmt.Sprintf("warn: udp#%d global target budget exhausted active=%d max=%d drops=%d; dropping new target", idx, len(fwdUDPGlobalSlots), fwdUDPGlobalMaxEntries, fwdUDPBudgetDrops.Load()))
+	rt.appendLog(fmt.Sprintf("warn: udp#%d global target budget exhausted active=%d max=%d drops=%d; dropping new target", idx, len(fwdUDPGlobalSlots), currentFwdUDPGlobalLimit(), fwdUDPBudgetDrops.Load()))
 }
 
 func logFwdUDPGlobalSessionBudgetExhausted(idx uint64) {
@@ -210,7 +249,7 @@ func logFwdUDPGlobalSessionBudgetExhausted(idx uint64) {
 	if now-last < int64(5*time.Second) || !fwdUDPSessionBudgetLogAt.CompareAndSwap(last, now) {
 		return
 	}
-	rt.appendLog(fmt.Sprintf("warn: udp#%d global session budget exhausted active=%d max=%d drops=%d; rejecting session", idx, len(fwdUDPGlobalSessionSlots), fwdUDPGlobalMaxSessions, fwdUDPSessionBudgetDrops.Load()))
+	rt.appendLog(fmt.Sprintf("warn: udp#%d global session budget exhausted active=%d max=%d drops=%d; rejecting session", idx, len(fwdUDPGlobalSessionSlots), currentFwdUDPGlobalLimit(), fwdUDPSessionBudgetDrops.Load()))
 }
 
 // Log file mirror — same App Group file the extension writes to. The

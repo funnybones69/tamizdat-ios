@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,7 +20,49 @@ const (
 	defaultVKAppID     = "6287487"
 	defaultVKAppSecret = "QbYic1K3lEV5kTGiqlq2"
 	defaultUserAgent   = "Mozilla/5.0"
+	peerResolveTimeout = 3 * time.Second
 )
+
+type peerIPLookupFunc func(context.Context, string) ([]net.IPAddr, error)
+
+// resolvePeerUDPAddr keeps the runner bootstrap cancellable. On iOS a cold
+// system DNS lookup can be captured by the packet tunnel while TURN is still
+// fail-closed, creating a circular wait before the first worker is launched.
+// Numeric peers bypass DNS entirely; hostname fallback is bounded by the
+// caller's context.
+func resolvePeerUDPAddr(ctx context.Context, address string, lookup peerIPLookupFunc) (*net.UDPAddr, error) {
+	host, portText, err := net.SplitHostPort(strings.TrimSpace(address))
+	if err != nil {
+		return nil, fmt.Errorf("split peer address: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("invalid peer port %q", portText)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return &net.UDPAddr{IP: ip, Port: port}, nil
+	}
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIPAddr
+	}
+	addrs, err := lookup(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("lookup peer host: %w", err)
+	}
+	var fallback net.IP
+	for _, addr := range addrs {
+		if ip4 := addr.IP.To4(); ip4 != nil {
+			return &net.UDPAddr{IP: ip4, Port: port}, nil
+		}
+		if fallback == nil && addr.IP != nil {
+			fallback = addr.IP
+		}
+	}
+	if fallback == nil {
+		return nil, fmt.Errorf("lookup peer host returned no addresses")
+	}
+	return &net.UDPAddr{IP: fallback, Port: port}, nil
+}
 
 type EventFunc func(level, message string)
 
@@ -186,10 +229,17 @@ func (r *Runner) Start(ctx context.Context) error {
 		r.clearRuntime()
 	}()
 
-	peer, err := net.ResolveUDPAddr("udp", r.cfg.PeerAddr)
+	peerHost, _, splitErr := net.SplitHostPort(r.cfg.PeerAddr)
+	peerNumeric := splitErr == nil && net.ParseIP(peerHost) != nil
+	r.eventf("info", "runner bootstrap peerNumeric=%t resolveTimeoutMs=%d", peerNumeric, peerResolveTimeout.Milliseconds())
+	resolveStarted := time.Now()
+	resolveCtx, resolveCancel := context.WithTimeout(runCtx, peerResolveTimeout)
+	peer, err := resolvePeerUDPAddr(resolveCtx, r.cfg.PeerAddr, nil)
+	resolveCancel()
 	if err != nil {
 		return fmt.Errorf("ошибка разбора пира: %w", err)
 	}
+	r.eventf("info", "runner peer ready numeric=%t resolveMs=%d", peerNumeric, time.Since(resolveStarted).Milliseconds())
 
 	tp := &TurnParams{
 		Host:          r.cfg.TurnHost,
@@ -239,7 +289,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	log.Printf("[КЛИЕНТ] Device ID: %s", r.cfg.DeviceID)
 	log.Printf("[КЛИЕНТ] Обход капчи: %s", r.getCaptchaMode())
 	log.Println("[КЛИЕНТ] ═══════════════════════════════════════")
-	memoryProfile := memoryProfileForWorkers(r.cfg.Workers)
+	memoryProfile := memoryProfileForWorkers(r.cfg.Workers, r.cfg.WorkersPerRoom > 0)
 	r.eventf("info", "runner start workers=%d groups=%d workersPerGroup=%d proto=%s socketBuf=%d sendQueue=%d preloaded=%t %s deviceIDLen=%d", r.cfg.Workers, numGroups, workersPerGroup, proto, memoryProfile.socketBufferSize, memoryProfile.workerSendBuffer, r.preloadedCreds.Load() != nil, credentialsSummary(r.preloadedCreds.Load()), len(r.cfg.DeviceID))
 
 	stats := NewStats(logicalRoomCount)

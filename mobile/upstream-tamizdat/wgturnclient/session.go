@@ -30,8 +30,11 @@ const (
 	// iOS Network Extensions have a tight process + kernel memory budget.
 	// SetReadBuffer/SetWriteBuffer are per worker and the kernel may account
 	// more than the requested size, so keep the aggregate request conservative.
-	multiRoomSocketBudget  = 8 * 1024 * 1024
-	multiRoomQueueBudget   = 1 * 1024 * 1024
+	// Explicit room pools share one fixed iOS budget regardless of room count.
+	// At 4x20 this yields ~25 KiB per socket direction and four queued overlay
+	// frames per worker instead of growing kernel/Go memory with every room.
+	multiRoomSocketBudget  = 4 * 1024 * 1024
+	multiRoomQueueBudget   = 512 * 1024
 	minWorkerSocketBufSize = 8 * 1024
 	minWorkerSendBuf       = 4
 	// Pion Client.Listen allocates math.MaxUint16 bytes per client. Our TURN
@@ -69,8 +72,8 @@ func MaxBudgetedRooms(workersPerRoom int) int {
 	return maxWorkersBySockets / workersPerRoom
 }
 
-func memoryProfileForWorkers(workers int) sessionMemoryProfile {
-	if workers > maxWorkersPerRoom {
+func memoryProfileForWorkers(workers int, explicitRoomPool bool) sessionMemoryProfile {
+	if explicitRoomPool {
 		socketBuffer := multiRoomSocketBudget / workers / 2
 		if socketBuffer > multiRoomSocketBufSize {
 			socketBuffer = multiRoomSocketBufSize

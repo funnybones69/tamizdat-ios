@@ -103,6 +103,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var combinedConfigBlob: String = ""
     private var primaryBlob: String = ""
     private var backupBlob: String?
+    private struct ResolvedPeer {
+        let host: String
+        let ip: String
+    }
+    private let resolvedPeerLock = OSAllocatedUnfairLock<ResolvedPeer?>(initialState: nil)
+    private var resolvedPeer: ResolvedPeer? {
+        get { resolvedPeerLock.withLock { $0 } }
+        set { resolvedPeerLock.withLock { $0 = newValue } }
+    }
 
     private enum EffectiveUpstream: String {
         case h2
@@ -166,6 +175,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
+        let serverHost = URLComponents(string: configBlob)?.host
+        let resolvedPeer = serverIP.flatMap { ip in
+            serverHost.map { ResolvedPeer(host: $0, ip: ip) }
+        }
+        self.resolvedPeer = resolvedPeer
 
         // IPA-P: split the combined blob (which carries an optional
         // &backup=base64url(...) query param) into per-endpoint URLs.
@@ -184,7 +198,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // cross-process sandbox issue and the listener can never get
         // host-app-suspended out from under us.
         appendExtLog("info: starting in-process SocksStub on 127.0.0.1:\(Self.socksPort)")
-        if !Self.startInProcessSocks(configBlob: activeBlob, policy: policy, log: appendExtLog) {
+        if !Self.startInProcessSocks(configBlob: activeBlob, policy: policy, resolvedPeer: resolvedPeer, log: appendExtLog) {
             completionHandler(makeError("SocksStub failed to start"))
             return
         }
@@ -223,7 +237,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// Starts the Go SOCKS5 listener and primes the samizdat client. Both
     /// run inside this extension process. Returns true on success.
-    private static func startInProcessSocks(configBlob: String, policy: UpstreamPolicy, log: @escaping (String) -> Void) -> Bool {
+    private static func startInProcessSocks(configBlob: String, policy: UpstreamPolicy, resolvedPeer: ResolvedPeer?, log: @escaping (String) -> Void) -> Bool {
         // Mirror Go-shim logs to the App Group file so the bridge sees them
         // alongside extension logs.
         if let containerURL = FileManager.default.containerURL(
@@ -290,7 +304,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if policy.usesTURN {
             log("info: [vkturn] effective Whitelist + WhitelistMode=vkTurn → calling attachVKTurnUpstream")
             ExtLog.info("[vkturn] effective Whitelist + WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            Self.attachVKTurnUpstream()
+            Self.attachVKTurnUpstream(resolvedPeer: resolvedPeer)
             log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
             ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
         } else {
@@ -298,6 +312,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.info("[vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
         }
         return true
+    }
+
+    /// Build a numeric peer from the IPv4 resolved by the main app before
+    /// startVPNTunnel(). This avoids a cold DNS lookup inside the fail-closed
+    /// extension bootstrap. If the pre-resolved value is absent or malformed,
+    /// Go retains a short context-bounded hostname fallback.
+    private static func numericPeerAddress(_ configuredPeer: String, resolvedPeer: ResolvedPeer?) -> String {
+        guard let resolvedPeer,
+              !resolvedPeer.ip.isEmpty,
+              let separator = configuredPeer.lastIndex(of: ":")
+        else { return configuredPeer }
+        let portText = configuredPeer[configuredPeer.index(after: separator)...]
+        guard let port = UInt16(portText), port > 0 else { return configuredPeer }
+        guard let configuredHost = URLComponents(string: "udp://\(configuredPeer)")?.host,
+              configuredHost.caseInsensitiveCompare(resolvedPeer.host) == .orderedSame
+        else { return configuredPeer }
+        var parsed = in_addr()
+        guard inet_pton(AF_INET, resolvedPeer.ip, &parsed) == 1 else { return configuredPeer }
+        return "\(resolvedPeer.ip):\(port)"
     }
 
     /// Spin up the VK TURN runner if the operator selected it.
@@ -316,7 +349,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// `ExtLog` open/write/fsync/close every call, so the timeline
     /// survives the block.
     @discardableResult
-    private static func attachVKTurnUpstream(scheduleDrainRetry: Bool = true) -> String {
+    private static func attachVKTurnUpstream(resolvedPeer: ResolvedPeer? = nil, scheduleDrainRetry: Bool = true) -> String {
         ExtLog.info("[vkturn] attach: entering helper")
 
         // Read runtime values from App Group UserDefaults — these keys
@@ -325,12 +358,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // the WKWebView refresh writer remains main-app-only.
         let groupID = "group.com.anarki.samizdat-test"
         let defaults = UserDefaults(suiteName: groupID)
-        let peer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        let configuredPeer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        let peer = numericPeerAddress(configuredPeer, resolvedPeer: resolvedPeer)
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let workers = VKCredsPreferences.workers
         let roomCount = VKCredsPreferences.roomHashes.count
-        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=20")
+        ExtLog.info("[vkturn] attach: peerNumeric=\(peer != configuredPeer) passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=20")
 
         guard !peer.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// server not mirrored yet. Open Settings → Proxies and save Main URI.")
@@ -418,7 +452,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if err == "previous runner still draining" {
             ExtLog.info("[vkturn] attach pending — previous runner still draining")
             if scheduleDrainRetry {
-                scheduleVKTurnAttachAfterDrain()
+                scheduleVKTurnAttachAfterDrain(resolvedPeer: resolvedPeer)
             }
             return err
         }
@@ -469,7 +503,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return ""
     }
 
-    private static func scheduleVKTurnAttachAfterDrain() {
+    private static func scheduleVKTurnAttachAfterDrain(resolvedPeer: ResolvedPeer?) {
         let capturedTunnelGeneration = turnTunnelGenerationLock.withLock { $0 }
         let shouldSchedule = turnAttachRetryGenerationLock.withLock { owner -> Bool in
             if owner == capturedTunnelGeneration { return false }
@@ -500,7 +534,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     return
                 }
                 if !SocksstubTURNUpstreamDraining() {
-                    let result = attachVKTurnUpstream(scheduleDrainRetry: false)
+                    let result = attachVKTurnUpstream(resolvedPeer: resolvedPeer, scheduleDrainRetry: false)
                     ExtLog.info("[vkturn] drain retry attempt=\(attempt) result=\(result.isEmpty ? "started" : result)")
                     if result == "previous runner still draining" {
                         try? await Task.sleep(nanoseconds: 500_000_000)
@@ -775,7 +809,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             if policy.usesTURN {
-                Self.attachVKTurnUpstream()
+                Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer)
             }
 
             self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
@@ -978,7 +1012,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // refresh should start the runner immediately, but only
                 // while the effective endpoint is Restricted+Relay.
                 appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
-                let attachResult = Self.attachVKTurnUpstream()
+                let attachResult = Self.attachVKTurnUpstream(resolvedPeer: resolvedPeer)
                 let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
                 completionHandler?(response.data(using: .utf8))
             } else {
@@ -1008,7 +1042,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler?("noCreds".data(using: .utf8))
                 return
             }
-            let attachResult = Self.attachVKTurnUpstream()
+            let attachResult = Self.attachVKTurnUpstream(resolvedPeer: resolvedPeer)
             let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
             completionHandler?(response.data(using: .utf8))
         case "status":

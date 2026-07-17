@@ -46,13 +46,21 @@ func TestNewLegacySingleRoomPreservesTwentyWorkers(t *testing.T) {
 	}
 }
 
-func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T) {
-	single := memoryProfileForWorkers(20)
+func TestSessionMemoryProfilePreservesLegacySingleRoomAndBoundsExplicitRooms(t *testing.T) {
+	single := memoryProfileForWorkers(20, false)
 	if single.socketBufferSize != 625*1024 || single.workerSendBuffer != 128 {
 		t.Fatalf("single-room profile=%+v, want legacy 625KiB/128", single)
 	}
 
-	multi := memoryProfileForWorkers(80)
+	oneExplicitRoom := memoryProfileForWorkers(20, true)
+	if got := 20 * oneExplicitRoom.socketBufferSize * 2; got > multiRoomSocketBudget {
+		t.Fatalf("one explicit room requested socket memory=%d, budget=%d", got, multiRoomSocketBudget)
+	}
+	if got := 20 * oneExplicitRoom.workerSendBuffer * readBufSize; got > multiRoomQueueBudget {
+		t.Fatalf("one explicit room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
+	}
+
+	multi := memoryProfileForWorkers(80, true)
 	if multi.socketBufferSize != multiRoomSocketBudget/80/2 || multi.workerSendBuffer != multiRoomQueueBudget/80/readBufSize {
 		t.Fatalf("multi-room profile=%+v, want budget-derived profile", multi)
 	}
@@ -63,7 +71,7 @@ func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T)
 		t.Fatalf("multi-room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
 	}
 
-	twoRooms := memoryProfileForWorkers(40)
+	twoRooms := memoryProfileForWorkers(40, true)
 	if got := 40 * twoRooms.socketBufferSize * 2; got > multiRoomSocketBudget {
 		t.Fatalf("two-room requested socket memory=%d, budget=%d", got, multiRoomSocketBudget)
 	}
@@ -71,21 +79,24 @@ func TestSessionMemoryProfilePreservesSingleRoomAndBoundsMultiRoom(t *testing.T)
 		t.Fatalf("two-room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
 	}
 
-	scaled := memoryProfileForWorkers(120)
+	scaled := memoryProfileForWorkers(120, true)
 	if got := 120 * scaled.socketBufferSize * 2; got > multiRoomSocketBudget {
 		t.Fatalf("scaled socket memory=%d, budget=%d", got, multiRoomSocketBudget)
 	}
-	if scaled.workerSendBuffer >= multi.workerSendBuffer {
-		t.Fatalf("scaled queue=%d, want below 80-worker queue %d", scaled.workerSendBuffer, multi.workerSendBuffer)
+	if scaled.workerSendBuffer != minWorkerSendBuf {
+		t.Fatalf("scaled queue=%d, want floor %d", scaled.workerSendBuffer, minWorkerSendBuf)
+	}
+	if got := 120 * scaled.workerSendBuffer * readBufSize; got <= multiRoomQueueBudget {
+		t.Fatalf("scaled queue memory=%d unexpectedly fits four-room budget=%d", got, multiRoomQueueBudget)
 	}
 }
 
 func TestMaxBudgetedRoomsHonorsPerWorkerFloors(t *testing.T) {
-	if got := MaxBudgetedRooms(20); got != 8 {
-		t.Fatalf("MaxBudgetedRooms(20)=%d, want 8", got)
+	if got := MaxBudgetedRooms(20); got != 4 {
+		t.Fatalf("MaxBudgetedRooms(20)=%d, want 4", got)
 	}
 	maxWorkers := MaxBudgetedRooms(20) * 20
-	maxProfile := memoryProfileForWorkers(maxWorkers)
+	maxProfile := memoryProfileForWorkers(maxWorkers, true)
 	if got := maxWorkers * maxProfile.socketBufferSize * 2; got > multiRoomSocketBudget {
 		t.Fatalf("max-room socket request=%d, budget=%d", got, multiRoomSocketBudget)
 	}
@@ -93,7 +104,7 @@ func TestMaxBudgetedRoomsHonorsPerWorkerFloors(t *testing.T) {
 		t.Fatalf("max-room queue=%d, budget=%d", got, multiRoomQueueBudget)
 	}
 	maxPlusOneWorkers := (MaxBudgetedRooms(20) + 1) * 20
-	maxPlusOneProfile := memoryProfileForWorkers(maxPlusOneWorkers)
+	maxPlusOneProfile := memoryProfileForWorkers(maxPlusOneWorkers, true)
 	if got := maxPlusOneWorkers * maxPlusOneProfile.workerSendBuffer * readBufSize; got <= multiRoomQueueBudget {
 		t.Fatalf("max+1 queue=%d unexpectedly fits budget=%d", got, multiRoomQueueBudget)
 	}

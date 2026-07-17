@@ -20,6 +20,10 @@ func resetFwdUDPBudgetForTest(t *testing.T) {
 	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
 		t.Fatalf("global FWD_UDP session budget is dirty before test: %d", got)
 	}
+	oldExpectedWorkers := vkturnExpectedWorkers.Load()
+	oldRequired := vkturnRequired.Load()
+	vkturnExpectedWorkers.Store(0)
+	vkturnRequired.Store(false)
 	rt = &runtimeState{logsMax: 100}
 	fwdUDPBudgetLogAt.Store(0)
 	fwdUDPBudgetDrops.Store(0)
@@ -32,6 +36,8 @@ func resetFwdUDPBudgetForTest(t *testing.T) {
 		for len(fwdUDPGlobalSessionSlots) > 0 {
 			releaseFwdUDPGlobalSession()
 		}
+		vkturnExpectedWorkers.Store(oldExpectedWorkers)
+		vkturnRequired.Store(oldRequired)
 	})
 }
 
@@ -159,6 +165,49 @@ func TestFwdUDPGlobalEntryBudget(t *testing.T) {
 	releaseFwdUDPGlobalEntry()
 	if got := len(fwdUDPGlobalSlots); got != 0 {
 		t.Fatalf("global FWD_UDP budget leaked %d slots", got)
+	}
+}
+
+func TestFwdUDPAdaptiveBudgetShrinksAsTURNWorkerPoolGrows(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	vkturnRequired.Store(true)
+
+	cases := []struct {
+		workers int64
+		want    int
+	}{
+		{workers: 0, want: 64},
+		{workers: 20, want: 64},
+		{workers: 40, want: 48},
+		{workers: 80, want: 32},
+	}
+	for _, tc := range cases {
+		vkturnExpectedWorkers.Store(tc.workers)
+		if got := currentFwdUDPGlobalLimit(); got != tc.want {
+			t.Fatalf("workers=%d limit=%d, want %d", tc.workers, got, tc.want)
+		}
+	}
+	vkturnRequired.Store(false)
+	vkturnExpectedWorkers.Store(80)
+	if got := currentFwdUDPGlobalLimit(); got != fwdUDPGlobalMaxEntries {
+		t.Fatalf("H2 with stale expected workers limit=%d, want %d", got, fwdUDPGlobalMaxEntries)
+	}
+
+	vkturnRequired.Store(true)
+	vkturnExpectedWorkers.Store(80)
+	for i := 0; i < currentFwdUDPGlobalLimit(); i++ {
+		if !tryAcquireFwdUDPGlobalSession() {
+			t.Fatalf("80-worker session slot %d rejected before adaptive cap", i)
+		}
+		if !tryAcquireFwdUDPGlobalEntry() {
+			t.Fatalf("80-worker target slot %d rejected before adaptive cap", i)
+		}
+	}
+	if tryAcquireFwdUDPGlobalSession() {
+		t.Fatal("80-worker session above adaptive cap was accepted")
+	}
+	if tryAcquireFwdUDPGlobalEntry() {
+		t.Fatal("80-worker target above adaptive cap was accepted")
 	}
 }
 
@@ -399,5 +448,51 @@ func TestFwdUDPGlobalSessionBudgetRejectsBeforeAllocatingTargetResources(t *test
 	closeFwdUDPTestSession(t, acceptedClient, acceptedDone)
 	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
 		t.Fatalf("closed session leaked slot: %d", got)
+	}
+}
+
+func TestFwdUDPAdaptiveFourRoomSessionCapRejectsBeforeDial(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	vkturnRequired.Store(true)
+	vkturnExpectedWorkers.Store(80)
+	limit := currentFwdUDPGlobalLimit()
+	if limit != 32 {
+		t.Fatalf("four-room adaptive limit=%d, want 32", limit)
+	}
+	for i := 0; i < limit; i++ {
+		if !tryAcquireFwdUDPGlobalSession() {
+			t.Fatalf("four-room session slot %d rejected before cap %d", i, limit)
+		}
+	}
+
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	var dials atomic.Int64
+	go func() {
+		handleFwdUDPWithDial(context.Background(), server, 4000, func(context.Context, string) (net.PacketConn, error) {
+			dials.Add(1)
+			return newFwdUDPTestPacketConn(nil), nil
+		})
+		_ = server.Close()
+		close(done)
+	}()
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read adaptive-cap reply: %v", err)
+	}
+	if reply[0] != socksVersion5 || reply[1] != socksReplyGeneral {
+		t.Fatalf("adaptive-cap reply=%v, want general failure", reply)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("adaptive-cap rejected session did not stop")
+	}
+	_ = client.Close()
+	if got := dials.Load(); got != 0 {
+		t.Fatalf("adaptive-cap rejection performed %d dials, want 0", got)
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != limit {
+		t.Fatalf("adaptive-cap rejection changed owned slots=%d, want %d", got, limit)
 	}
 }
