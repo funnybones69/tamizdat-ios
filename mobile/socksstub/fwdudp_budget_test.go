@@ -29,6 +29,8 @@ func resetFwdUDPBudgetForTest(t *testing.T) {
 	fwdUDPBudgetDrops.Store(0)
 	fwdUDPSessionBudgetLogAt.Store(0)
 	fwdUDPSessionBudgetDrops.Store(0)
+	vkturnPendingLogAt.Store(0)
+	vkturnPendingDrops.Store(0)
 	t.Cleanup(func() {
 		for len(fwdUDPGlobalSlots) > 0 {
 			releaseFwdUDPGlobalEntry()
@@ -179,7 +181,8 @@ func TestFwdUDPAdaptiveBudgetShrinksAsTURNWorkerPoolGrows(t *testing.T) {
 		{workers: 0, want: 64},
 		{workers: 20, want: 64},
 		{workers: 40, want: 48},
-		{workers: 80, want: 32},
+		{workers: 60, want: 24},
+		{workers: 80, want: 16},
 	}
 	for _, tc := range cases {
 		vkturnExpectedWorkers.Store(tc.workers)
@@ -456,8 +459,8 @@ func TestFwdUDPAdaptiveFourRoomSessionCapRejectsBeforeDial(t *testing.T) {
 	vkturnRequired.Store(true)
 	vkturnExpectedWorkers.Store(80)
 	limit := currentFwdUDPGlobalLimit()
-	if limit != 32 {
-		t.Fatalf("four-room adaptive limit=%d, want 32", limit)
+	if limit != 16 {
+		t.Fatalf("four-room adaptive limit=%d, want 16", limit)
 	}
 	for i := 0; i < limit; i++ {
 		if !tryAcquireFwdUDPGlobalSession() {
@@ -494,5 +497,63 @@ func TestFwdUDPAdaptiveFourRoomSessionCapRejectsBeforeDial(t *testing.T) {
 	}
 	if got := len(fwdUDPGlobalSessionSlots); got != limit {
 		t.Fatalf("adaptive-cap rejection changed owned slots=%d, want %d", got, limit)
+	}
+}
+
+func TestFwdUDPTURNPendingRejectsBeforeSessionAdmission(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	oldNet := vkturnNet.Load()
+	t.Cleanup(func() { vkturnNet.Store(oldNet) })
+	vkturnRequired.Store(true)
+	vkturnExpectedWorkers.Store(80)
+	vkturnNet.Store(nil)
+
+	server, client := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() {
+		handleFwdUDP(context.Background(), server, 1)
+		_ = server.Close()
+		close(done)
+	}()
+
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read fail-closed FWD_UDP reply: %v", err)
+	}
+	if reply[0] != socksVersion5 || reply[1] != socksReplyGeneral {
+		t.Fatalf("pending TURN FWD_UDP reply=%v, want general failure", reply)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("pending TURN FWD_UDP did not stop")
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("pending TURN FWD_UDP occupied session slots=%d", got)
+	}
+	if got := len(fwdUDPGlobalSlots); got != 0 {
+		t.Fatalf("pending TURN FWD_UDP occupied target slots=%d", got)
+	}
+}
+
+func TestFwdUDPAdmittedSessionExitsWhenTURNBecomesPending(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	client, done := startFwdUDPTestSession(t, 2, func(context.Context, string) (net.PacketConn, error) {
+		return nil, errVKTurnRequiredNotReady
+	})
+
+	writeFwdUDPTestFrame(t, client, 14000)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("admitted FWD_UDP session kept retrying after TURN became pending")
+	}
+	_ = client.Close()
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("pending transition leaked outer session slots=%d", got)
+	}
+	if got := len(fwdUDPGlobalSlots); got != 0 {
+		t.Fatalf("pending transition leaked target slots=%d", got)
 	}
 }

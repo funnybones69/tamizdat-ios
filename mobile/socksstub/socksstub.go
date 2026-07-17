@@ -145,11 +145,24 @@ const (
 	// More sessions cannot obtain a target while all target slots are occupied.
 	fwdUDPGlobalMaxSessions = fwdUDPGlobalMaxEntries
 	// Preserve more app-flow concurrency for smaller TURN pools, but trade part
-	// of it for worker/socket headroom as rooms are added. At 4x20, 32 reverse
-	// buffers cap the Go side at 2 MiB instead of 4 MiB; the same cap bounds
-	// outer HEV sessions, loopback sockets, goroutines and sweep tickers.
-	fwdUDPThreePlusRoomLimit = 32
-	fwdUDPTwoRoomLimit       = 48
+	// of it for worker/socket headroom as rooms are added. The physical build-316
+	// 4x20 incident filled the old 64-target budget before kernel-critical
+	// pressure. Four rooms now use 16 reverse buffers (1 MiB), while three use
+	// 24. The same values bound outer HEV sessions, loopback sockets, goroutines
+	// and sweep tickers until physical-device soak provides a tighter profile.
+	fwdUDPFourRoomLimit  = 16
+	fwdUDPThreeRoomLimit = 24
+	fwdUDPTwoRoomLimit   = 48
+
+	// Every accepted SOCKS flow owns a loopback socket and handler goroutine;
+	// CONNECT additionally owns upstream/gVisor state and relay buffers. A prior
+	// 4x20 pressure episode closed 171 live flows, so FWD_UDP target/session caps
+	// alone are not a process-wide memory bound. Keep a high non-TURN safety
+	// ceiling, but shrink TURN admission as worker/socket pressure grows.
+	socksFlowDefaultLimit       int64 = 500
+	socksFlowOneRoomLimit       int64 = 160
+	socksFlowTwoRoomLimit       int64 = 128
+	socksFlowThreePlusRoomLimit int64 = 96
 )
 
 var (
@@ -171,6 +184,11 @@ var (
 	fwdUDPSessionGlobalMu    sync.Mutex
 	fwdUDPSessionBudgetLogAt atomic.Int64
 	fwdUDPSessionBudgetDrops atomic.Uint64
+
+	socksFlowBudgetLogAt atomic.Int64
+	socksFlowBudgetDrops atomic.Uint64
+	vkturnPendingLogAt   atomic.Int64
+	vkturnPendingDrops   atomic.Uint64
 )
 
 func currentFwdUDPGlobalLimit() int {
@@ -181,13 +199,74 @@ func currentFwdUDPGlobalLimit() int {
 		return fwdUDPGlobalMaxEntries
 	}
 	expected := vkturnExpectedWorkers.Load()
+	if expected >= 4*vkturnWorkersPerRoom {
+		return fwdUDPFourRoomLimit
+	}
 	if expected > 2*vkturnWorkersPerRoom {
-		return fwdUDPThreePlusRoomLimit
+		return fwdUDPThreeRoomLimit
 	}
 	if expected > vkturnWorkersPerRoom {
 		return fwdUDPTwoRoomLimit
 	}
 	return fwdUDPGlobalMaxEntries
+}
+
+func socksFlowLimit(required bool, expectedWorkers int64) int64 {
+	if !required {
+		return socksFlowDefaultLimit
+	}
+	if expectedWorkers > 2*vkturnWorkersPerRoom {
+		return socksFlowThreePlusRoomLimit
+	}
+	if expectedWorkers > vkturnWorkersPerRoom {
+		return socksFlowTwoRoomLimit
+	}
+	return socksFlowOneRoomLimit
+}
+
+func currentSocksFlowLimit() int64 {
+	return socksFlowLimit(vkturnRequired.Load(), vkturnExpectedWorkers.Load())
+}
+
+func tryAcquireSocksFlow(state *runtimeState, limit int64) bool {
+	if state == nil || limit <= 0 {
+		return false
+	}
+	for {
+		active := state.connsActive.Load()
+		if active >= limit {
+			return false
+		}
+		if state.connsActive.CompareAndSwap(active, active+1) {
+			return true
+		}
+	}
+}
+
+func releaseSocksFlow(state *runtimeState) {
+	if state != nil {
+		state.connsActive.Add(-1)
+	}
+}
+
+func logSocksFlowBudgetExhausted(active, limit int64) {
+	drops := socksFlowBudgetDrops.Add(1)
+	now := time.Now().UnixNano()
+	last := socksFlowBudgetLogAt.Load()
+	if now-last < int64(5*time.Second) || !socksFlowBudgetLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	rt.appendLog(fmt.Sprintf("warn: SOCKS flow budget exhausted active=%d max=%d drops=%d", active, limit, drops))
+}
+
+func logVKTurnPendingFlow(kind string) {
+	drops := vkturnPendingDrops.Add(1)
+	now := time.Now().UnixNano()
+	last := vkturnPendingLogAt.Load()
+	if now-last < int64(5*time.Second) || !vkturnPendingLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	rt.appendLog(fmt.Sprintf("warn: TURN required but netstack not ready; rejected=%s drops=%d", kind, drops))
 }
 
 func tryAcquireFwdUDPGlobalSession() bool {
@@ -1020,12 +1099,11 @@ func (r *runtimeState) appendLog(line string) {
 	}
 }
 
-// acceptLoop services incoming SOCKS5 client connections.
-//
-// (D15 cleanup) Removed admission/protect-mode branches — D12 fixed
-// the real memory leak so we no longer need any kind of accept-time
-// throttling. Every accepted conn gets its own goroutine; nuclear
-// close (D7) handles emergencies.
+// acceptLoop services incoming SOCKS5 client connections. Admission is bounded
+// process-wide before a handler goroutine or upstream resource is allocated.
+// TURN pools reserve increasingly more socket/kernel memory as rooms grow, so
+// the flow ceiling shrinks with vkturnExpectedWorkers. Nuclear close remains an
+// emergency release valve rather than the only memory bound.
 func acceptLoop(state *runtimeState, ctx context.Context, ln net.Listener) {
 	for {
 		c, err := ln.Accept()
@@ -1047,14 +1125,19 @@ func acceptLoop(state *runtimeState, ctx context.Context, ln net.Listener) {
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 		}
+		flowLimit := currentSocksFlowLimit()
+		if !tryAcquireSocksFlow(state, flowLimit) {
+			logSocksFlowBudgetExhausted(state.connsActive.Load(), flowLimit)
+			_ = c.Close()
+			continue
+		}
 		n := state.connsTotal.Add(1)
-		state.connsActive.Add(1)
 		flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
 		fs := &flowState{conn: c}
 		flowRegistry.Store(n, fs)
 		go func(client net.Conn, idx uint64) {
 			defer client.Close()
-			defer state.connsActive.Add(-1)
+			defer releaseSocksFlow(state)
 			defer flowRegistry.Delete(idx)
 			handleSocks(ctx, client, idx)
 		}(c, n)
@@ -1168,6 +1251,11 @@ func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string
 	upstream, err := dialUpstream(dialCtx, dest)
 	cancel()
 	if err != nil {
+		if errors.Is(err, errVKTurnRequiredNotReady) {
+			logVKTurnPendingFlow("CONNECT")
+			_ = sendReply(client, socksReplyGeneral)
+			return
+		}
 		rt.appendLog(fmt.Sprintf("error: conn#%d dial %s failed after %dms: %v", idx, dest, time.Since(dialStart).Milliseconds(), err))
 		code := byte(socksReplyHostUnk)
 		var oerr *net.OpError
@@ -1346,6 +1434,14 @@ func (a *udpDestAddr) String() string  { return a.s }
 type fwdUDPDialFunc func(context.Context, string) (net.PacketConn, error)
 
 func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
+	// During startup, pressure shedding, or runner drain, do not report SOCKS
+	// success and leave a long-lived HEV session retrying every datagram against
+	// a nil TURN netstack. Reject before session admission/dial/buffer/ticker.
+	if vkturnRequired.Load() && VKTurnNetstack() == nil {
+		logVKTurnPendingFlow("FWD_UDP")
+		_ = sendReply(client, socksReplyGeneral)
+		return
+	}
 	handleFwdUDPWithDial(ctx, client, idx, dialUpstreamUDP)
 }
 
@@ -1564,7 +1660,16 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 			dialCancel()
 			if derr != nil {
 				releaseFwdUDPGlobalEntry()
-				rt.appendLog(fmt.Sprintf("warn: udp#%d dial %s:%d: %v", idx, host, port, derr))
+				if errors.Is(derr, errVKTurnRequiredNotReady) {
+					logVKTurnPendingFlow("FWD_UDP target")
+					// The session may have been admitted while TURN was ready and
+					// then raced a pressure detach. Do not keep its outer HEV TCP
+					// stream, ticker and retry loop alive while fail-closed; return
+					// so every owned resource/slot is released by the defers above.
+					return
+				} else {
+					rt.appendLog(fmt.Sprintf("warn: udp#%d dial %s:%d: %v", idx, host, port, derr))
+				}
 				continue
 			}
 			pcMu.Lock()
