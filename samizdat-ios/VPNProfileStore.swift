@@ -55,8 +55,8 @@ final class VPNProfileStore {
         // startTunnel.
         let serverIP = await resolvedIPv4Address(from: configBlob)
         let engineConfigBlob = configBlobWithConnectEndpoint(serverIP, in: configBlob) ?? configBlob
-        if let serverIP {
-            SamizdatAddLog("info: resolved server IPv4 before VPN start: \(serverIP)")
+        if serverIP != nil {
+            SamizdatAddLog("info: resolved server IPv4 before VPN start")
         } else {
             SamizdatAddLog("warn: server IPv4 resolve timed out before VPN start")
         }
@@ -356,8 +356,8 @@ final class VPNProfileStore {
         if let systemResult, !isReservedFakeIPv4(systemResult) {
             return systemResult
         }
-        if let systemResult {
-            SamizdatAddLog("warn: ignoring fake/reserved DNS result: \(systemResult)")
+        if systemResult != nil {
+            SamizdatAddLog("warn: ignoring fake/reserved DNS result")
         }
         return await resolveIPv4AddressWithDoH(host: host)
     }
@@ -396,8 +396,8 @@ final class VPNProfileStore {
                 .filter { $0.type == 1 }
                 .map(\.data)
                 .first { isUsableIPv4($0) }
-            if let address {
-                SamizdatAddLog("info: resolved server IPv4 via DoH: \(address)")
+            if address != nil {
+                SamizdatAddLog("info: resolved server IPv4 via DoH")
             }
             return address
         } catch {

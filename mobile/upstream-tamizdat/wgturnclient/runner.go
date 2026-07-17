@@ -280,7 +280,7 @@ func (r *Runner) Start(ctx context.Context) error {
 	log.Printf("[КЛИЕНТ] VK App: %s", r.cfg.VKAppID)
 	log.Printf("[КЛИЕНТ] Воркеров: %d (групп: %d, по %d)", r.cfg.Workers, numGroups, workersPerGroup)
 	log.Printf("[КЛИЕНТ] Хешей: %d", len(r.cfg.VKHashes))
-	log.Printf("[КЛИЕНТ] Слушаю: %s | Пир: %s", r.cfg.Listen, r.cfg.PeerAddr)
+	log.Printf("[КЛИЕНТ] Слушаю: %s | Пир numeric=%t", r.cfg.Listen, peerNumeric)
 	proto := "TCP"
 	if r.cfg.UseUDP {
 		proto = "UDP"

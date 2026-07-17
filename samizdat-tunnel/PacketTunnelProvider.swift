@@ -435,7 +435,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         }
 
-        ExtLog.info("[vkturn] attach: BEFORE runner start peer=\(peer), listenPort=9000, rooms=\(roomCount)")
+        ExtLog.info("[vkturn] attach: BEFORE runner start peerNumeric=\(peer != configuredPeer), listenPort=9000, rooms=\(roomCount)")
         let beforeMs = Date()
         let err: String
         if let bundle = roomBundleJSON, !bundle.isEmpty {
