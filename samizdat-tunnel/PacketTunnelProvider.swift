@@ -1128,11 +1128,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } else {
                 uptime = 0
             }
+            // Runtime status must be tunnel-authoritative (Go `vkturnRequired`);
+            // App Group prefs are published separately as the requested/next policy.
+            // Otherwise changing prefs while a TURN tunnel is live hides the UI amber
+            // `active < expected` gate (build-326 review blocker).
+            let turnRequiredNow = SocksstubVKTurnRequired()
             let mode = EndpointModeStore.current
             let policy = Self.upstreamPolicy(mode: mode, backup: backupBlob)
             let turnRunning = SocksstubTURNUpstreamRunning()
             let turnNetstackReady = !SocksstubTURNUpstreamWGConfig().isEmpty
-            let actualUpstream = policy.usesTURN
+            let actualUpstream = turnRequiredNow
                 ? (turnNetstackReady ? "turn" : "turn-pending")
                 : "h2"
             let turnStats: (active: Int, expected: Int) = {
@@ -1149,11 +1154,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // H2 ping state is irrelevant in TURN-only mode and can be stale
             // from a previous policy. Keep it neutral instead of letting an
             // old H2 failure paint the TURN connection as failed.
-            let pingMs = policy.usesTURN ? -1 : Int(pingSnap?.lastMs ?? -1)
-            let pingOK = policy.usesTURN ? false : (pingSnap?.ok ?? false)
-            let pingFailed = policy.usesTURN ? false : (pingSnap?.failed ?? false)
+            let pingMs = turnRequiredNow ? -1 : Int(pingSnap?.lastMs ?? -1)
+            let pingOK = turnRequiredNow ? false : (pingSnap?.ok ?? false)
+            let pingFailed = turnRequiredNow ? false : (pingSnap?.failed ?? false)
             let payload: [String: Any] = [
-                "realShape":   policy.usesTURN ? "turn" : SocksstubRealShapeMode(),
+                "realShape":   turnRequiredNow ? "turn" : SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
                 "liteAlive":   Int(SocksstubLiteAlive()),
                 "rttLiteMs":   Int(SocksstubRTTLiteP50Ms()),
@@ -1171,7 +1176,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "rewireGeneration": self.rewireGeneration,
                 "endpointMode": mode.rawValue,
                 "effectiveEndpoint": policy.effectiveEndpoint.rawValue,
-                "desiredUpstream": policy.upstream.rawValue,
+                "requestedUpstream": policy.upstream.rawValue,
+                "desiredUpstream": turnRequiredNow ? "turn" : "h2",
                 "upstreamKind": actualUpstream,
                 "turnRunning": turnRunning ? 1 : 0,
                 "turnNetstackReady": turnNetstackReady ? 1 : 0,
@@ -1260,6 +1266,14 @@ misc:
   task-stack-size: 24576
   # HEV 2.14.4 conf/main.yml defines this key; align it with Go socksFlowLimit.
   max-session-count: \(maxSessionCount)
+  # IPA-R1: clamp HEV native buffers (defaults: tcp-buffer-size 65536,
+  # udp-recv-buffer-size 524288). This memory is lwIP/kernel side and NOT
+  # governed by the Go SetMemoryLimit; at the session caps above the old
+  # defaults alone could pin 6-18 MB during a speed test. hev's lwIP leg
+  # terminates on-device (microsecond RTT), so 32 KiB windows do not cap
+  # end-to-end throughput — backpressure lives on the TURN/netstack side.
+  tcp-buffer-size: 32768
+  udp-recv-buffer-size: 131072
   log-level: 'info'
   connect-timeout: 2000
   # HEV 2.14.4 exposes protocol-specific timeout keys in conf/main.yml. Keep
@@ -1705,6 +1719,17 @@ misc:
     }
 
     private func scheduleTURNPressureRecovery(pressureAt: Date) {
+        // Tunnel-authoritative gate: recover only what this tunnel actually
+        // runs (the Go-side TURN-required flag), never live App Group prefs.
+        // The 2026-07-17 field hang (0/80 zombie on the reverted v1) came
+        // from recovery consulting instantaneous prefs the user had already
+        // flipped for the NEXT connect while the running tunnel was still
+        // TURN-required fail-closed.
+        guard SocksstubVKTurnRequired() else {
+            memoryPressureState.withLock { $0.recoveryScheduled = false }
+            appendExtLog("info: memorypressure recovery not scheduled — tunnel is not TURN-required")
+            return
+        }
         let capturedTunnelGeneration = Self.turnTunnelGenerationLock.withLock { $0 }
         let capturedRewireGeneration = rewireGeneration
         appendExtLog("info: memorypressure auto-recovery scheduled tunnelGeneration=\(capturedTunnelGeneration) rewireGeneration=\(capturedRewireGeneration) rooms=\(VKCredsPreferences.roomHashes.count) cooldown=60s headroom=20MiB")
@@ -1739,8 +1764,10 @@ misc:
                     return
                 }
 
-                let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob)
-                guard policy.usesTURN else {
+                // Tunnel-authoritative: the Go TURN-required flag flips only
+                // through this tunnel's own wiring (attach/rewire), unlike
+                // App Group prefs which describe the NEXT connect.
+                guard SocksstubVKTurnRequired() else {
                     let didMutate = self.mutatePressureStateIfOwned(
                         tunnelGeneration: capturedTunnelGeneration
                     ) {
@@ -1751,7 +1778,7 @@ misc:
                         self.appendExtLog("info: memorypressure auto-recovery state reset skipped, ownership changed")
                         return
                     }
-                    self.appendExtLog("info: memorypressure auto-recovery cancelled — current policy no longer uses TURN")
+                    self.appendExtLog("info: memorypressure auto-recovery cancelled — tunnel no longer TURN-required (rewired)")
                     return
                 }
 
@@ -1816,7 +1843,7 @@ misc:
                     return
                 }
                 guard self.rewireGeneration == capturedRewireGeneration,
-                      Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob).usesTURN else {
+                      SocksstubVKTurnRequired() else {
                     let didMutate = self.mutatePressureStateIfOwned(
                         tunnelGeneration: capturedTunnelGeneration
                     ) {
@@ -1866,7 +1893,7 @@ misc:
                         guard currentRewireGeneration == capturedRewireGeneration,
                               !Task.isCancelled,
                               self.isRunning,
-                              Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob).usesTURN
+                              SocksstubVKTurnRequired()
                         else { return nil }
                         SocksstubSetVKTurnRequired(true)
                         return Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer, scheduleDrainRetry: false)

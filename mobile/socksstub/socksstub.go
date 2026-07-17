@@ -477,10 +477,17 @@ func Start(addrSpec string) error {
 	// observed in D14 and 25+ MB headroom under SetMemoryLimit, the
 	// aggressive 20% growth threshold caused ~5x more GC cycles than
 	// necessary at idle — each cycle wakes CPU and burns battery.
-	// SetMemoryLimit(37 MB) below remains as the emergency cap; if
-	// the heap actually approaches 37 MB the runtime biases GC harder
-	// regardless of GOGC.
-	debug.SetMemoryLimit(37 * 1024 * 1024)
+	//
+	// IPA-R1: soft limit 37 MB → 26 MB. The 2026-07-17 4x20 speed-test
+	// collapse (heap-kernel-critical-1784303711) showed live heap of only
+	// 13 MB but 74 MB allocated in 2.5 min (per-frame TURN/DTLS/reorder
+	// churn), floating go.sys to 29 MB while native (hev/lwIP, DTLS
+	// records in kernel, Swift, NE) needed more than the 13 MB the 37 MB
+	// cap left — kernel-critical fired with the Go arena mostly garbage.
+	// 26 MB still doubles the observed peak live heap (no GC thrash at
+	// idle, GOGC stays 100) but biases GC hard exactly during load
+	// bursts and returns ~11 MB of headroom to the native side.
+	debug.SetMemoryLimit(26 * 1024 * 1024)
 	debug.SetGCPercent(100)
 
 	network := "tcp"
