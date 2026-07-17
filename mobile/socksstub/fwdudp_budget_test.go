@@ -15,14 +15,22 @@ import (
 func resetFwdUDPBudgetForTest(t *testing.T) {
 	t.Helper()
 	if got := len(fwdUDPGlobalSlots); got != 0 {
-		t.Fatalf("global FWD_UDP budget is dirty before test: %d", got)
+		t.Fatalf("global FWD_UDP target budget is dirty before test: %d", got)
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("global FWD_UDP session budget is dirty before test: %d", got)
 	}
 	rt = &runtimeState{logsMax: 100}
 	fwdUDPBudgetLogAt.Store(0)
 	fwdUDPBudgetDrops.Store(0)
+	fwdUDPSessionBudgetLogAt.Store(0)
+	fwdUDPSessionBudgetDrops.Store(0)
 	t.Cleanup(func() {
 		for len(fwdUDPGlobalSlots) > 0 {
 			releaseFwdUDPGlobalEntry()
+		}
+		for len(fwdUDPGlobalSessionSlots) > 0 {
+			releaseFwdUDPGlobalSession()
 		}
 	})
 }
@@ -231,7 +239,7 @@ func TestFwdUDPGlobalBudgetBoundsConcurrentSessions(t *testing.T) {
 		return newFwdUDPTestPacketConn(&closes), nil
 	}
 
-	clients := make([]net.Conn, fwdUDPGlobalMaxEntries+1)
+	clients := make([]net.Conn, fwdUDPGlobalMaxEntries)
 	dones := make([]<-chan struct{}, len(clients))
 	for i := range clients {
 		clients[i], dones[i] = startFwdUDPTestSession(t, uint64(100+i), dial)
@@ -239,6 +247,9 @@ func TestFwdUDPGlobalBudgetBoundsConcurrentSessions(t *testing.T) {
 	}
 	waitAtomicAtLeast(t, &dials, int64(fwdUDPGlobalMaxEntries))
 	waitFwdUDPBudgetLen(t, fwdUDPGlobalMaxEntries)
+	// A second target in an already-admitted session must be rejected while the
+	// process-wide target budget is full.
+	writeFwdUDPTestFrame(t, clients[0], 13000)
 	waitAtomicUintAtLeast(t, &fwdUDPBudgetDrops, 1)
 	if got := dials.Load(); got != int64(fwdUDPGlobalMaxEntries) {
 		t.Fatalf("concurrent dials=%d, want capped at %d", got, fwdUDPGlobalMaxEntries)
@@ -249,5 +260,62 @@ func TestFwdUDPGlobalBudgetBoundsConcurrentSessions(t *testing.T) {
 	waitFwdUDPBudgetLen(t, 0)
 	if got := closes.Load(); got != int64(fwdUDPGlobalMaxEntries) {
 		t.Fatalf("closed PacketConns=%d, want %d", got, fwdUDPGlobalMaxEntries)
+	}
+}
+
+func TestFwdUDPGlobalSessionBudgetRejectsBeforeAllocatingTargetResources(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	for i := 0; i < fwdUDPGlobalMaxSessions; i++ {
+		if !tryAcquireFwdUDPGlobalSession() {
+			t.Fatalf("session slot %d rejected before cap %d", i, fwdUDPGlobalMaxSessions)
+		}
+	}
+
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	var dials atomic.Int64
+	go func() {
+		handleFwdUDPWithDial(context.Background(), server, 999, func(context.Context, string) (net.PacketConn, error) {
+			dials.Add(1)
+			return newFwdUDPTestPacketConn(nil), nil
+		})
+		_ = server.Close()
+		close(done)
+	}()
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read rejected FWD_UDP reply: %v", err)
+	}
+	if reply[0] != socksVersion5 || reply[1] != 0x01 {
+		t.Fatalf("rejected FWD_UDP reply=%v, want general failure", reply)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rejected FWD_UDP session did not stop")
+	}
+	_ = client.Close()
+	if got := dials.Load(); got != 0 {
+		t.Fatalf("rejected session allocated %d target resources, want 0", got)
+	}
+	if got := fwdUDPSessionBudgetDrops.Load(); got != 1 {
+		t.Fatalf("session budget drops=%d, want 1", got)
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != fwdUDPGlobalMaxSessions {
+		t.Fatalf("rejected session leaked slot: active=%d, want %d", got, fwdUDPGlobalMaxSessions)
+	}
+
+	for len(fwdUDPGlobalSessionSlots) > 0 {
+		releaseFwdUDPGlobalSession()
+	}
+	acceptedClient, acceptedDone := startFwdUDPTestSession(t, 1000, func(context.Context, string) (net.PacketConn, error) {
+		return newFwdUDPTestPacketConn(nil), nil
+	})
+	if got := len(fwdUDPGlobalSessionSlots); got != 1 {
+		t.Fatalf("accepted session slots=%d, want 1", got)
+	}
+	closeFwdUDPTestSession(t, acceptedClient, acceptedDone)
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("closed session leaked slot: %d", got)
 	}
 }

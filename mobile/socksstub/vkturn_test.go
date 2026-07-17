@@ -454,12 +454,12 @@ func TestParseVKTurnRoomCredsJSONRejectsPartialDuplicateAndStaleBundles(t *testi
 	room := func(hash string, acquired int64) string {
 		return fmt.Sprintf(`{"hash":%q,"credentials":{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600,"acquired_at_unix":%d}}`, hash, acquired)
 	}
-	valid := `{"rooms":[` + room("a", fresh) + `,` + room("b", fresh) + `,` + room("c", fresh) + `,` + room("d", fresh) + `]}`
+	valid := `{"rooms":[` + room("a", fresh) + `,` + room("b", fresh) + `]}`
 	hashes, creds, err := parseVKTurnRoomCredsJSON(valid)
 	if err != nil {
 		t.Fatalf("valid bundle: %v", err)
 	}
-	if len(hashes) != 4 || len(creds) != 4 {
+	if len(hashes) != 2 || len(creds) != 2 {
 		t.Fatalf("valid bundle sizes hashes=%d creds=%d", len(hashes), len(creds))
 	}
 
@@ -486,13 +486,13 @@ func TestParseVKTurnRoomCredsJSONEnforcesIOSResourceRoomLimit(t *testing.T) {
 		return `{"rooms":[` + strings.Join(rooms, ",") + `]}`
 	}
 
-	if VKTurnMaxRooms() != 4 {
-		t.Fatalf("VKTurnMaxRooms()=%d, want 4", VKTurnMaxRooms())
+	if VKTurnMaxRooms() != 2 {
+		t.Fatalf("VKTurnMaxRooms()=%d, want 2", VKTurnMaxRooms())
 	}
 	if hashes, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms())); err != nil || len(hashes) != VKTurnMaxRooms() {
 		t.Fatalf("max-room bundle rejected: hashes=%d err=%v", len(hashes), err)
 	}
-	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 4") {
+	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 2") {
 		t.Fatalf("max+1 bundle error = %v, want iOS room-limit rejection", err)
 	}
 }

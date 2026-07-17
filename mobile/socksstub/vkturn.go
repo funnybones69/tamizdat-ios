@@ -81,12 +81,16 @@ func SetVKTurnRequired(required bool) {
 // VKTurnRequired is exposed for status and regression tests.
 func VKTurnRequired() bool { return vkturnRequired.Load() }
 
-const vkturnIOSDeviceMaxRooms = 4
+const vkturnIOSDeviceMaxRooms = 2
 
 // VKTurnMaxRooms exposes the iOS-only room limit to Swift so Settings, App
 // Group storage and the gomobile data-plane gate cannot drift. The generic
 // wgturn protocol remains dynamic; this stricter ceiling is a Network Extension
-// resource gate proven by a real 5x20 memory-pressure incident.
+// resource gate proven by real 5x20 and 4x20 memory-pressure incidents. Even
+// after bounding Go TURN/FWD buffers, 4x20 hit kernel-critical pressure during
+// startup and the Network Extension then disappeared. Two rooms preserve the
+// required multi-room 20-workers-per-room invariant while halving the long-lived
+// worker/socket footprint; the separate FWD_UDP session cap bounds flow bursts.
 func VKTurnMaxRooms() int {
 	budgeted := wgturnclient.MaxBudgetedRooms(vkturnWorkersPerRoom)
 	if budgeted < vkturnIOSDeviceMaxRooms {

@@ -72,6 +72,7 @@ const (
 	socksAtypDomain    = 0x03
 	socksAtypIPv6      = 0x04
 	socksReplySuccess  = 0x00
+	socksReplyGeneral  = 0x01
 	socksReplyHostUnk  = 0x04
 	socksReplyConnRef  = 0x05
 	socksReplyCmdNoSup = 0x07
@@ -132,6 +133,12 @@ const (
 	fwdUDPReverseBufferSize  = 64 * 1024
 	fwdUDPGlobalBufferBudget = 4 * 1024 * 1024
 	fwdUDPGlobalMaxEntries   = fwdUDPGlobalBufferBudget / fwdUDPReverseBufferSize
+	// Every outer FWD_UDP session owns a loopback TCP socket, a handler
+	// goroutine and a sweep ticker even before it obtains a target entry. A real
+	// iPhone pressure profile reached 171 live flows while the 64-target budget
+	// was already full, so target slots alone are not a process memory bound.
+	// More sessions cannot obtain a target while all target slots are occupied.
+	fwdUDPGlobalMaxSessions = fwdUDPGlobalMaxEntries
 )
 
 var (
@@ -147,7 +154,27 @@ var (
 	fwdUDPGlobalSlots = make(chan struct{}, fwdUDPGlobalMaxEntries)
 	fwdUDPBudgetLogAt atomic.Int64
 	fwdUDPBudgetDrops atomic.Uint64
+
+	fwdUDPGlobalSessionSlots = make(chan struct{}, fwdUDPGlobalMaxSessions)
+	fwdUDPSessionBudgetLogAt atomic.Int64
+	fwdUDPSessionBudgetDrops atomic.Uint64
 )
+
+func tryAcquireFwdUDPGlobalSession() bool {
+	select {
+	case fwdUDPGlobalSessionSlots <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func releaseFwdUDPGlobalSession() {
+	select {
+	case <-fwdUDPGlobalSessionSlots:
+	default:
+	}
+}
 
 func tryAcquireFwdUDPGlobalEntry() bool {
 	select {
@@ -175,6 +202,15 @@ func logFwdUDPGlobalBudgetExhausted(idx uint64) {
 		return
 	}
 	rt.appendLog(fmt.Sprintf("warn: udp#%d global target budget exhausted active=%d max=%d drops=%d; dropping new target", idx, len(fwdUDPGlobalSlots), fwdUDPGlobalMaxEntries, fwdUDPBudgetDrops.Load()))
+}
+
+func logFwdUDPGlobalSessionBudgetExhausted(idx uint64) {
+	now := time.Now().UnixNano()
+	last := fwdUDPSessionBudgetLogAt.Load()
+	if now-last < int64(5*time.Second) || !fwdUDPSessionBudgetLogAt.CompareAndSwap(last, now) {
+		return
+	}
+	rt.appendLog(fmt.Sprintf("warn: udp#%d global session budget exhausted active=%d max=%d drops=%d; rejecting session", idx, len(fwdUDPGlobalSessionSlots), fwdUDPGlobalMaxSessions, fwdUDPSessionBudgetDrops.Load()))
 }
 
 // Log file mirror — same App Group file the extension writes to. The
@@ -1237,6 +1273,19 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 }
 
 func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial fwdUDPDialFunc) {
+	// Claim the outer-session budget before reporting SOCKS success. Rejected
+	// sessions therefore allocate no upstream target, reverse buffer or ticker,
+	// and hev can retry later after an existing session closes.
+	if !tryAcquireFwdUDPGlobalSession() {
+		fwdUDPSessionBudgetDrops.Add(1)
+		logFwdUDPGlobalSessionBudgetExhausted(idx)
+		if err := sendReply(client, socksReplyGeneral); err != nil {
+			rt.appendLog(fmt.Sprintf("warn: udp#%d rejection reply write: %v", idx, err))
+		}
+		return
+	}
+	defer releaseFwdUDPGlobalSession()
+
 	if err := sendReply(client, socksReplySuccess); err != nil {
 		rt.appendLog(fmt.Sprintf("warn: udp#%d reply write: %v", idx, err))
 		return
