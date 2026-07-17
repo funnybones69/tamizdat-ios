@@ -33,7 +33,104 @@ func TestStartStop(t *testing.T) {
 
 	Stop()
 	if got := Status(); got != "stopped" {
-		t.Errorf("Status after Stop = %q", got)
+		t.Errorf("Status after Stop = %q, want stopped", got)
+	}
+}
+
+func TestConcurrentAndDoubleStop(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+	port := pickPort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	if err := Start(addr); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	const callers = 8
+	done := make(chan struct{}, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			Stop()
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < callers; i++ {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("concurrent Stop call did not return")
+		}
+	}
+	Stop()
+	if got := Status(); got != "stopped" {
+		t.Fatalf("Status after concurrent/double Stop=%q, want stopped", got)
+	}
+}
+
+func TestStopDuringAcceptHandoffDrainsFlows(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+	port := pickPort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	if err := Start(addr); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	const clients = 64
+	var dials sync.WaitGroup
+	dials.Add(clients)
+	for i := 0; i < clients; i++ {
+		go func() {
+			defer dials.Done()
+			conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+			}
+		}()
+	}
+	Stop()
+	dials.Wait()
+	if got := ConnectionsActive(); got != 0 {
+		t.Fatalf("active connections after accept-handoff Stop=%d, want 0", got)
+	}
+	if got := Status(); got != "stopped" {
+		t.Fatalf("Status after accept-handoff Stop=%q, want stopped", got)
+	}
+}
+
+func TestStopTimeoutDoesNotPoisonRestart(t *testing.T) {
+	rt = &runtimeState{logsMax: 100}
+	oldTimeout := socksStopDrainTimeout
+	socksStopDrainTimeout = 10 * time.Millisecond
+	t.Cleanup(func() { socksStopDrainTimeout = oldTimeout })
+
+	port := pickPort(t)
+	addr := "127.0.0.1:" + strconv.Itoa(port)
+	if err := Start(addr); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	state := rt
+	server, client := net.Pipe()
+	const fakeFlowID = ^uint64(0)
+	flowRegistry.Store(fakeFlowID, &flowState{conn: server})
+	state.connsActive.Store(1)
+
+	started := time.Now()
+	Stop()
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("timed-out Stop took %v", elapsed)
+	}
+	flowRegistry.Delete(fakeFlowID)
+	state.connsActive.Store(0)
+	_ = server.Close()
+	_ = client.Close()
+
+	port = pickPort(t)
+	addr = "127.0.0.1:" + strconv.Itoa(port)
+	if err := Start(addr); err != nil {
+		t.Fatalf("restart after timeout: %v", err)
+	}
+	Stop()
+	if got := Status(); got != "stopped" {
+		t.Fatalf("Status after timeout/restart=%q, want stopped", got)
 	}
 }
 
@@ -388,7 +485,7 @@ func socks5Echo(socks string, target *net.TCPAddr) error {
 // (no samizdat). Verifies framing on both directions: client → upstream
 // and reverse.
 func TestFwdUDPDirectEcho(t *testing.T) {
-	rt = &runtimeState{logsMax: 100}
+	resetFwdUDPBudgetForTest(t)
 
 	// UDP echo server.
 	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
@@ -496,6 +593,21 @@ func TestFwdUDPDirectEcho(t *testing.T) {
 	gotData := rest[rhdrLen-3:]
 	if !bytesEqual(gotData, payload) {
 		t.Fatalf("reverse data = %q, want %q", gotData, payload)
+	}
+
+	// Stop must close handlers already accepted by the listener, not merely
+	// cancel the accept context. FWD_UDP blocks in ReadFull on this connection;
+	// without an explicit flow close its target/session slots outlive Stop and
+	// contaminate the next listener generation.
+	Stop()
+	if got := ConnectionsActive(); got != 0 {
+		t.Fatalf("active connections after Stop=%d, want 0", got)
+	}
+	if got := len(fwdUDPGlobalSlots); got != 0 {
+		t.Fatalf("FWD_UDP target slots after Stop=%d, want 0", got)
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("FWD_UDP session slots after Stop=%d, want 0", got)
 	}
 }
 

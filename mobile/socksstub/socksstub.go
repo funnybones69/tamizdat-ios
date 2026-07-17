@@ -94,6 +94,7 @@ type upstreamClient interface {
 
 type runtimeState struct {
 	mu             sync.Mutex
+	acceptWG       sync.WaitGroup
 	listener       net.Listener
 	cancel         context.CancelFunc
 	ctx            context.Context
@@ -114,6 +115,10 @@ type runtimeState struct {
 }
 
 var rt = &runtimeState{logsMax: 500}
+
+var listenerLifecycleMu sync.Mutex
+
+var socksStopDrainTimeout = 2 * time.Second
 
 // flowState is registered for every active SOCKS5 flow. The registry
 // is walked by CloseAllFlows() (called from Swift's kernel
@@ -367,6 +372,9 @@ func SetLogSink(path string) {
 // Idempotent — calling again with a different addr is a no-op (Stop
 // first). Returns immediately; the accept loop runs in the background.
 func Start(addrSpec string) error {
+	listenerLifecycleMu.Lock()
+	defer listenerLifecycleMu.Unlock()
+
 	rt.mu.Lock()
 	if rt.listener != nil {
 		rt.mu.Unlock()
@@ -420,35 +428,65 @@ func Start(addrSpec string) error {
 	rt.ctx = ctx
 	rt.cancel = cancel
 	rt.socketPath = addr
+	rt.acceptWG.Add(1)
 	rt.mu.Unlock()
 
 	rt.appendLog(fmt.Sprintf("info: socks listener up on %s://%s", network, addr))
-	go acceptLoop(ctx, ln)
+	state := rt
+	go func() {
+		defer state.acceptWG.Done()
+		acceptLoop(state, ctx, ln)
+	}()
 	return nil
 }
 
 // Stop closes the listener and any active connections.
 func Stop() {
-	rt.mu.Lock()
-	ln := rt.listener
-	cancel := rt.cancel
-	path := rt.socketPath
-	rt.listener = nil
-	rt.cancel = nil
-	rt.ctx = nil
-	rt.mu.Unlock()
+	listenerLifecycleMu.Lock()
+	defer listenerLifecycleMu.Unlock()
+
+	state := rt
+	state.mu.Lock()
+	ln := state.listener
+	cancel := state.cancel
+	path := state.socketPath
+	state.listener = nil
+	state.cancel = nil
+	state.ctx = nil
+	state.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
 	if ln != nil {
 		_ = ln.Close()
 	}
+	// Closing the listener prevents any new handler registration. Wait for the
+	// accept loop to finish the last possible handoff, then close every
+	// connection already handed to a handler. Context cancellation alone does
+	// not unblock a handler blocked in ReadFull on the loopback TCP connection.
+	state.acceptWG.Wait()
+	closed := closeRegisteredFlows()
+	drained := waitForConnectionsToDrain(state, socksStopDrainTimeout)
 	// Remove only if it looks like a UDS path (TCP "127.0.0.1:1080"
 	// would not be a valid path).
 	if path != "" && len(path) > 0 && path[0] == '/' {
 		_ = os.Remove(path)
 	}
-	rt.appendLog("info: socks listener stopped")
+	if !drained {
+		state.appendLog(fmt.Sprintf("warn: socks listener stop timed out with %d active flows", state.connsActive.Load()))
+	}
+	state.appendLog(fmt.Sprintf("info: socks listener stopped closedFlows=%d drained=%t", closed, drained))
+}
+
+func waitForConnectionsToDrain(state *runtimeState, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for state.connsActive.Load() != 0 {
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // Status returns "stopped" or "listening".
@@ -988,7 +1026,7 @@ func (r *runtimeState) appendLog(line string) {
 // the real memory leak so we no longer need any kind of accept-time
 // throttling. Every accepted conn gets its own goroutine; nuclear
 // close (D7) handles emergencies.
-func acceptLoop(ctx context.Context, ln net.Listener) {
+func acceptLoop(state *runtimeState, ctx context.Context, ln net.Listener) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -1009,14 +1047,14 @@ func acceptLoop(ctx context.Context, ln net.Listener) {
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 		}
-		n := rt.connsTotal.Add(1)
-		rt.connsActive.Add(1)
+		n := state.connsTotal.Add(1)
+		state.connsActive.Add(1)
 		flowLogf("info: accept #%d from %s", n, c.RemoteAddr())
 		fs := &flowState{conn: c}
 		flowRegistry.Store(n, fs)
 		go func(client net.Conn, idx uint64) {
 			defer client.Close()
-			defer rt.connsActive.Add(-1)
+			defer state.connsActive.Add(-1)
 			defer flowRegistry.Delete(idx)
 			handleSocks(ctx, client, idx)
 		}(c, n)
@@ -1618,7 +1656,7 @@ func relay(a, b net.Conn, idx uint64) {
 // iteration and exits naturally; tamizdat's transport pool stays alive.
 //
 // gomobile binding exposes this as SocksstubCloseAllFlows().
-func CloseAllFlows() int32 {
+func closeRegisteredFlows() int32 {
 	closed := int32(0)
 	flowRegistry.Range(func(k, v any) bool {
 		fs := v.(*flowState)
@@ -1626,6 +1664,11 @@ func CloseAllFlows() int32 {
 		closed++
 		return true
 	})
+	return closed
+}
+
+func CloseAllFlows() int32 {
+	closed := closeRegisteredFlows()
 	if closed > 0 {
 		rt.appendLog(fmt.Sprintf("warn: nuclear close — %d flows terminated under memory pressure", closed))
 	}
