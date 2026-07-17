@@ -557,3 +557,48 @@ func TestFwdUDPAdmittedSessionExitsWhenTURNBecomesPending(t *testing.T) {
 		t.Fatalf("pending transition leaked target slots=%d", got)
 	}
 }
+
+func TestFwdUDPParentCancelClosesBlockedClientAndReleasesSessionSlot(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	server, client := net.Pipe()
+	t.Cleanup(func() {
+		cancel()
+		_ = client.Close()
+		_ = server.Close()
+	})
+
+	done := make(chan struct{})
+	go func() {
+		handleFwdUDPWithDial(ctx, server, 3, func(context.Context, string) (net.PacketConn, error) {
+			return newFwdUDPTestPacketConn(nil), nil
+		})
+		close(done)
+	}()
+
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read FWD_UDP success reply: %v", err)
+	}
+	if reply[0] != socksVersion5 || reply[1] != socksReplySuccess {
+		t.Fatalf("FWD_UDP reply=%v, want success", reply)
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 1 {
+		t.Fatalf("admitted session slots=%d, want 1", got)
+	}
+
+	// Do not close the peer. Parent cancellation alone must wake io.ReadFull,
+	// end the handler and release its process-wide session slot.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled FWD_UDP session stayed blocked on peer I/O")
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("cancelled session leaked outer slot=%d", got)
+	}
+	if got := len(fwdUDPGlobalSlots); got != 0 {
+		t.Fatalf("cancelled session leaked target slots=%d", got)
+	}
+}

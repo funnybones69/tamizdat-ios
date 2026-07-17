@@ -30,7 +30,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private struct MemoryPressureState {
         var lastNuclearCloseAt = Date.distantPast
+        // Every delivered critical event, including ones swallowed by the
+        // nuclear-close rate limit, re-arms the recovery cooldown via this
+        // timestamp. lastNuclearCloseAt alone would let a critical at t+59
+        // pass unseen and recovery attach at t+60 — one second after live
+        // pressure.
+        var lastCriticalEventAt = Date.distantPast
         var didDumpHeap = false
+        var recoveryScheduled = false
+        var recoveryAttempted = false
     }
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
@@ -57,7 +65,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var swiftLogHandle: FileHandle?
     private var memPressureSrc: DispatchSourceMemoryPressure?
     private let memoryPressureState = OSAllocatedUnfairLock<MemoryPressureState>(initialState: .init())
+    private let pressureRecoveryTask = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
     private static let memoryPressureCooldown: TimeInterval = 60
+    private static let turnPressureRecoveryHeadroomBytes: UInt64 = 20 * 1024 * 1024
+    private static let turnPressureRecoveryStableSamples = 2
+    private static let turnPressureRecoveryPollNanoseconds: UInt64 = 2_000_000_000
+    private static let turnPressureRecoveryMaxPolls = 150
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
@@ -333,6 +346,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return "\(resolvedPeer.ip):\(port)"
     }
 
+    private static func roomCount(inBundleJSON json: String?) -> Int {
+        guard let json, !json.isEmpty,
+              let data = json.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let rooms = object["rooms"] as? [Any]
+        else { return 0 }
+        return rooms.count
+    }
+
     /// Spin up the VK TURN runner if the operator selected it.
     /// All inputs come from App Group UserDefaults — the user fills
     /// them in Settings → VK TURN before flipping the picker on.
@@ -380,10 +402,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return "already running"
         }
 
-        // Prefer the atomic multi-room bundle. Legacy single-room JSON remains
-        // readable so existing installs can refresh once after upgrading.
+        // Prefer the atomic multi-room bundle. Legacy JSON is a migration path
+        // for a true single-room install only. A configured multi-room tunnel
+        // must fail closed if its complete bundle is missing: silently falling
+        // back to one legacy room during pressure recovery would make 4×20
+        // appear recovered while actually running only 20 workers.
         let roomBundleJSON = TURNCredsStore.shared.validatedRoomBundleJSON()
         let legacyCredsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
+        let bundleRoomCount = Self.roomCount(inBundleJSON: roomBundleJSON)
+        if roomCount > 1 && bundleRoomCount != roomCount {
+            ExtLog.warn("[vkturn] attach SKIPPED — incomplete multi-room bundle bundleRooms=\(bundleRoomCount) configured=\(roomCount)")
+            return "noCreds"
+        }
         guard (roomBundleJSON?.isEmpty == false) || (legacyCredsJSON?.isEmpty == false) else {
             ExtLog.warn("[vkturn] attach SKIPPED — no complete credential bundle in App Group")
             return "noCreds"
@@ -553,6 +583,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let defaults = UserDefaults(suiteName: groupID)
         let roomBundle = TURNCredsStore.shared.validatedRoomBundleJSON()
         let legacyJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
+        let configuredRoomCount = VKCredsPreferences.roomHashes.count
+        let bundleRoomCount = Self.roomCount(inBundleJSON: roomBundle)
+
+        if configuredRoomCount > 1 && bundleRoomCount != configuredRoomCount {
+            ExtLog.warn("[vkturn] refresh creds SKIPPED — incomplete multi-room bundle bundleRooms=\(bundleRoomCount) configured=\(configuredRoomCount)")
+            return "noCreds"
+        }
 
         let beforeMs = Date()
         let err: String
@@ -605,8 +642,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // TURN workers/allocations in Go background. Replacement starts remain
         // gated until that drain completes.
         Self.turnTunnelGenerationLock.withLock { $0 += 1 }
+        pressureRecoveryTask.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         SocksstubStopVKTurnUpstreamAsync()
         hev_socks5_tunnel_quit()
+        // Go Stop closes the listener, waits for the accept handoff, closes all
+        // registered flows and bounds the drain to two seconds.
+        SocksstubStop()
+        appendExtLog("info: stopTunnel stopped SOCKS listener and drained registered flows")
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
         stopBurstProtection()  // IPA-D2
@@ -1035,9 +1080,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             SocksstubSetVKTurnRequired(true)
             SocksstubStopVKTurnUpstream()
             let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
-            let hasBundle = TURNCredsStore.shared.validatedRoomBundleJSON()?.isEmpty == false
+            let roomBundleJSON = TURNCredsStore.shared.validatedRoomBundleJSON()
+            let hasBundle = roomBundleJSON?.isEmpty == false
             let hasLegacy = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")?.isEmpty == false
-            guard hasBundle || hasLegacy else {
+            let configuredRoomCount = VKCredsPreferences.roomHashes.count
+            let bundleRoomCount = Self.roomCount(inBundleJSON: roomBundleJSON)
+            if configuredRoomCount > 1 && bundleRoomCount != configuredRoomCount {
+                appendExtLog("warn: VK TURN restart skipped — incomplete multi-room bundle bundleRooms=\(bundleRoomCount) configured=\(configuredRoomCount)")
+                completionHandler?("noCreds".data(using: .utf8))
+                return
+            }
+            let hasRequiredCredentials = configuredRoomCount > 1 ? hasBundle : (hasBundle || hasLegacy)
+            guard hasRequiredCredentials else {
                 appendExtLog("warn: VK TURN restart skipped — no credential payload in App Group")
                 completionHandler?("noCreds".data(using: .utf8))
                 return
@@ -1170,6 +1224,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         //
         // Only retained: task-stack-size 24 KiB (default 84 KiB,
         // historic iOS budget choice — out of scope to revisit).
+        // Key the cap on TURN *capability*, not the instantaneous effective
+        // policy: HEV reads this YAML once at tunnel start, while the endpoint
+        // can live-switch H2<->TURN later without a tunnel restart. A
+        // TURN-capable tunnel always gets the room-based cap so a switch into
+        // 3-4-room TURN can never leave HEV holding an H2-sized session
+        // backlog under memory pressure.
+        let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+        let turnCapable = policy.usesTURN || policy.whitelistModeRaw == "vkTurn"
+        let configuredRoomCount = VKCredsPreferences.roomHashes.count
+        let maxSessionCount: Int
+        if turnCapable {
+            if configuredRoomCount <= 1 {
+                maxSessionCount = 160
+            } else if configuredRoomCount == 2 {
+                maxSessionCount = 128
+            } else {
+                maxSessionCount = 96
+            }
+        } else {
+            maxSessionCount = 500
+        }
+        appendExtLog("info: hev max-session-count=\(maxSessionCount) turnCapable=\(turnCapable) upstream=\(policy.upstream.rawValue) configuredRooms=\(configuredRoomCount)")
         let yaml = """
 tunnel:
   mtu: 1280
@@ -1182,16 +1258,15 @@ socks5:
 
 misc:
   task-stack-size: 24576
+  # HEV 2.14.4 conf/main.yml defines this key; align it with Go socksFlowLimit.
+  max-session-count: \(maxSessionCount)
   log-level: 'info'
   connect-timeout: 2000
-  # IPA-D19: bump hev per-socket read/write idle from 60s to 5min.
-  # 60s killed AnyDesk after ~1 minute when the user paused typing on the
-  # HID side of its multi-TCP relay (only the video channel kept hev's read
-  # loop fed; HID went silent and tripped the deadline). 5 min matches sing-
-  # box's industry-standard UDPTimeout/TCPKeepAliveInitial constants
-  # (sing-box/constant/timeout.go:6,12). See diagnosis at
-  # /c/var-tmp/anydesk-diagnosis.md.
-  read-write-timeout: 300000
+  # HEV 2.14.4 exposes protocol-specific timeout keys in conf/main.yml. Keep
+  # idle TCP control channels (for example AnyDesk HID) alive for five minutes
+  # while retaining HEV's 60s UDP idle reclamation.
+  tcp-read-write-timeout: 300000
+  udp-read-write-timeout: 60000
 """
         appendExtLog("info: hev config built (\(yaml.utf8.count) bytes)")
 
@@ -1526,6 +1601,10 @@ misc:
         // IPA-D9: dump one heap profile per pressure episode. iOS may
         // repeatedly deliver `.critical`; the shared cooldown below prevents
         // a GC/profile/flow-close feedback loop.
+        pressureRecoveryTask.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
         memoryPressureState.withLock { $0 = MemoryPressureState() }
         let q = DispatchQueue(label: "com.anarki.samizdat-test.burst", qos: .userInitiated)
         let src = DispatchSource.makeMemoryPressureSource(eventMask: [.critical], queue: q)
@@ -1538,32 +1617,354 @@ misc:
 
     private func handleCriticalMemoryPressure(reason: String) -> Bool {
         let now = Date()
-        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool) in
+        // Capture ownership before any side effect: a handler delivered just
+        // before Disconnect must not stop TURN/flows of the next tunnel.
+        let handlerTunnelGeneration = Self.turnTunnelGenerationLock.withLock { $0 }
+        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool, scheduleRecovery: Bool, manualRecovery: Bool) in
+            state.lastCriticalEventAt = now
             guard now.timeIntervalSince(state.lastNuclearCloseAt) >= Self.memoryPressureCooldown else {
-                return (false, false)
+                return (false, false, false, false)
             }
             state.lastNuclearCloseAt = now
             let shouldDump = !state.didDumpHeap
             state.didDumpHeap = true
-            return (true, shouldDump)
+            if state.recoveryScheduled {
+                return (true, shouldDump, false, false)
+            }
+            if state.recoveryAttempted {
+                return (true, shouldDump, false, true)
+            }
+            state.recoveryScheduled = true
+            return (true, shouldDump, true, false)
         }
         guard decision.run else { return false }
 
+        // Re-check after the decision: stopTunnel may have advanced the
+        // generation while this handler was queued or dumping. The side
+        // effects below (stop TURN, close flows, schedule recovery) must
+        // never land on the next tunnel's runtime.
+        guard Self.turnTunnelGenerationLock.withLock({ $0 }) == handlerTunnelGeneration else {
+            appendExtLog("warn: memorypressure CRITICAL reason=\(reason) ignored — tunnel generation changed mid-handler")
+            return false
+        }
+
+        let availKB = os_proc_available_memory() / 1024
+        appendExtLog("error: memorypressure CRITICAL reason=\(reason) avail=\(availKB)KB — entering fail-closed pressure recovery")
+        // Preserve the triggering state in the one diagnostic heap before any
+        // worker/flow teardown changes it.
         if decision.dump {
             dumpProfileBeforeNuclear(reason: reason)
         }
+        // The dump above can stall for hundreds of milliseconds; re-check
+        // ownership once more so a Disconnect/Connect completed meanwhile
+        // keeps its fresh runtime. (A microsecond race remains between this
+        // check and the calls below; its worst case is the pre-recovery
+        // behavior — TURN stopped, manual reconnect.)
+        guard Self.turnTunnelGenerationLock.withLock({ $0 }) == handlerTunnelGeneration else {
+            appendExtLog("warn: memorypressure CRITICAL reason=\(reason) ignored after dump — tunnel generation changed")
+            return false
+        }
+        // Stop is idempotent and also clears a stale netstack whose runner has
+        // already exited. Desired TURN policy remains required throughout.
+        SocksstubStopVKTurnUpstreamAsync()
         let closed = SocksstubCloseAllFlows()
-        appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — nuclear close (\(closed) flows); cooldown=60s")
-        if SocksstubTURNUpstreamRunning() {
-            // A real 4x20 incident disappeared after the first critical event
-            // before a second event could reliably trigger after the cooldown.
-            // Stop the long-lived TURN/DTLS source immediately. Desired TURN
-            // remains fail-closed and status becomes pending; reconnect is an
-            // explicit recovery action instead of risking extension death.
-            SocksstubStopVKTurnUpstreamAsync()
-            appendExtLog("error: memorypressure critical — TURN runner stopped to protect extension; reconnect required")
+        appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — stopped TURN and closed \(closed) flows; cooldown=60s")
+
+        if decision.scheduleRecovery {
+            scheduleTURNPressureRecovery(pressureAt: now)
+        } else if decision.manualRecovery {
+            appendExtLog("error: memorypressure repeated after automatic recovery — circuit breaker open; manual reconnect required")
+        } else {
+            appendExtLog("warn: memorypressure recovery already scheduled; keeping TURN fail-closed")
         }
         return true
+    }
+
+    /// One bounded automatic recovery is allowed per Network Extension tunnel
+    /// generation. It waits for the old runner's drain/release barrier, the
+    /// full 60-second pressure cooldown, and two stable >=20 MiB headroom
+    /// samples. A second critical episode opens the circuit breaker instead of
+    /// creating a stop/start pressure loop. Room preferences are never reduced.
+    /// Pressure state is owned per tunnel generation: startBurstProtection
+    /// resets it on every tunnel start. Rewire changes within one tunnel
+    /// intentionally do NOT block these writes — an exiting recovery task must
+    /// still reset the shared per-tunnel state (e.g. after a rewire or policy
+    /// change) or recoveryScheduled would stay latched and both auto-recovery
+    /// and the circuit breaker would be dead for the rest of the tunnel.
+    private func mutatePressureStateIfOwned(
+        tunnelGeneration: Int,
+        _ mutate: (inout MemoryPressureState) -> Void
+    ) -> Bool {
+        Self.turnTunnelGenerationLock.withLock { currentTunnelGeneration -> Bool in
+            guard currentTunnelGeneration == tunnelGeneration else { return false }
+            memoryPressureState.withLock { state in
+                mutate(&state)
+            }
+            return true
+        }
+    }
+
+    private func scheduleTURNPressureRecovery(pressureAt: Date) {
+        let capturedTunnelGeneration = Self.turnTunnelGenerationLock.withLock { $0 }
+        let capturedRewireGeneration = rewireGeneration
+        appendExtLog("info: memorypressure auto-recovery scheduled tunnelGeneration=\(capturedTunnelGeneration) rewireGeneration=\(capturedRewireGeneration) rooms=\(VKCredsPreferences.roomHashes.count) cooldown=60s headroom=20MiB")
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            var stableHeadroomSamples = 0
+            var requestedCompaction = false
+            var previousLastPressure = pressureAt
+
+            for poll in 1...Self.turnPressureRecoveryMaxPolls {
+                if Task.isCancelled { return }
+                guard Self.turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration,
+                      self.isRunning else {
+                    // Do not mutate recovery state here: the same provider
+                    // object may already have reset it for a newer generation.
+                    self.appendExtLog("info: memorypressure auto-recovery cancelled — tunnel generation stopped or changed")
+                    return
+                }
+                guard self.rewireGeneration == capturedRewireGeneration else {
+                    let didMutate = self.mutatePressureStateIfOwned(
+                        tunnelGeneration: capturedTunnelGeneration
+                    ) {
+                        $0.recoveryScheduled = false
+                        $0.recoveryAttempted = false
+                    }
+                    guard didMutate else {
+                        self.appendExtLog("info: memorypressure auto-recovery state reset skipped, ownership changed")
+                        return
+                    }
+                    self.appendExtLog("info: memorypressure auto-recovery cancelled — authoritative rewire generation changed")
+                    return
+                }
+
+                let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob)
+                guard policy.usesTURN else {
+                    let didMutate = self.mutatePressureStateIfOwned(
+                        tunnelGeneration: capturedTunnelGeneration
+                    ) {
+                        $0.recoveryScheduled = false
+                        $0.recoveryAttempted = false
+                    }
+                    guard didMutate else {
+                        self.appendExtLog("info: memorypressure auto-recovery state reset skipped, ownership changed")
+                        return
+                    }
+                    self.appendExtLog("info: memorypressure auto-recovery cancelled — current policy no longer uses TURN")
+                    return
+                }
+
+                let lastPressure = self.memoryPressureState.withLock { max($0.lastNuclearCloseAt, $0.lastCriticalEventAt) }
+                if lastPressure > previousLastPressure {
+                    previousLastPressure = lastPressure
+                    stableHeadroomSamples = 0
+                    self.appendExtLog("info: memorypressure auto-recovery cooldown re-armed by repeated pressure")
+                }
+                let cooldownComplete = Date().timeIntervalSince(lastPressure) >= Self.memoryPressureCooldown
+                if !cooldownComplete || SocksstubTURNUpstreamDraining() {
+                    do {
+                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+
+                let availableBeforeCompaction = os_proc_available_memory()
+                if availableBeforeCompaction < Self.turnPressureRecoveryHeadroomBytes,
+                   !requestedCompaction {
+                    // Limit this recovery poller to one post-drain compaction;
+                    // never repeat it every two seconds as the reverted loop did.
+                    // The 30 s heartbeat backstop and nuclear-close compaction
+                    // remain independent pressure-safety mechanisms.
+                    requestedCompaction = true
+                    SocksstubFreeOSMemory()
+                    self.appendExtLog("info: memorypressure auto-recovery requested one post-drain memory compaction")
+                    do {
+                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+
+                let available = os_proc_available_memory()
+                if available >= Self.turnPressureRecoveryHeadroomBytes {
+                    stableHeadroomSamples += 1
+                } else {
+                    stableHeadroomSamples = 0
+                }
+
+                if stableHeadroomSamples < Self.turnPressureRecoveryStableSamples {
+                    if poll % 15 == 0 {
+                        self.appendExtLog("info: memorypressure auto-recovery waiting headroom=\(available / 1024)KB stable=\(stableHeadroomSamples)/\(Self.turnPressureRecoveryStableSamples)")
+                    }
+                    do {
+                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+
+                // Re-check ownership immediately before consuming the one-shot
+                // attempt. A rewire may have started while headroom was sampled.
+                guard Self.turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration,
+                      self.isRunning else {
+                    self.appendExtLog("info: memorypressure auto-recovery cancelled before attach — tunnel generation changed")
+                    return
+                }
+                guard self.rewireGeneration == capturedRewireGeneration,
+                      Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob).usesTURN else {
+                    let didMutate = self.mutatePressureStateIfOwned(
+                        tunnelGeneration: capturedTunnelGeneration
+                    ) {
+                        $0.recoveryScheduled = false
+                        $0.recoveryAttempted = false
+                    }
+                    guard didMutate else {
+                        self.appendExtLog("info: memorypressure auto-recovery state reset before attach skipped, ownership changed")
+                        return
+                    }
+                    self.appendExtLog("info: memorypressure auto-recovery cancelled before attach — rewire/policy ownership changed")
+                    return
+                }
+
+                var ownsAttempt = false
+                let didMutate = self.mutatePressureStateIfOwned(
+                    tunnelGeneration: capturedTunnelGeneration
+                ) { state in
+                    guard state.recoveryScheduled, !state.recoveryAttempted else { return }
+                    state.recoveryScheduled = false
+                    state.recoveryAttempted = true
+                    ownsAttempt = true
+                }
+                guard didMutate else {
+                    self.appendExtLog("info: memorypressure auto-recovery attempt consume skipped, ownership changed")
+                    return
+                }
+                guard ownsAttempt else {
+                    self.appendExtLog("info: memorypressure auto-recovery skipped — recovery ownership changed")
+                    return
+                }
+
+                // Desired TURN remains fail-closed before, during and after
+                // attach. attachVKTurnUpstream re-reads the same complete App
+                // Group room bundle; it does not silently truncate 4 rooms.
+                // Holding both generation locks across attach closes the
+                // check-to-attach race with stopTunnel/rewire. This is only
+                // legal with scheduleDrainRetry:false — the drain-retry path
+                // (scheduleVKTurnAttachAfterDrain) takes the same non-recursive
+                // turnTunnelGenerationLock and would deadlock here.
+                let ownedResult = Self.turnTunnelGenerationLock.withLock { currentTunnelGeneration -> String? in
+                    guard currentTunnelGeneration == capturedTunnelGeneration,
+                          !Task.isCancelled,
+                          self.isRunning
+                    else { return nil }
+                    return self.rewireGenerationLock.withLock { currentRewireGeneration -> String? in
+                        guard currentRewireGeneration == capturedRewireGeneration,
+                              !Task.isCancelled,
+                              self.isRunning,
+                              Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob).usesTURN
+                        else { return nil }
+                        SocksstubSetVKTurnRequired(true)
+                        return Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer, scheduleDrainRetry: false)
+                    }
+                }
+                guard let result = ownedResult else {
+                    // The consumed one-shot never attached. Hand the allowance
+                    // back (tunnel-guarded) so a later critical in this tunnel
+                    // schedules a fresh recovery instead of instantly opening
+                    // the breaker for an attach that never ran.
+                    _ = self.mutatePressureStateIfOwned(
+                        tunnelGeneration: capturedTunnelGeneration
+                    ) {
+                        $0.recoveryScheduled = false
+                        $0.recoveryAttempted = false
+                    }
+                    self.appendExtLog("info: memorypressure auto-recovery attach skipped, ownership changed; attempt returned")
+                    return
+                }
+                self.appendExtLog("info: memorypressure auto-recovery attach result=\(result.isEmpty ? "started" : result) headroom=\(available / 1024)KB")
+
+                if result == "previous runner still draining" {
+                    let didMutate = self.mutatePressureStateIfOwned(
+                        tunnelGeneration: capturedTunnelGeneration
+                    ) {
+                        $0.recoveryScheduled = true
+                        $0.recoveryAttempted = false
+                    }
+                    guard didMutate else {
+                        self.appendExtLog("info: memorypressure auto-recovery drain retry state skipped, ownership changed")
+                        return
+                    }
+                    stableHeadroomSamples = 0
+                    do {
+                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
+                    } catch {
+                        return
+                    }
+                    continue
+                }
+                guard result.isEmpty || result == "already running" else {
+                    self.appendExtLog("error: memorypressure auto-recovery failed before runner readiness; manual reconnect required")
+                    return
+                }
+
+                for _ in 0..<120 { // 60 s bound for runner + GETCONF + WG attach
+                    if Task.isCancelled { return }
+                    guard Self.turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration,
+                          self.rewireGeneration == capturedRewireGeneration,
+                          self.isRunning else {
+                        self.appendExtLog("info: memorypressure auto-recovery readiness poll cancelled — lifecycle generation changed")
+                        return
+                    }
+                    if !SocksstubTURNUpstreamWGConfig().isEmpty {
+                        self.appendExtLog("info: memorypressure auto-recovery READY workers=\(SocksstubTURNUpstreamActiveWorkers())/\(SocksstubTURNUpstreamExpectedWorkers()) rooms=\(VKCredsPreferences.roomHashes.count)")
+                        return
+                    }
+                    if !SocksstubTURNUpstreamRunning() {
+                        self.appendExtLog("error: memorypressure auto-recovery runner exited before ready; manual reconnect required")
+                        return
+                    }
+                    do {
+                        try await Task.sleep(nanoseconds: 500_000_000)
+                    } catch {
+                        return
+                    }
+                }
+                let didMutateAfterReadinessTimeout = self.mutatePressureStateIfOwned(
+                    tunnelGeneration: capturedTunnelGeneration
+                ) {
+                    $0.recoveryScheduled = false
+                    $0.recoveryAttempted = true
+                }
+                guard didMutateAfterReadinessTimeout else {
+                    self.appendExtLog("info: memorypressure auto-recovery readiness timeout state skipped, ownership changed")
+                    return
+                }
+                self.appendExtLog("error: memorypressure auto-recovery timed out waiting for WG netstack; manual reconnect required")
+                return
+            }
+
+            if Task.isCancelled { return }
+            let didMutate = self.mutatePressureStateIfOwned(
+                tunnelGeneration: capturedTunnelGeneration
+            ) {
+                $0.recoveryScheduled = false
+                $0.recoveryAttempted = true
+            }
+            guard didMutate else {
+                self.appendExtLog("info: memorypressure auto-recovery drain/headroom timeout state skipped, ownership changed")
+                return
+            }
+            self.appendExtLog("error: memorypressure auto-recovery timed out waiting for drain/headroom; manual reconnect required")
+        }
+        pressureRecoveryTask.withLock {
+            $0?.cancel()
+            $0 = task
+        }
     }
 
     private func dumpProfileBeforeNuclear(reason: String) {
