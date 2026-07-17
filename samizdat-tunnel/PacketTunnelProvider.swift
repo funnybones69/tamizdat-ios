@@ -31,7 +31,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private struct MemoryPressureState {
         var lastNuclearCloseAt = Date.distantPast
         var didDumpHeap = false
-        var criticalEvents = 0
     }
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
@@ -1505,15 +1504,14 @@ misc:
 
     private func handleCriticalMemoryPressure(reason: String) -> Bool {
         let now = Date()
-        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool, stopTURN: Bool) in
+        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool) in
             guard now.timeIntervalSince(state.lastNuclearCloseAt) >= Self.memoryPressureCooldown else {
-                return (false, false, false)
+                return (false, false)
             }
             state.lastNuclearCloseAt = now
-            state.criticalEvents += 1
             let shouldDump = !state.didDumpHeap
             state.didDumpHeap = true
-            return (true, shouldDump, state.criticalEvents >= 2)
+            return (true, shouldDump)
         }
         guard decision.run else { return false }
 
@@ -1522,13 +1520,14 @@ misc:
         }
         let closed = SocksstubCloseAllFlows()
         appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — nuclear close (\(closed) flows); cooldown=60s")
-        if decision.stopTURN && SocksstubTURNUpstreamRunning() {
-            // Repeated pressure means closing app flows did not reduce the
-            // long-lived TURN/DTLS footprint. Stop the runner asynchronously;
-            // desired TURN remains fail-closed and status becomes pending
-            // instead of repeatedly shedding flows until iOS jetsams us.
+        if SocksstubTURNUpstreamRunning() {
+            // A real 4x20 incident disappeared after the first critical event
+            // before a second event could reliably trigger after the cooldown.
+            // Stop the long-lived TURN/DTLS source immediately. Desired TURN
+            // remains fail-closed and status becomes pending; reconnect is an
+            // explicit recovery action instead of risking extension death.
             SocksstubStopVKTurnUpstreamAsync()
-            appendExtLog("error: memorypressure repeated — TURN runner stopped to prevent jetsam; reconnect required")
+            appendExtLog("error: memorypressure critical — TURN runner stopped to protect extension; reconnect required")
         }
         return true
     }

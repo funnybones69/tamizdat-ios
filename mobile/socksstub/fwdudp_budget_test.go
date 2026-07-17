@@ -247,6 +247,32 @@ func TestFwdUDPGlobalBudgetBoundsConcurrentSessions(t *testing.T) {
 	}
 	waitAtomicAtLeast(t, &dials, int64(fwdUDPGlobalMaxEntries))
 	waitFwdUDPBudgetLen(t, fwdUDPGlobalMaxEntries)
+
+	// The max+1 outer session must fail before dialing or allocating a target.
+	rejectedServer, rejectedClient := net.Pipe()
+	rejectedDone := make(chan struct{})
+	go func() {
+		handleFwdUDPWithDial(context.Background(), rejectedServer, 999, dial)
+		_ = rejectedServer.Close()
+		close(rejectedDone)
+	}()
+	rejectedReply := make([]byte, 10)
+	if _, err := io.ReadFull(rejectedClient, rejectedReply); err != nil {
+		t.Fatalf("read max+1 session reply: %v", err)
+	}
+	if rejectedReply[0] != socksVersion5 || rejectedReply[1] != socksReplyGeneral {
+		t.Fatalf("max+1 session reply=%v, want general failure", rejectedReply)
+	}
+	select {
+	case <-rejectedDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("max+1 rejected session did not stop")
+	}
+	_ = rejectedClient.Close()
+	if got := dials.Load(); got != int64(fwdUDPGlobalMaxEntries) {
+		t.Fatalf("max+1 session performed a dial: got=%d want=%d", got, fwdUDPGlobalMaxEntries)
+	}
+
 	// A second target in an already-admitted session must be rejected while the
 	// process-wide target budget is full.
 	writeFwdUDPTestFrame(t, clients[0], 13000)
@@ -260,6 +286,62 @@ func TestFwdUDPGlobalBudgetBoundsConcurrentSessions(t *testing.T) {
 	waitFwdUDPBudgetLen(t, 0)
 	if got := closes.Load(); got != int64(fwdUDPGlobalMaxEntries) {
 		t.Fatalf("closed PacketConns=%d, want %d", got, fwdUDPGlobalMaxEntries)
+	}
+}
+
+func TestFwdUDPGlobalSessionBudgetReleasesOnMalformedFrame(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		handleFwdUDPWithDial(context.Background(), server, 1001, func(context.Context, string) (net.PacketConn, error) {
+			t.Error("malformed frame must not dial a target")
+			return nil, errors.New("unexpected dial")
+		})
+		_ = server.Close()
+		close(done)
+	}()
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read FWD_UDP reply: %v", err)
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 1 {
+		t.Fatalf("accepted session slots=%d, want 1", got)
+	}
+	if _, err := client.Write([]byte{0, 0, 4}); err != nil {
+		t.Fatalf("write malformed frame: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("malformed FWD_UDP session did not stop")
+	}
+	_ = client.Close()
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("malformed session leaked slot: %d", got)
+	}
+}
+
+func TestFwdUDPGlobalSessionBudgetReleasesOnReplyFailure(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	server, client := net.Pipe()
+	_ = client.Close()
+	done := make(chan struct{})
+	go func() {
+		handleFwdUDPWithDial(context.Background(), server, 1002, func(context.Context, string) (net.PacketConn, error) {
+			t.Error("reply failure must not dial a target")
+			return nil, errors.New("unexpected dial")
+		})
+		_ = server.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reply-failed FWD_UDP session did not stop")
+	}
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("reply-failed session leaked slot: %d", got)
 	}
 }
 
