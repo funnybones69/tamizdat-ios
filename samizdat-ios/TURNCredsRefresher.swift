@@ -229,7 +229,7 @@ final class TURNCredsRefresher: ObservableObject {
     /// fresh enough for the extension to attach TURN.
     func ensureFreshForConnect(reason: String = "connectVKTurn",
                                timeout: TimeInterval = 780) async throws {
-        guard TURNCredsStore.shared.needsRefresh else {
+        guard TURNCredsStore.shared.needsRefreshForConnect else {
             TURNLog.info("turncreds", "connect preflight: cached VK TURN creds are fresh")
             return
         }
@@ -255,7 +255,7 @@ final class TURNCredsRefresher: ObservableObject {
             try await Task.sleep(nanoseconds: 500_000_000)
         }
 
-        guard !TURNCredsStore.shared.needsRefresh else {
+        guard !TURNCredsStore.shared.needsRefreshForConnect else {
             TURNLog.error("turncreds", "connect preflight failed — creds still stale after refresh: \(lastError ?? "<no error>")")
             throw TURNCredsRefreshWaitError.stillStale(lastError)
         }
@@ -379,6 +379,7 @@ final class TURNCredsRefresher: ObservableObject {
                 guard TURNCredsStore.shared.roomsAreFresh else {
                     throw TURNCredsRefreshWaitError.stillStale("неполный multi-room credential bundle")
                 }
+                TURNCredsStore.shared.clearQuotaStormMarker()
                 self.publishTurnInfo("TURN: \(roomCredentials.count) комнат готовы, \(roomCredentials.count * 20) workers.")
 
                 let bundleJSON = vkRoomCredsAsJSON(roomCredentials)

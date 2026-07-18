@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSessionReturnCountsValidBondDataBeforeCancelledEnqueue(t *testing.T) {
@@ -106,5 +107,52 @@ func TestStatsSupportsRoomsBeyondLegacyFour(t *testing.T) {
 	snapshot := stats.Snapshot()
 	if len(snapshot.RoomUpBytes) != 7 || snapshot.RoomUpBytes[6] != 606 {
 		t.Fatalf("dynamic room telemetry=%v", snapshot.RoomUpBytes)
+	}
+}
+
+func TestQuotaStormActive(t *testing.T) {
+	const now = int64(1_000)
+	tests := []struct {
+		name        string
+		active      int32
+		streak      int64
+		lastOK      int64
+		runnerStart int64
+		want        bool
+	}{
+		{name: "active worker", active: 1, streak: 8, lastOK: 900, runnerStart: 900},
+		{name: "below streak", streak: 7, lastOK: 900, runnerStart: 900},
+		{name: "recent allocation", streak: 8, lastOK: 986, runnerStart: 900},
+		{name: "last allocation old enough", streak: 8, lastOK: 985, runnerStart: 900, want: true},
+		{name: "never allocated runner too young", streak: 8, runnerStart: 986},
+		{name: "never allocated runner old enough", streak: 8, runnerStart: 985, want: true},
+		{name: "future timestamp", streak: 8, lastOK: 1_001, runnerStart: 900},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := quotaStormActive(tc.active, tc.streak, tc.lastOK, tc.runnerStart, now); got != tc.want {
+				t.Fatalf("quotaStormActive()=%t want=%t", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestStatsAllocateEventsDriveQuotaStormSnapshot(t *testing.T) {
+	stats := NewStats()
+	stats.runnerStartedUnix = 100
+	for range 8 {
+		stats.recordAllocateError(true)
+	}
+	if got := stats.snapshotAtUnix(114); got.QuotaStorm {
+		t.Fatalf("quota storm activated too early: %+v", got)
+	}
+	if got := stats.snapshotAtUnix(115); !got.QuotaStorm || got.QuotaErrStreak != 8 || got.LastAllocOKUnix != 0 {
+		t.Fatalf("quota storm snapshot=%+v", got)
+	}
+
+	stats.recordAllocateOK(time.Unix(120, 0))
+	got := stats.snapshotAtUnix(200)
+	if got.QuotaStorm || got.QuotaErrStreak != 0 || got.LastAllocOKUnix != 120 {
+		t.Fatalf("allocate success did not reset storm state: %+v", got)
 	}
 }

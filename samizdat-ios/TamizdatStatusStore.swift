@@ -90,6 +90,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     let turnNetstackReady: Int
     let turnActiveWorkers: Int
     let turnExpectedWorkers: Int
+    let turnQuotaStorm: Bool
 
     /// VK TURN relay session parameters available from the server.
     let hasTURNCreds: Bool
@@ -101,7 +102,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0,
         rewireGeneration: 0, endpointMode: "primary", effectiveEndpoint: "primary",
         desiredUpstream: "h2", upstreamKind: "h2", turnRunning: 0, turnNetstackReady: 0,
-        turnActiveWorkers: 0, turnExpectedWorkers: 0,
+        turnActiveWorkers: 0, turnExpectedWorkers: 0, turnQuotaStorm: false,
         hasTURNCreds: false
     )
 
@@ -115,7 +116,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
         case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
-        case turnRunning, turnNetstackReady, turnActiveWorkers, turnExpectedWorkers
+        case turnRunning, turnNetstackReady, turnActiveWorkers, turnExpectedWorkers, turnQuotaStorm
         case hasTURNCreds
     }
 
@@ -132,6 +133,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
          turnNetstackReady: Int = 0,
          turnActiveWorkers: Int = 0,
          turnExpectedWorkers: Int = 0,
+         turnQuotaStorm: Bool = false,
          hasTURNCreds: Bool = false) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
@@ -155,6 +157,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.turnNetstackReady = turnNetstackReady
         self.turnActiveWorkers = turnActiveWorkers
         self.turnExpectedWorkers = turnExpectedWorkers
+        self.turnQuotaStorm = turnQuotaStorm
         self.hasTURNCreds = hasTURNCreds
     }
 
@@ -182,6 +185,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.turnNetstackReady = (try? c.decode(Int.self, forKey: .turnNetstackReady)) ?? 0
         self.turnActiveWorkers = (try? c.decode(Int.self, forKey: .turnActiveWorkers)) ?? 0
         self.turnExpectedWorkers = (try? c.decode(Int.self, forKey: .turnExpectedWorkers)) ?? 0
+        self.turnQuotaStorm = (try? c.decode(Bool.self, forKey: .turnQuotaStorm)) ?? false
         self.hasTURNCreds = (try? c.decode(Bool.self, forKey: .hasTURNCreds)) ?? false
     }
 }
@@ -210,6 +214,10 @@ final class TamizdatStatusStore: ObservableObject {
     // `dataText`.
 
     private var timer: Timer?
+    private var quotaStormEpisodeActive = false
+    private var quotaStormEpisodeRefreshAttempted = false
+    private static var lastQuotaStormRefreshAt: Date?
+    private static let quotaStormRefreshCooldown: TimeInterval = 120
 
     /// IPA-D65b: True while the main-app refresher is solving a VK
     /// verification challenge (auto WKWebView or manual sheet). Drives a small
@@ -293,6 +301,7 @@ final class TamizdatStatusStore: ObservableObject {
         if result != snapshot {
             snapshot = result
         }
+        handleQuotaStorm(snap: result)
         applyDerivedState(snap: result)
 
         // IPA-D65b: mirror the refresher's in-flight flag so any
@@ -305,6 +314,42 @@ final class TamizdatStatusStore: ObservableObject {
     }
 
     // MARK: – Derived state (IPA-D22)
+
+    private func handleQuotaStorm(snap: TamizdatStatusSnapshot) {
+        if snap.turnActiveWorkers > 0 {
+            if quotaStormEpisodeActive {
+                TURNLog.info("turncreds", "quota storm episode recovered — active TURN workers observed")
+            }
+            quotaStormEpisodeActive = false
+            quotaStormEpisodeRefreshAttempted = false
+            return
+        }
+        guard snap.turnQuotaStorm else { return }
+
+        let now = Date()
+        let enteredNow = !quotaStormEpisodeActive
+        if enteredNow {
+            quotaStormEpisodeActive = true
+            quotaStormEpisodeRefreshAttempted = false
+            TURNCredsStore.shared.markQuotaStorm(at: now)
+        }
+        guard !quotaStormEpisodeRefreshAttempted else { return }
+        if let lastAttempt = Self.lastQuotaStormRefreshAt {
+            let elapsed = now.timeIntervalSince(lastAttempt)
+            guard elapsed >= Self.quotaStormRefreshCooldown else {
+                if enteredNow {
+                    let remaining = Int(Self.quotaStormRefreshCooldown - elapsed)
+                    TURNLog.warn("turncreds", "quota storm entered during refresh cooldown remaining=\(remaining)s")
+                }
+                return
+            }
+        }
+
+        quotaStormEpisodeRefreshAttempted = true
+        Self.lastQuotaStormRefreshAt = now
+        TURNLog.warn("turncreds", "quota storm detected — forcing credential refresh")
+        TURNCredsRefresher.shared.forceRefresh(reason: "quotaStorm")
+    }
 
     /// Re-derive uptime / data / rate from the latest snapshot. Called
     /// on every poll. Updates the @Published mirror properties only when

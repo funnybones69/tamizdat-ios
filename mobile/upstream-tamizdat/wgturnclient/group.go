@@ -54,6 +54,25 @@ func isTURNQuotaError(errText string) bool {
 		strings.Contains(lower, "error 486")
 }
 
+func credentialsRevisionAdvanced(captured, current uint64) bool {
+	return current > captured
+}
+
+// getCredsWithRevision returns a credential snapshot paired with a stable
+// external-push revision. The retry is only needed when an iOS credential push
+// races this read; desktop runners never advance credsRevision and therefore do
+// not repeat their potentially expensive VK fetch.
+func (r *Runner) getCredsWithRevision(ctx context.Context, tp *TurnParams, hash string, stats *Stats) (*Credentials, uint64, error) {
+	for {
+		before := r.credsRevision.Load()
+		creds, err := r.getCredsWithFallback(ctx, tp, hash, stats)
+		after := r.credsRevision.Load()
+		if before == after {
+			return creds, after, err
+		}
+	}
+}
+
 // quotaRetryDelay keeps quota-blocked workers alive until the TURN server has
 // released old allocations. Exponential backoff avoids hammering VK, while a
 // stable per-worker spread prevents all 20 workers in a room retrying together.
@@ -162,7 +181,7 @@ func (r *Runner) workerGroup(
 
 		r.groupAuthMutex.Lock()
 		log.Printf("[ГРУППА #%d] Цикл %d: запрос кредов", groupID, cycleNumber)
-		creds, err := r.getCredsWithFallback(ctx, tp, hash, stats)
+		creds, credsRevision, err := r.getCredsWithRevision(ctx, tp, hash, stats)
 		r.groupAuthMutex.Unlock()
 
 		if err != nil {
@@ -221,7 +240,7 @@ func (r *Runner) workerGroup(
 			// Stagger: 500мс между воркерами
 			workerDelay := time.Duration(i) * 500 * time.Millisecond
 
-			go func(wid int, delay time.Duration, doneCh chan struct{}) {
+			go func(wid int, delay time.Duration, doneCh chan struct{}, workerCreds *Credentials, workerCredsRevision uint64) {
 				defer close(doneCh)
 
 				if delay > 0 {
@@ -247,7 +266,7 @@ func (r *Runner) workerGroup(
 					}
 
 					configDelivered, sessErr := RunSession(batchCtx, tp, peer, d, localPort, useUDP,
-						getConf, cc, wid, creds, deviceID, password, stats, r.cfg.OnEvent,
+						getConf, cc, wid, workerCreds, deviceID, password, stats, r.cfg.OnEvent,
 						memoryProfileForWorkers(r.cfg.Workers, r.cfg.WorkersPerRoom > 0), bondV2, bondID, roomID)
 
 					if getConf {
@@ -287,10 +306,24 @@ func (r *Runner) workerGroup(
 							r.eventf("warn", "quota retry scheduled worker=%d room=%d attempt=%d delay_ms=%d", wid, roomID, quotaAttempt, delay.Milliseconds())
 							select {
 							case <-time.After(delay):
-								continue
 							case <-batchCtx.Done():
 								return
 							}
+							currentRevision := r.credsRevision.Load()
+							if credentialsRevisionAdvanced(workerCredsRevision, currentRevision) {
+								r.groupAuthMutex.Lock()
+								refreshed, revision, refreshErr := r.getCredsWithRevision(batchCtx, tp, hash, stats)
+								r.groupAuthMutex.Unlock()
+								if refreshErr != nil {
+									r.eventf("warn", "quota retry credentials refresh failed worker=%d room=%d", wid, roomID)
+								} else {
+									workerCreds = refreshed
+									workerCredsRevision = revision
+									log.Printf("quota retry picked up refreshed credentials worker=%d room=%d", wid, roomID)
+									r.eventf("info", "quota retry picked up refreshed credentials worker=%d room=%d", wid, roomID)
+								}
+							}
+							continue
 						}
 
 						quotaAttempt = 0
@@ -341,7 +374,7 @@ func (r *Runner) workerGroup(
 						return
 					}
 				}
-			}(wid, workerDelay, doneCh)
+			}(wid, workerDelay, doneCh, creds, credsRevision)
 		}
 
 		// Сохраняем батч для бесшовной ротации
