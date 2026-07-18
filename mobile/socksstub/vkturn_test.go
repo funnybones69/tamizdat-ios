@@ -422,6 +422,42 @@ func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
 	}
 }
 
+func TestVKTurnQuotaRecoveryTransitionIsRisingEdgeOnly(t *testing.T) {
+	episode, notify := vkturnQuotaRecoveryTransition(false, true, 0, true)
+	if !episode || !notify {
+		t.Fatalf("storm entry episode=%t notify=%t, want true/true", episode, notify)
+	}
+	episode, notify = vkturnQuotaRecoveryTransition(episode, true, 0, true)
+	if !episode || notify {
+		t.Fatalf("steady storm episode=%t notify=%t, want true/false", episode, notify)
+	}
+	episode, notify = vkturnQuotaRecoveryTransition(episode, true, 1, false)
+	if episode || notify {
+		t.Fatalf("recovery episode=%t notify=%t, want false/false", episode, notify)
+	}
+	episode, notify = vkturnQuotaRecoveryTransition(episode, true, 0, true)
+	if !episode || !notify {
+		t.Fatalf("second storm episode=%t notify=%t, want true/true", episode, notify)
+	}
+}
+
+type testVKTurnRecoveryCallback struct{}
+
+func (*testVKTurnRecoveryCallback) OnQuotaStorm() {}
+
+func TestVKTurnRecoveryCallbackCanBeReleased(t *testing.T) {
+	ClearVKTurnRecoveryCallback()
+	callback := &testVKTurnRecoveryCallback{}
+	SetVKTurnRecoveryCallback(callback)
+	if currentVKTurnRecoveryCallback() != callback {
+		t.Fatal("registered recovery callback was not returned")
+	}
+	ClearVKTurnRecoveryCallback()
+	if currentVKTurnRecoveryCallback() != nil {
+		t.Fatal("recovery callback survived clear")
+	}
+}
+
 func TestVKTurnRequiredFailsClosedWithoutNetstack(t *testing.T) {
 	vkturnNet.Store(nil)
 	SetVKTurnRequired(true)

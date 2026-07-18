@@ -104,6 +104,7 @@ func (r *Runner) UpdatePreloadedCredsByHash(creds map[string]*Credentials) error
 		r.updateRoomCreds(hash, snapshot)
 	}
 	r.credsRevision.Add(1)
+	r.signalCredentialsUpdated()
 	r.eventf("info", "multi-room credentials updated rooms=%d", len(creds))
 	return nil
 }

@@ -85,6 +85,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastPathInterfaceID: String? // sortable key from path.availableInterfaces
     private var lastReconnectAt = Date.distantPast
 
+    private struct TURNCredentialRecoveryState {
+        var generation = 0
+        var running = false
+        var rewireAfterRefresh = false
+    }
+    private let turnCredentialRecoveryState = OSAllocatedUnfairLock<TURNCredentialRecoveryState>(initialState: .init())
+    private var turnRecoveryBridge: VKTurnRecoveryBridge?
+    private static let turnCredentialRecoveryRetryBaseSeconds: UInt64 = 15
+    private static let turnCredentialRecoveryMaxBackoffSeconds: UInt64 = 60
+
     // IPA-D22: timestamp when startTunnel completed (the SOCKS5 listener
     // is up and we handed packets to hev). Surfaced in the "status" RPC
     // as uptimeSec so the main-app Uptime stat tile can render m:ss /
@@ -629,6 +639,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // IPA-D26: drop the auto-rewire bridge so it doesn't keep a
         // strong reference to self after the tunnel is torn down.
         autoRewireBridge = nil
+        SocksstubClearVKTurnRecoveryCallback()
+        turnRecoveryBridge = nil
+        turnCredentialRecoveryState.withLock {
+            $0.generation += 1
+            $0.running = false
+            $0.rewireAfterRefresh = false
+        }
         whitelistDetector?.stop()
         whitelistDetector = nil
         WhitelistProbePinnedStore.clear()
@@ -723,7 +740,189 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         lastReconnectAt = Date()
 
         appendExtLog("info: path change \(prev ?? "?") → \(kind) — rewiring upstream + force-closing stale flows")
-        rewireUpstream()
+        let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+        if policy.usesTURN {
+            // A same-credential TURN restart cannot replace orphaned allocations:
+            // VK returns 486 until their quota expires. Fetch a fresh accountless
+            // bundle from the NetworkExtension process's physical egress first.
+            scheduleTURNCredentialRecovery(reason: "path-change", rewireAfterRefresh: true)
+        } else {
+            rewireUpstream()
+        }
+    }
+
+    /// Starts one extension-owned credential recovery loop. Regular sockets
+    /// created by a packet-tunnel provider use the underlying physical path,
+    /// so this request remains reachable while all user traffic is correctly
+    /// fail-closed behind a 0/N TURN data plane.
+    private func scheduleTURNCredentialRecovery(reason: String, rewireAfterRefresh: Bool) {
+        guard isRunning else { return }
+        let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+        guard policy.usesTURN else {
+            if rewireAfterRefresh { rewireUpstream() }
+            return
+        }
+        guard !VKCredsPreferences.roomHashes.isEmpty else {
+            appendExtLog("warn: TURN credential recovery skipped — no configured rooms")
+            if rewireAfterRefresh { rewireUpstream() }
+            return
+        }
+
+        let generation: Int? = turnCredentialRecoveryState.withLock { state in
+            if state.running {
+                state.rewireAfterRefresh = state.rewireAfterRefresh || rewireAfterRefresh
+                return nil
+            }
+            state.generation += 1
+            state.running = true
+            state.rewireAfterRefresh = rewireAfterRefresh
+            return state.generation
+        }
+        guard let generation else {
+            appendExtLog("info: TURN credential recovery coalesced reason=\(reason)")
+            return
+        }
+
+        appendExtLog("warn: TURN credential recovery started reason=\(reason) timeout=15s")
+        Task.detached(priority: .userInitiated) { [weak self] in
+            await self?.runTURNCredentialRecovery(generation: generation, reason: reason)
+        }
+    }
+
+    private func runTURNCredentialRecovery(generation: Int, reason: String) async {
+        var attempt = 0
+        while isCurrentTURNCredentialRecovery(generation), isRunning {
+            let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+            guard policy.usesTURN else {
+                finishTURNCredentialRecovery(generation: generation, allowRewire: false)
+                return
+            }
+
+            if attempt == 0 {
+                // Release extension memory and invalidate every socket pinned to
+                // the dead interface before Foundation opens the small bootstrap
+                // request set. The fresh username does not depend on old TURN
+                // allocations completing their best-effort deallocation.
+                SocksstubStopVKTurnUpstreamAsync()
+                let closed = SocksstubCloseAllFlows()
+                appendExtLog("info: TURN credential recovery detached stale runner and closed \(closed) flows")
+            }
+
+            let runtime = Self.turnRecoveryRuntimeSnapshot()
+            if attempt > 0, runtime.active > 0 {
+                appendExtLog("info: TURN credential recovery stopped — workers recovered independently active=\(runtime.active)")
+                finishTURNCredentialRecovery(generation: generation, allowRewire: false)
+                return
+            }
+
+            attempt += 1
+            let hashes = VKCredsPreferences.roomHashes
+            do {
+                let rooms = try await TURNAnonymousCredsFetcher.fetchRooms(
+                    hashes,
+                    perRequestTimeout: 5,
+                    overallTimeout: 15
+                )
+                guard isCurrentTURNCredentialRecovery(generation), isRunning else { return }
+                guard hashes == VKCredsPreferences.roomHashes else {
+                    appendExtLog("warn: TURN credential recovery discarded — configured rooms changed")
+                    finishTURNCredentialRecovery(generation: generation, allowRewire: false)
+                    return
+                }
+                guard TURNCredsStore.shared.saveRooms(rooms) else {
+                    throw TURNAnonymousCredsFetcher.FetchError.malformed(
+                        step: "bundle",
+                        reason: "App Group save failed"
+                    )
+                }
+                TURNCredsStore.shared.clearQuotaStormMarker()
+                let bundleJSON = vkRoomCredsAsJSON(rooms)
+                guard !bundleJSON.isEmpty else {
+                    throw TURNAnonymousCredsFetcher.FetchError.malformed(
+                        step: "bundle",
+                        reason: "wire encoding failed"
+                    )
+                }
+                let updateResult = SocksstubUpdateVKTurnRoomCreds(bundleJSON)
+                if updateResult.isEmpty {
+                    appendExtLog("info: TURN credential recovery applied rooms=\(rooms.count) attempt=\(attempt) reason=\(reason)")
+                } else if updateResult == "not running" {
+                    appendExtLog("info: TURN credential recovery saved rooms=\(rooms.count); runner will read them on attach")
+                } else {
+                    appendExtLog("warn: TURN credential recovery live update returned \(updateResult)")
+                }
+                if !updateResult.isEmpty {
+                    requestTURNCredentialRecoveryRewire(generation: generation)
+                }
+                finishTURNCredentialRecovery(generation: generation, allowRewire: true)
+                return
+            } catch {
+                guard isCurrentTURNCredentialRecovery(generation), isRunning else { return }
+                appendExtLog("warn: TURN credential recovery attempt=\(attempt) failed: \(error.localizedDescription)")
+
+                // Do not hold the authoritative path-change rewire hostage to
+                // an unavailable API. Restart once with the cached bundle, then
+                // keep retrying the physical bootstrap in the background.
+                if consumeTURNCredentialRecoveryRewire(generation: generation) {
+                    rewireUpstream()
+                }
+            }
+
+            let backoffSeconds = min(
+                UInt64(attempt) * Self.turnCredentialRecoveryRetryBaseSeconds,
+                Self.turnCredentialRecoveryMaxBackoffSeconds
+            )
+            try? await Task.sleep(nanoseconds: backoffSeconds * 1_000_000_000)
+        }
+    }
+
+    private func isCurrentTURNCredentialRecovery(_ generation: Int) -> Bool {
+        turnCredentialRecoveryState.withLock {
+            $0.running && $0.generation == generation
+        }
+    }
+
+    private func consumeTURNCredentialRecoveryRewire(generation: Int) -> Bool {
+        turnCredentialRecoveryState.withLock { state in
+            guard state.running, state.generation == generation else { return false }
+            let requested = state.rewireAfterRefresh
+            state.rewireAfterRefresh = false
+            return requested
+        }
+    }
+
+    private func requestTURNCredentialRecoveryRewire(generation: Int) {
+        turnCredentialRecoveryState.withLock { state in
+            guard state.running, state.generation == generation else { return }
+            state.rewireAfterRefresh = true
+        }
+    }
+
+    private func finishTURNCredentialRecovery(generation: Int, allowRewire: Bool) {
+        let shouldRewire = turnCredentialRecoveryState.withLock { state -> Bool in
+            guard state.running, state.generation == generation else { return false }
+            let requested = allowRewire && state.rewireAfterRefresh
+            state.running = false
+            state.rewireAfterRefresh = false
+            return requested
+        }
+        if shouldRewire, isRunning {
+            rewireUpstream()
+        }
+    }
+
+    private static func turnRecoveryRuntimeSnapshot() -> (running: Bool, active: Int, quotaStorm: Bool) {
+        let raw = SocksstubTURNUpstreamStatsJSON()
+        guard let data = raw.data(using: .utf8),
+              let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            return (SocksstubTURNUpstreamRunning(), 0, false)
+        }
+        return (
+            object["running"] as? Bool ?? SocksstubTURNUpstreamRunning(),
+            max(0, object["active"] as? Int ?? 0),
+            object["quota_storm"] as? Bool ?? false
+        )
     }
 
     private func describePath(_ path: Network.NWPath) -> String {
@@ -1035,6 +1234,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested whitelist probes refresh → foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
+        case "recoverVKTurnQuotaStorm":
+            // Belt-and-suspenders path for the foreground status poller. Go's
+            // rising-edge callback normally schedules this first; the recovery
+            // state coalesces both signals without issuing duplicate requests.
+            appendExtLog("warn: app requested physical-path TURN quota recovery")
+            scheduleTURNCredentialRecovery(reason: "app-quota-status", rewireAfterRefresh: true)
+            completionHandler?("scheduled".data(using: .utf8))
         case "refreshVKTurnCreds":
             // Main app fetched fresh VK TURN session params and wrote them to the
             // App Group. The active runner lives in THIS extension
@@ -1326,6 +1532,19 @@ misc:
         startPathMonitor()
         startWhitelistDetectorIfNeeded()
         isRunning = true
+        let recoveryBridge = VKTurnRecoveryBridge { [weak self] in
+            self?.scheduleTURNCredentialRecovery(reason: "quota-storm", rewireAfterRefresh: true)
+        }
+        turnRecoveryBridge = recoveryBridge
+        SocksstubSetVKTurnRecoveryCallback(recoveryBridge)
+
+        // The runner starts before HEV. If it reached a quota storm during
+        // tunnel setup, its rising edge predated callback registration; recover
+        // that state explicitly so a system-initiated connect is autonomous too.
+        let recoveryRuntime = Self.turnRecoveryRuntimeSnapshot()
+        if recoveryRuntime.running, recoveryRuntime.active == 0, recoveryRuntime.quotaStorm {
+            scheduleTURNCredentialRecovery(reason: "startup-quota-storm", rewireAfterRefresh: true)
+        }
         // IPA-D22: anchor uptime for the main-app Uptime stat tile.
         tunnelStartedAt = Date()
 

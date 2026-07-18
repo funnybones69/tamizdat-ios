@@ -171,6 +171,18 @@ final class VPNProfileStore {
         }
     }
 
+    /// Asks the packet-tunnel process to acquire a replacement anonymous TURN
+    /// bundle on its physical egress path. No credentials are carried in this
+    /// message; the extension reads room configuration from the App Group.
+    func recoverVKTurnQuotaStorm() async -> String {
+        do {
+            return try await sendProviderMessage("recoverVKTurnQuotaStorm")
+        } catch {
+            SamizdatAddLog("warn: recoverVKTurnQuotaStorm provider message failed: \(error.localizedDescription)")
+            return "sendError"
+        }
+    }
+
     /// Applies Settings → VK TURN worker-count changes to a live TURN
     /// runner. The extension re-reads App Group UserDefaults, stops the
     /// current runner if policy is Restricted+Relay, and starts a fresh

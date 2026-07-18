@@ -273,6 +273,46 @@ func TestQuotaRetryCredentialRevisionGate(t *testing.T) {
 	}
 }
 
+func TestQuotaRetryWakesImmediatelyOnCredentialUpdate(t *testing.T) {
+	runner := &Runner{credsChanged: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	done := make(chan bool, 1)
+	started := time.Now()
+	go func() {
+		done <- runner.waitForQuotaRetry(ctx, 0, 10*time.Second)
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	runner.credsRevision.Add(1)
+	runner.signalCredentialsUpdated()
+
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("quota retry treated credential wake as cancellation")
+		}
+		if elapsed := time.Since(started); elapsed >= time.Second {
+			t.Fatalf("credential update did not interrupt quota backoff: %v", elapsed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("quota retry remained asleep after credential update")
+	}
+}
+
+func TestQuotaRetryObservesUpdateBeforeSignalCapture(t *testing.T) {
+	runner := &Runner{credsChanged: make(chan struct{})}
+	runner.credsRevision.Store(2)
+	started := time.Now()
+	if !runner.waitForQuotaRetry(context.Background(), 1, time.Second) {
+		t.Fatal("advanced revision was not accepted")
+	}
+	if elapsed := time.Since(started); elapsed >= 100*time.Millisecond {
+		t.Fatalf("advanced revision waited for timer: %v", elapsed)
+	}
+}
+
 func TestCredentialPushesAdvanceRevision(t *testing.T) {
 	legacy := &Runner{}
 	legacy.UpdatePreloadedCreds(testRoomCreds("legacy-refresh"))

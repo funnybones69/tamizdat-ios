@@ -106,6 +106,8 @@ type Runner struct {
 	userAgent      atomic.Value
 	preloadedCreds atomic.Pointer[Credentials]
 	credsRevision  atomic.Uint64
+	credsSignalMu  sync.Mutex
+	credsChanged   chan struct{}
 
 	captchaResultCh chan string
 	vkSemaphore     chan struct{}
@@ -200,6 +202,7 @@ func New(cfg Config) (*Runner, error) {
 		vkSemaphore:     make(chan struct{}, 2),
 		captchaWVSem:    make(chan struct{}, 1),
 		roomCreds:       make(map[string]roomCredentialCacheEntry),
+		credsChanged:    make(chan struct{}),
 	}
 	r.vkAppID.Store(cfg.VKAppID)
 	r.vkAppSecret.Store(cfg.VKAppSecret)
@@ -412,7 +415,30 @@ func (r *Runner) UpdatePreloadedCreds(creds *Credentials) {
 	}
 	r.preloadedCreds.Store(&dup)
 	r.credsRevision.Add(1)
+	r.signalCredentialsUpdated()
 	r.eventf("info", "preloaded creds updated %s", credentialsSummary(&dup))
+}
+
+func (r *Runner) credentialsUpdateSignal() <-chan struct{} {
+	r.credsSignalMu.Lock()
+	defer r.credsSignalMu.Unlock()
+	if r.credsChanged == nil {
+		r.credsChanged = make(chan struct{})
+	}
+	return r.credsChanged
+}
+
+// signalCredentialsUpdated closes the current generation channel so every
+// quota-blocked worker wakes immediately. Replacing the channel keeps the
+// notification edge-triggered and avoids a 60-worker polling loop.
+func (r *Runner) signalCredentialsUpdated() {
+	r.credsSignalMu.Lock()
+	if r.credsChanged == nil {
+		r.credsChanged = make(chan struct{})
+	}
+	close(r.credsChanged)
+	r.credsChanged = make(chan struct{})
+	r.credsSignalMu.Unlock()
 }
 
 func (r *Runner) eventf(level, format string, args ...interface{}) {
