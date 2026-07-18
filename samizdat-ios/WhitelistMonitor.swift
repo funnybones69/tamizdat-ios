@@ -90,7 +90,7 @@ final class WhitelistMonitor: ObservableObject {
         lastConfigSignature = configSignature
 
         TURNLog.info("whitelist", "monitor cycle start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
-        let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex)
+        let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex, pinnedIPs: [:])
         guard gen == generation, !Task.isCancelled else { return Self.cycleInterval }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
             TURNLog.info("whitelist", "monitor probe \(line)")

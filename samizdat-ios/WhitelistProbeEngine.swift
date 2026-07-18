@@ -13,6 +13,7 @@ struct WhitelistProbeCycleConfig: Encodable {
     let timeoutMs: Int
     let port: Int
     let interfaceIndex: Int
+    let pinnedIPs: [String: String]
 
     enum CodingKeys: String, CodingKey {
         case foreign
@@ -20,6 +21,7 @@ struct WhitelistProbeCycleConfig: Encodable {
         case timeoutMs = "timeout_ms"
         case port
         case interfaceIndex = "interface_index"
+        case pinnedIPs = "pinned_ips"
     }
 }
 
@@ -141,13 +143,14 @@ enum WhitelistProbeEngine {
         return WhitelistProbePathSelection(interfaceIndex: bindIndex, summary: summary)
     }
 
-    static func run(interfaceIndex: UInt32? = nil) -> WhitelistProbeCycleResult {
+    static func run(interfaceIndex: UInt32? = nil, pinnedIPs: [String: String] = [:]) -> WhitelistProbeCycleResult {
         let cfg = WhitelistProbeCycleConfig(
             foreign: WhitelistProbePreferences.foreignControlTargets,
             domestic: WhitelistProbePreferences.domesticAllowlistedTargets,
             timeoutMs: defaultTimeoutMs,
             port: defaultPort,
-            interfaceIndex: Int(interfaceIndex ?? 0)
+            interfaceIndex: Int(interfaceIndex ?? 0),
+            pinnedIPs: pinnedIPs
         )
         let data: Data
         do {
@@ -167,9 +170,9 @@ enum WhitelistProbeEngine {
         }
     }
 
-    static func runAsync(interfaceIndex: UInt32? = nil) async -> WhitelistProbeCycleResult {
+    static func runAsync(interfaceIndex: UInt32? = nil, pinnedIPs: [String: String] = [:]) async -> WhitelistProbeCycleResult {
         await Task.detached(priority: .utility) {
-            run(interfaceIndex: interfaceIndex)
+            run(interfaceIndex: interfaceIndex, pinnedIPs: pinnedIPs)
         }.value
     }
 

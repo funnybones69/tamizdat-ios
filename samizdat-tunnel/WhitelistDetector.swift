@@ -177,6 +177,7 @@ final class WhitelistDetector {
         }
         let pathSelection = WhitelistProbeEngine.pathSelection(pathProvider())
         let iface = pathSelection.interfaceIndex
+        let pinned = WhitelistProbePinnedStore.current()
         let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
         let baseCadence = onBackup ? Self.onBackupCadence : Self.normalCadence
         let cadence = ProcessInfo.processInfo.isLowPowerModeEnabled ? baseCadence * 3 : baseCadence
@@ -184,11 +185,16 @@ final class WhitelistDetector {
         if iface == nil {
             log("info: detector probe uses NECP/default route (no unambiguous physical interface)")
         }
+        if pinned.isEmpty {
+            log("info: detector probe: no pinned IPs (targets unresolved) — probe resolves on physical path")
+        } else {
+            log("info: detector probe pinned=\(pinned.count) targets")
+        }
 
         probeGeneration += 1
         let gen = probeGeneration
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let result = WhitelistProbeEngine.run(interfaceIndex: iface)
+            let result = WhitelistProbeEngine.run(interfaceIndex: iface, pinnedIPs: pinned)
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 guard !self.stopped, gen == self.probeGeneration else { return }

@@ -105,6 +105,9 @@ targets:
       # extension. The Go primitive lives in SamizdatClient.xcframework;
       # Swift owns scheduling, interface selection, and hysteresis.
       - path: samizdat-ios/WhitelistProbeEngine.swift
+      # Process-local host→pinned-IP map filled by makeNetworkSettings so
+      # the detector probes the exact IPs excluded from the tunnel routes.
+      - path: samizdat-ios/WhitelistProbePinnedStore.swift
       # Retained as a low-level diagnostic helper only. The production
       # restricted-network verdict is comparative TCP+TLS in
       # WhitelistProbeEngine; ICMP does not switch endpoints.
