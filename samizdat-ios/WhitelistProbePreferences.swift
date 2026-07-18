@@ -2,9 +2,9 @@ import Foundation
 
 /// User-facing settings for carrier allowlist detection.
 ///
-/// The old D65 detector used two ICMP targets. The current detector follows
-/// the allowlist research: compare multiple foreign control domains against
-/// multiple domestic allowlisted domains using TCP-connect + TLS-SNI probes.
+/// The old D65 detector used two ICMP targets. The current defaults compare
+/// one foreign control domain against one domestic allowlisted domain using
+/// TCP-connect + TLS-SNI probes. User-configured target lists remain supported.
 /// ICMP remains available as a low-level helper file, but it is not a deciding
 /// censorship signal.
 ///
@@ -19,8 +19,8 @@ enum WhitelistProbePreferences {
     private static let successesKey = "tamizdat.whitelistSuccessesNeeded"
     private static let intervalKey = "tamizdat.whitelistProbeInterval"
 
-    static let defaultTestHost = "google.com, cloudflare.com"
-    static let defaultWhitelistHost = "ya.ru, ozon.ru, gosuslugi.ru"
+    static let defaultTestHost = "google.com"
+    static let defaultWhitelistHost = "ya.ru"
     static let defaultSuccessesNeeded = 3
     static let defaultProbeInterval = 30
 

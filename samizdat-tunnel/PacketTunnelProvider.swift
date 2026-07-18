@@ -631,6 +631,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         autoRewireBridge = nil
         whitelistDetector?.stop()
         whitelistDetector = nil
+        WhitelistProbePinnedStore.clear()
         // D61 FIX: do NOT call WhitelistStatusStore.reset() here.
         // reset() wipes activeEndpoint → defaults to .primary → Mode
         // tile flips from "Whitelist" to "Main" on every disconnect,
@@ -1505,22 +1506,33 @@ misc:
         probeTargets.append(contentsOf: WhitelistProbePreferences.foreignControlTargets)
         probeTargets.append(contentsOf: WhitelistProbePreferences.domesticAllowlistedTargets)
         var addedProbeIPs = Set<String>()
+        var pinnedProbeIPs: [String: String] = [:]
         for target in probeTargets {
-            let ips = Self.resolveProbeTargetIPv4(target, log: appendExtLog)
+            let host = target.trimmingCharacters(in: .whitespacesAndNewlines)
+            let key = host.lowercased()
+            let ips = Self.resolveProbeTargetIPv4(host, log: appendExtLog)
             if ips.isEmpty {
-                appendExtLog("warn: probe target \(target) — could not resolve to IPv4, route skipped")
+                appendExtLog("warn: probe target \(host) — could not resolve to IPv4, route skipped")
                 continue
             }
+            pinnedProbeIPs[key] = ips[0]
             for ip in ips {
                 if addedProbeIPs.contains(ip) {
-                    appendExtLog("info: probe target \(target) → \(ip) already excluded (deduped)")
+                    appendExtLog("info: probe target \(host) → \(ip) already excluded (deduped)")
                     continue
                 }
                 addedProbeIPs.insert(ip)
-                appendExtLog("info: probe target \(target) → excludedRoute \(ip)/32")
+                appendExtLog("info: probe target \(host) → excludedRoute \(ip)/32")
                 excluded.append(NEIPv4Route(destinationAddress: ip, subnetMask: "255.255.255.255"))
             }
         }
+        // INVARIANT: the pinned map and excludedRoutes above are built from
+        // the SAME resolve pass in this loop. The detector dials exactly these
+        // IPs, so its traffic provably egresses the physical carrier path. If
+        // route exclusion and pinning are ever split apart, the probe can fall
+        // back onto tunnel DNS/routing and the allowlist verdict goes blind.
+        WhitelistProbePinnedStore.set(pinnedProbeIPs)
+        appendExtLog("info: whitelist probe pinned \(pinnedProbeIPs.count) target IPs to physical path")
         ipv4.excludedRoutes = excluded
         settings.ipv4Settings = ipv4
 

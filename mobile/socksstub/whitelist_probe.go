@@ -21,11 +21,12 @@ const (
 )
 
 type whitelistProbeCycleRequest struct {
-	Foreign        []string `json:"foreign"`
-	Domestic       []string `json:"domestic"`
-	TimeoutMs      int      `json:"timeout_ms"`
-	Port           int      `json:"port"`
-	InterfaceIndex int      `json:"interface_index"`
+	Foreign        []string          `json:"foreign"`
+	Domestic       []string          `json:"domestic"`
+	TimeoutMs      int               `json:"timeout_ms"`
+	Port           int               `json:"port"`
+	InterfaceIndex int               `json:"interface_index"`
+	PinnedIPs      map[string]string `json:"pinned_ips"`
 }
 
 type whitelistProbeTargetResult struct {
@@ -118,7 +119,7 @@ func normalizeWhitelistProbeHosts(in []string) []string {
 	return out
 }
 
-type whitelistProbeFunc func(context.Context, string, int, int) whitelistProbeTargetResult
+type whitelistProbeFunc func(ctx context.Context, host, dialIP string, port, ifaceIndex int) whitelistProbeTargetResult
 
 func runWhitelistProbeCycle(cfg whitelistProbeCycleRequest, probe whitelistProbeFunc) whitelistProbeCycleResult {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.TimeoutMs+750)*time.Millisecond)
@@ -133,7 +134,8 @@ func runWhitelistProbeCycle(cfg whitelistProbeCycleRequest, probe whitelistProbe
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				r := probe(ctx, host, cfg.Port, cfg.InterfaceIndex)
+				dialIP := cfg.PinnedIPs[strings.ToLower(host)]
+				r := probe(ctx, host, dialIP, cfg.Port, cfg.InterfaceIndex)
 				r.Group = group
 				mu.Lock()
 				results = append(results, r)
@@ -185,10 +187,13 @@ func classifyWhitelistProbeCycle(domesticPass, domesticTotal, foreignPass, forei
 	}
 }
 
-func runTCPThenTLSProbe(ctx context.Context, host string, port int, ifaceIndex int) whitelistProbeTargetResult {
+func runTCPThenTLSProbe(ctx context.Context, host, dialIP string, port, ifaceIndex int) whitelistProbeTargetResult {
 	start := time.Now()
 	res := whitelistProbeTargetResult{Host: host, Port: port}
 	addr := net.JoinHostPort(host, intToString(port))
+	if dialIP != "" {
+		addr = net.JoinHostPort(dialIP, intToString(port))
+	}
 	dialer := &net.Dialer{Timeout: deadlineTimeout(ctx, defaultWhitelistProbeTimeout)}
 	applyWhitelistProbeInterface(dialer, ifaceIndex)
 

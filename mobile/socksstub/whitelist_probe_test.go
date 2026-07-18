@@ -3,6 +3,7 @@ package socksstub
 import (
 	"context"
 	"encoding/json"
+	"sync"
 	"testing"
 )
 
@@ -26,7 +27,7 @@ func TestWhitelistProbeClassifiesAllowlistOnlyWhenDomesticPassesAndForeignAllFai
 		TimeoutMs: 1000,
 		Port:      443,
 	}
-	probe := func(_ context.Context, host string, port int, _ int) whitelistProbeTargetResult {
+	probe := func(_ context.Context, host, dialIP string, port, _ int) whitelistProbeTargetResult {
 		pass := host == "ya.ru" || host == "ozon.ru" || host == "gosuslugi.ru"
 		return whitelistProbeTargetResult{Host: host, Port: port, TCPOK: pass, TLSOK: pass, Pass: pass, ErrorClass: map[bool]string{true: "ok", false: "timeout"}[pass]}
 	}
@@ -45,7 +46,7 @@ func TestWhitelistProbeClassifiesAllowlistWithSingleForeignControl(t *testing.T)
 		Domestic: []string{"ya.ru"},
 		Port:     443,
 	}
-	probe := func(_ context.Context, host string, port int, _ int) whitelistProbeTargetResult {
+	probe := func(_ context.Context, host, dialIP string, port, _ int) whitelistProbeTargetResult {
 		pass := host == "ya.ru"
 		return whitelistProbeTargetResult{Host: host, Port: port, TCPOK: pass, TLSOK: pass, Pass: pass, ErrorClass: map[bool]string{true: "ok", false: "timeout"}[pass]}
 	}
@@ -58,9 +59,36 @@ func TestWhitelistProbeClassifiesAllowlistWithSingleForeignControl(t *testing.T)
 	}
 }
 
+func TestWhitelistProbePinnedIPPassedToProbe(t *testing.T) {
+	cfg := whitelistProbeCycleRequest{
+		Foreign:   []string{"google.com"},
+		Domestic:  []string{"ya.ru"},
+		Port:      443,
+		PinnedIPs: map[string]string{"google.com": "93.184.216.34"},
+	}
+	var mu sync.Mutex
+	received := map[string]string{}
+	probe := func(_ context.Context, host, dialIP string, port, _ int) whitelistProbeTargetResult {
+		mu.Lock()
+		received[host] = dialIP
+		mu.Unlock()
+		return whitelistProbeTargetResult{Host: host, Port: port}
+	}
+	_ = runWhitelistProbeCycle(cfg, probe)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := received["google.com"]; got != "93.184.216.34" {
+		t.Fatalf("google.com dialIP=%q want %q", got, "93.184.216.34")
+	}
+	if got := received["ya.ru"]; got != "" {
+		t.Fatalf("ya.ru dialIP=%q want empty", got)
+	}
+}
+
 func TestWhitelistProbeClassifiesPartialWhenSomeForeignPass(t *testing.T) {
 	cfg := whitelistProbeCycleRequest{Foreign: []string{"google.com", "cloudflare.com"}, Domestic: []string{"ya.ru", "ozon.ru", "gosuslugi.ru"}, Port: 443}
-	probe := func(_ context.Context, host string, port int, _ int) whitelistProbeTargetResult {
+	probe := func(_ context.Context, host, dialIP string, port, _ int) whitelistProbeTargetResult {
 		pass := host != "cloudflare.com"
 		return whitelistProbeTargetResult{Host: host, Port: port, TCPOK: pass, TLSOK: pass, Pass: pass}
 	}
