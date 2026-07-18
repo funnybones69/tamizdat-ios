@@ -23,7 +23,7 @@ import (
 const (
 	singleRoomWorkerSendBuf = 128
 	multiRoomWorkerSendBuf  = 32
-	sessionReadTimeout      = 60 * time.Second
+	sessionReadTimeout      = 15 * time.Second
 	readBufSize             = 1600
 	singleRoomSocketBufSize = 625 * 1024
 	multiRoomSocketBufSize  = 128 * 1024
@@ -51,6 +51,23 @@ const (
 	handshakeSemCap     = 3
 	handshakeAcquireTTL = 5 * time.Second
 )
+
+var errSessionReadTimeout = errors.New("wgturn session inbound timeout")
+
+// sessionReadTimeoutRemaining measures the timeout from the most recent
+// inbound frame, not from an older absolute socket deadline. Durations are
+// measured from one monotonic session origin so wall-clock adjustments cannot
+// spuriously expire every worker at once.
+func sessionReadTimeoutRemaining(lastInbound, now time.Duration) time.Duration {
+	if now < lastInbound {
+		return sessionReadTimeout
+	}
+	idle := now - lastInbound
+	if idle >= sessionReadTimeout {
+		return 0
+	}
+	return sessionReadTimeout - idle
+}
 
 type sessionMemoryProfile struct {
 	socketBufferSize int
@@ -733,9 +750,16 @@ func RunSession(
 	atomic.AddInt32(&stats.ActiveConnections, 1)
 	defer atomic.AddInt32(&stats.ActiveConnections, -1)
 
-	// Proxy DTLS ↔ Dispatcher
+	// Proxy DTLS ↔ Dispatcher. A separate liveness timer watches the last
+	// successful inbound frame. This avoids a SetReadDeadline syscall for every
+	// data packet while still making the 15-second timeout relative to actual
+	// activity (the server heartbeat cadence is five seconds).
+	sessionOrigin := time.Now()
+	var lastInboundElapsed atomic.Int64
+	lastInboundElapsed.Store(0)
+	terminalErr := make(chan error, 1)
 	var proxyWg sync.WaitGroup
-	proxyWg.Add(2)
+	proxyWg.Add(3)
 
 	// Writer: dispatcher → DTLS
 	go func() {
@@ -779,30 +803,60 @@ func RunSession(
 		}
 	}()
 
+	// Inbound liveness watchdog. When the physical path disappears, UDP writes
+	// can continue to appear successful, so the missing server heartbeat is the
+	// authoritative signal that this worker must return to the group retry loop.
+	go func() {
+		defer proxyWg.Done()
+		timer := time.NewTimer(sessionReadTimeout)
+		defer timer.Stop()
+		for {
+			select {
+			case <-sessCtx.Done():
+				return
+			case now := <-timer.C:
+				nowElapsed := now.Sub(sessionOrigin)
+				observed := time.Duration(lastInboundElapsed.Load())
+				remaining := sessionReadTimeoutRemaining(observed, nowElapsed)
+				if remaining > 0 {
+					timer.Reset(remaining)
+					continue
+				}
+				// Re-check once after deciding to expire so a frame processed
+				// concurrently with the timer gets its full 15-second window.
+				latest := time.Duration(lastInboundElapsed.Load())
+				if latest != observed {
+					timer.Reset(sessionReadTimeoutRemaining(latest, time.Since(sessionOrigin)))
+					continue
+				}
+				log.Printf("[ВОРКЕР #%d] Таймаут Reader — закрываем сессию для автоматического retry", sessionID)
+				emitEvent(onEvent, "warn", "session inbound timeout worker=%d idle_ms=%d", sessionID, nowElapsed.Milliseconds()-observed.Milliseconds())
+				select {
+				case terminalErr <- errSessionReadTimeout:
+				default:
+				}
+				sessCancel()
+				return
+			}
+		}
+	}()
+
 	// Reader: DTLS → dispatcher
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
 		b := make([]byte, 2000)
-		var lastReadDeadline time.Time
 		for {
-			now := time.Now()
-			if now.Sub(lastReadDeadline) > 10*time.Second {
-				_ = dtlsConn.SetReadDeadline(now.Add(sessionReadTimeout))
-				lastReadDeadline = now
-			}
 			n, readErr := dtlsConn.Read(b)
 			if readErr != nil {
 				if sessCtx.Err() != nil {
 					// Контекст был отменен (ротация/уничтожение батча)
 					return
 				}
-				if ne, ok := readErr.(net.Error); ok && ne.Timeout() {
-					continue
-				}
 				log.Printf("[ВОРКЕР #%d] Ошибка Reader: %v", sessionID, readErr)
 				return
 			}
+			lastInboundElapsed.Store(time.Since(sessionOrigin).Nanoseconds())
 
 			if n == 6 && string(b[:6]) == "WAKEUP" {
 				continue
@@ -823,5 +877,10 @@ func RunSession(
 	_ = pipeA.Close()
 	_ = pipeB.Close()
 	log.Printf("[СЕССИЯ #%d] Завершена", sessionID)
+	select {
+	case terminal := <-terminalErr:
+		return configDelivered, terminal
+	default:
+	}
 	return configDelivered, nil
 }
