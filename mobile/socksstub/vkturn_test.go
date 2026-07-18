@@ -486,13 +486,13 @@ func TestParseVKTurnRoomCredsJSONEnforcesIOSResourceRoomLimit(t *testing.T) {
 		return `{"rooms":[` + strings.Join(rooms, ",") + `]}`
 	}
 
-	if VKTurnMaxRooms() != 4 {
-		t.Fatalf("VKTurnMaxRooms()=%d, want 4", VKTurnMaxRooms())
+	if VKTurnMaxRooms() != 3 {
+		t.Fatalf("VKTurnMaxRooms()=%d, want 3", VKTurnMaxRooms())
 	}
 	if hashes, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms())); err != nil || len(hashes) != VKTurnMaxRooms() {
 		t.Fatalf("max-room bundle rejected: hashes=%d err=%v", len(hashes), err)
 	}
-	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 4") {
+	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 3") {
 		t.Fatalf("max+1 bundle error = %v, want iOS room-limit rejection", err)
 	}
 }
