@@ -929,16 +929,18 @@ func storeVKTurnStats(active int, running bool) {
 	if running {
 		active = int(vkturnActiveWorkers.Load())
 	}
+	quotaStorm := running && active == 0 && telemetry != nil && telemetry.QuotaStorm
 	payload := struct {
-		Active    int                         `json:"active"`
-		Expected  int64                       `json:"expected"`
-		Running   bool                        `json:"running"`
-		Error     string                      `json:"error,omitempty"`
-		Telemetry *wgturnclient.StatsSnapshot `json:"telemetry,omitempty"`
-	}{Active: active, Expected: vkturnExpectedWorkers.Load(), Running: running, Error: errText, Telemetry: telemetry}
+		Active     int                         `json:"active"`
+		Expected   int64                       `json:"expected"`
+		Running    bool                        `json:"running"`
+		QuotaStorm bool                        `json:"quota_storm"`
+		Error      string                      `json:"error,omitempty"`
+		Telemetry  *wgturnclient.StatsSnapshot `json:"telemetry,omitempty"`
+	}{Active: active, Expected: vkturnExpectedWorkers.Load(), Running: running, QuotaStorm: quotaStorm, Error: errText, Telemetry: telemetry}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		snapshot := fmt.Sprintf(`{"active":%d,"expected":%d,"running":%t}`, active, vkturnExpectedWorkers.Load(), running)
+		snapshot := fmt.Sprintf(`{"active":%d,"expected":%d,"running":%t,"quota_storm":%t}`, active, vkturnExpectedWorkers.Load(), running, quotaStorm)
 		vkturnStats.Store(&snapshot)
 		return
 	}

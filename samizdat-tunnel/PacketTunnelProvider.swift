@@ -1141,16 +1141,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let actualUpstream = turnRequiredNow
                 ? (turnNetstackReady ? "turn" : "turn-pending")
                 : "h2"
-            let turnStats: (active: Int, expected: Int) = {
+            let turnStats: (active: Int, expected: Int, quotaStorm: Bool) = {
                 let fallbackExpected = VKCredsPreferences.roomHashes.count * VKCredsPreferences.workersPerRoom
                 let raw = SocksstubTURNUpstreamStatsJSON()
                 guard let data = raw.data(using: .utf8),
                       let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                else { return (0, fallbackExpected) }
+                else { return (0, fallbackExpected, false) }
                 let active = object["active"] as? Int ?? 0
                 let reportedExpected = object["expected"] as? Int ?? 0
                 let expected = reportedExpected > 0 ? reportedExpected : fallbackExpected
-                return (max(0, active), max(0, expected))
+                let quotaStorm = object["quota_storm"] as? Bool ?? false
+                return (max(0, active), max(0, expected), quotaStorm)
             }()
             // H2 ping state is irrelevant in TURN-only mode and can be stale
             // from a previous policy. Keep it neutral instead of letting an
@@ -1185,6 +1186,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "turnActiveWorkers": turnStats.active,
                 "turnExpectedWorkers": turnStats.expected,
                 "turnWorkers": turnStats.expected,
+                "turnQuotaStorm": turnStats.quotaStorm,
                 // VK TURN relay session parameter status. IPA-D65b: the main
                 // app now acquires session params itself via WKWebView verification challenge
                 // solving and writes them to App Group UserDefaults

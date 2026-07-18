@@ -103,6 +103,7 @@ func (r *Runner) UpdatePreloadedCredsByHash(creds map[string]*Credentials) error
 	for hash, snapshot := range creds {
 		r.updateRoomCreds(hash, snapshot)
 	}
+	r.credsRevision.Add(1)
 	r.eventf("info", "multi-room credentials updated rooms=%d", len(creds))
 	return nil
 }

@@ -386,10 +386,11 @@ func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
 	storeVKTurnWorkerCountIfCurrent(stale, 99)
 
 	var got struct {
-		Active    int   `json:"active"`
-		Expected  int64 `json:"expected"`
-		Running   bool  `json:"running"`
-		Telemetry struct {
+		Active     int   `json:"active"`
+		Expected   int64 `json:"expected"`
+		Running    bool  `json:"running"`
+		QuotaStorm bool  `json:"quota_storm"`
+		Telemetry  struct {
 			BondFramesUp  int64   `json:"bond_frames_up"`
 			RoomUpBytes   []int64 `json:"room_up_bytes"`
 			RoomDownBytes []int64 `json:"room_down_bytes"`
@@ -400,6 +401,24 @@ func TestVKTurnStatsJSONExportsCurrentRunnerTelemetry(t *testing.T) {
 	}
 	if !got.Running || got.Active != 44 || got.Expected != 120 || got.Telemetry.BondFramesUp != 12 || got.Telemetry.RoomUpBytes[3] != 404 || got.Telemetry.RoomDownBytes[3] != 505 {
 		t.Fatalf("telemetry JSON=%+v", got)
+	}
+
+	stormSnapshot := snapshot
+	stormSnapshot.ActiveConnections = 0
+	stormSnapshot.QuotaStorm = true
+	storeVKTurnTelemetryIfCurrent(current, stormSnapshot)
+	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.QuotaStorm {
+		t.Fatalf("quota_storm missing from stats JSON: %+v", got)
+	}
+	storeVKTurnWorkerCountIfCurrent(current, 1)
+	if err := json.Unmarshal([]byte(TURNUpstreamStatsJSON()), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.QuotaStorm {
+		t.Fatalf("quota_storm remained active after worker recovery: %+v", got)
 	}
 }
 

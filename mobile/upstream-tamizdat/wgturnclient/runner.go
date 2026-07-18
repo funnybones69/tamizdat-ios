@@ -105,6 +105,7 @@ type Runner struct {
 	noDNS          atomic.Bool
 	userAgent      atomic.Value
 	preloadedCreds atomic.Pointer[Credentials]
+	credsRevision  atomic.Uint64
 
 	captchaResultCh chan string
 	vkSemaphore     chan struct{}
@@ -410,6 +411,7 @@ func (r *Runner) UpdatePreloadedCreds(creds *Credentials) {
 		dup.TurnServers = append([]TurnServer(nil), creds.TurnServers...)
 	}
 	r.preloadedCreds.Store(&dup)
+	r.credsRevision.Add(1)
 	r.eventf("info", "preloaded creds updated %s", credentialsSummary(&dup))
 }
 

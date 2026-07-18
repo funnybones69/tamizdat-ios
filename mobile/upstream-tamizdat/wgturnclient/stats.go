@@ -6,7 +6,11 @@ import (
 	"time"
 )
 
-const defaultStatsRoomCount = 4
+const (
+	defaultStatsRoomCount = 4
+	quotaStormMinErrors   = 8
+	quotaStormMinAgeSecs  = 15
+)
 
 type Stats struct {
 	ActiveConnections int32
@@ -14,6 +18,9 @@ type Stats struct {
 	TotalBytesUp      int64
 	TotalBytesDown    int64
 	CredsErrors       int64
+	lastAllocOKUnix   int64
+	quotaErrStreak    int64
+	runnerStartedUnix int64
 
 	BondFramesUp        int64
 	BondFramesDown      int64
@@ -38,6 +45,9 @@ type StatsSnapshot struct {
 	TotalBytesUp      int64   `json:"total_bytes_up"`
 	TotalBytesDown    int64   `json:"total_bytes_down"`
 	CredsErrors       int64   `json:"credential_errors"`
+	LastAllocOKUnix   int64   `json:"last_alloc_ok_unix"`
+	QuotaErrStreak    int64   `json:"quota_error_streak"`
+	QuotaStorm        bool    `json:"quota_storm"`
 	BondFramesUp      int64   `json:"bond_frames_up"`
 	BondFramesDown    int64   `json:"bond_frames_down"`
 	BondBytesUp       int64   `json:"bond_bytes_up"`
@@ -63,6 +73,7 @@ func NewStats(roomCounts ...int) *Stats {
 		}
 	}
 	return &Stats{
+		runnerStartedUnix:   time.Now().Unix(),
 		BondRoomPackets:     make([]int64, rooms),
 		BondRoomBytes:       make([]int64, rooms),
 		BondRoomDrops:       make([]int64, rooms),
@@ -72,13 +83,23 @@ func NewStats(roomCounts ...int) *Stats {
 }
 
 func (s *Stats) Snapshot() StatsSnapshot {
+	return s.snapshotAtUnix(time.Now().Unix())
+}
+
+func (s *Stats) snapshotAtUnix(nowUnix int64) StatsSnapshot {
 	rooms := len(s.BondRoomPackets)
+	active := atomic.LoadInt32(&s.ActiveConnections)
+	lastAllocOKUnix := atomic.LoadInt64(&s.lastAllocOKUnix)
+	quotaErrStreak := atomic.LoadInt64(&s.quotaErrStreak)
 	out := StatsSnapshot{
-		ActiveConnections: atomic.LoadInt32(&s.ActiveConnections),
+		ActiveConnections: active,
 		Reconnects:        atomic.LoadInt64(&s.Reconnects),
 		TotalBytesUp:      atomic.LoadInt64(&s.TotalBytesUp),
 		TotalBytesDown:    atomic.LoadInt64(&s.TotalBytesDown),
 		CredsErrors:       atomic.LoadInt64(&s.CredsErrors),
+		LastAllocOKUnix:   lastAllocOKUnix,
+		QuotaErrStreak:    quotaErrStreak,
+		QuotaStorm:        quotaStormActive(active, quotaErrStreak, lastAllocOKUnix, s.runnerStartedUnix, nowUnix),
 		BondFramesUp:      atomic.LoadInt64(&s.BondFramesUp),
 		BondFramesDown:    atomic.LoadInt64(&s.BondFramesDown),
 		BondBytesUp:       atomic.LoadInt64(&s.BondBytesUp),
@@ -100,6 +121,31 @@ func (s *Stats) Snapshot() StatsSnapshot {
 		out.RoomDownBytes[i] = atomic.LoadInt64(&s.BondRoomDownBytes[i])
 	}
 	return out
+}
+
+func quotaStormActive(activeWorkers int32, quotaErrStreak, lastAllocOKUnix, runnerStartedUnix, nowUnix int64) bool {
+	if activeWorkers != 0 || quotaErrStreak < quotaStormMinErrors {
+		return false
+	}
+	referenceUnix := lastAllocOKUnix
+	if referenceUnix == 0 {
+		referenceUnix = runnerStartedUnix
+	}
+	return referenceUnix > 0 && nowUnix >= referenceUnix && nowUnix-referenceUnix >= quotaStormMinAgeSecs
+}
+
+func (s *Stats) recordAllocateError(quota bool) {
+	if s != nil && quota {
+		atomic.AddInt64(&s.quotaErrStreak, 1)
+	}
+}
+
+func (s *Stats) recordAllocateOK(now time.Time) {
+	if s == nil {
+		return
+	}
+	atomic.StoreInt64(&s.lastAllocOKUnix, now.Unix())
+	atomic.StoreInt64(&s.quotaErrStreak, 0)
 }
 
 func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {

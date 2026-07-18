@@ -245,6 +245,7 @@ final class TURNCredsStore {
     private static let storageKey = "tamizdat.vkTURNCreds.v2"
     private static let roomStorageKey = "tamizdat.vkTURNCreds.rooms.v1"
     static let roomJSONKey = "tamizdat.vkTURNCredsRoomsJSON"
+    private static let lastQuotaStormKey = "tamizdat.lastQuotaStormAt"
 
     /// Cushion before expiry that triggers a refresh. 15 min gives the
     /// foreground 5-minute heartbeat (TURNSession paramsRefresher) four chances
@@ -401,6 +402,37 @@ final class TURNCredsStore {
     /// `true` iff one or more configured rooms are missing/near expiry.
     var needsRefresh: Bool {
         !roomsAreFresh
+    }
+
+    var lastQuotaStormAt: Date? {
+        defaults?.object(forKey: Self.lastQuotaStormKey) as? Date
+    }
+
+    func markQuotaStorm(at date: Date = Date()) {
+        defaults?.set(date, forKey: Self.lastQuotaStormKey)
+    }
+
+    func clearQuotaStormMarker() {
+        defaults?.removeObject(forKey: Self.lastQuotaStormKey)
+    }
+
+    /// A manual reconnect must not reuse credentials minted before the latest
+    /// observed quota storm, even when their normal TTL is still healthy.
+    var credentialsPredateLastQuotaStorm: Bool {
+        guard let stormAt = lastQuotaStormAt else { return false }
+        let configured = VKCredsPreferences.roomHashes
+        var saved: [String: VKTURNCredentials] = [:]
+        for room in loadRooms() where saved[room.roomHash] == nil {
+            saved[room.roomHash] = room.credentials
+        }
+        return configured.contains { hash in
+            guard let creds = saved[hash] else { return true }
+            return creds.acquiredAt < stormAt
+        }
+    }
+
+    var needsRefreshForConnect: Bool {
+        needsRefresh || credentialsPredateLastQuotaStorm
     }
 }
 

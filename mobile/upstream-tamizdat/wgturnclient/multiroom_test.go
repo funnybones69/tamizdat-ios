@@ -1,6 +1,7 @@
 package wgturnclient
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"sync"
@@ -210,6 +211,57 @@ func TestTURNQuotaErrorsRemainRetryableWithBoundedStagger(t *testing.T) {
 	}
 	if other := quotaRetryDelay(20, 2); other == steady {
 		t.Fatalf("worker retry staggering collapsed: worker1=%v worker2=%v", steady, other)
+	}
+}
+
+func TestQuotaRetryCredentialRevisionGate(t *testing.T) {
+	tests := []struct {
+		name     string
+		captured uint64
+		current  uint64
+		want     bool
+	}{
+		{name: "unchanged", captured: 7, current: 7, want: false},
+		{name: "older", captured: 7, current: 6, want: false},
+		{name: "advanced", captured: 7, current: 8, want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := credentialsRevisionAdvanced(tc.captured, tc.current); got != tc.want {
+				t.Fatalf("credentialsRevisionAdvanced(%d, %d)=%t want=%t", tc.captured, tc.current, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCredentialPushesAdvanceRevision(t *testing.T) {
+	legacy := &Runner{}
+	legacy.UpdatePreloadedCreds(testRoomCreds("legacy-refresh"))
+	if got := legacy.credsRevision.Load(); got != 1 {
+		t.Fatalf("legacy credentials revision=%d want=1", got)
+	}
+
+	multi := &Runner{
+		cfg:       Config{WorkersPerRoom: 20, VKHashes: []string{"room-a", "room-b"}},
+		roomCreds: make(map[string]roomCredentialCacheEntry),
+	}
+	multi.updateRoomCreds("room-a", testRoomCreds("old-a"))
+	multi.updateRoomCreds("room-b", testRoomCreds("old-b"))
+	if err := multi.UpdatePreloadedCredsByHash(map[string]*Credentials{
+		"room-a": testRoomCreds("room-a-refresh"),
+		"room-b": testRoomCreds("room-b-refresh"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := multi.credsRevision.Load(); got != 1 {
+		t.Fatalf("multi-room credentials revision=%d want=1", got)
+	}
+	creds, revision, err := multi.getCredsWithRevision(context.Background(), &TurnParams{}, "room-b", NewStats())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if revision != 1 || creds.User != "user-room-b-refresh" {
+		t.Fatalf("room-b refresh revision=%d user=%q", revision, creds.User)
 	}
 }
 

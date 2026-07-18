@@ -722,7 +722,7 @@ struct ContentView: View {
             return
         }
         guard let blob = ConfigStore.shared.load() else { return }
-        let shouldPreflightTurnCreds = desiredConnectUsesVKTurn && TURNCredsStore.shared.needsRefresh
+        let shouldPreflightTurnCreds = desiredConnectUsesVKTurn && TURNCredsStore.shared.needsRefreshForConnect
         isPreparingVPN = true
         vpnProfileError = nil
         Task { @MainActor in

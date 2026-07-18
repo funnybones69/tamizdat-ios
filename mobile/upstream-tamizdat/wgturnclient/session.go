@@ -547,12 +547,14 @@ func RunSession(
 	if err != nil {
 		errStr := err.Error()
 		stunCode, quota := classifyTURNError(err)
+		stats.recordAllocateError(quota)
 		emitEvent(onEvent, ternaryEventLevel(quota), "allocate error worker=%d quota=%t stunCode=%d err=%s", sessionID, quota, stunCode, sanitizeErrForEvent(err))
 		if strings.Contains(errStr, "Quota") || strings.Contains(errStr, "486") {
 			return false, fmt.Errorf("TURN квота: %w", err)
 		}
 		return false, fmt.Errorf("TURN Allocate: %w", err)
 	}
+	stats.recordAllocateOK(time.Now())
 	defer relay.Close()
 	log.Printf("[СЕССИЯ #%d] Relay: %s", sessionID, relay.LocalAddr())
 	emitEvent(onEvent, "info", "allocate ok worker=%d relayAddrPresent=%t", sessionID, relay.LocalAddr() != nil)
