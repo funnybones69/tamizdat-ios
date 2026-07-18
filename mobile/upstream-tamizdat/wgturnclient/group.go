@@ -2,6 +2,7 @@ package wgturnclient
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -40,6 +41,13 @@ func (b *configBroker) complete(delivered bool) {
 	b.inFlight.Store(false)
 }
 
+// rearmAfterBondLoss allows exactly one future worker to become a config
+// claimant after the server-side bond disappeared. claim() still serializes
+// the claimant, and a successful recovery sets sent again through complete().
+func (b *configBroker) rearmAfterBondLoss() bool {
+	return b != nil && b.sent.CompareAndSwap(true, false)
+}
+
 func (b *configBroker) channel() chan<- string {
 	if b == nil {
 		return nil
@@ -52,6 +60,26 @@ func isTURNQuotaError(errText string) bool {
 	return strings.Contains(lower, "turn квота") ||
 		strings.Contains(lower, "allocation quota reached") ||
 		strings.Contains(lower, "error 486")
+}
+
+func isBondBindWaitTimeout(err error) bool {
+	var negotiationErr bondNegotiationError
+	if !errors.As(err, &negotiationErr) {
+		return false
+	}
+	return negotiationErr.Reason == "bind wait timeout" ||
+		negotiationErr.Reason == "bind wait retries exhausted"
+}
+
+func shouldRearmBondConfig(bondV2, getConf bool, sessErr error, activeWorkers int32) bool {
+	if !bondV2 || getConf || sessErr == nil {
+		return false
+	}
+	// When every active session timed out, re-elect a claimant before the
+	// server's empty-bond grace expires. The bind-wait fallback also recovers
+	// if cleanup won the race and token-only joins can no longer find a bond.
+	return (errors.Is(sessErr, errSessionReadTimeout) && activeWorkers == 0) ||
+		isBondBindWaitTimeout(sessErr)
 }
 
 func credentialsRevisionAdvanced(captured, current uint64) bool {
@@ -271,6 +299,11 @@ func (r *Runner) workerGroup(
 
 					if getConf {
 						broker.complete(configDelivered)
+					}
+					if shouldRearmBondConfig(bondV2, getConf, sessErr, atomic.LoadInt32(&stats.ActiveConnections)) &&
+						broker.rearmAfterBondLoss() {
+						log.Printf("[ВОРКЕР #%d] Bond исчез после потери сети — переизбираем config claimant", wid)
+						r.eventf("warn", "bond config claimant rearmed worker=%d room=%d", wid, roomID)
 					}
 
 					if sessErr != nil {

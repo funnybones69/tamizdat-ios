@@ -189,6 +189,45 @@ func TestConfigBrokerRetriesThenDeliversOnce(t *testing.T) {
 	}
 }
 
+func TestConfigBrokerRearmsExactlyOneClaimantAfterBondLoss(t *testing.T) {
+	broker := &configBroker{ch: make(chan string, 1)}
+	if !broker.claim() {
+		t.Fatal("initial claim failed")
+	}
+	broker.complete(true)
+	if !broker.rearmAfterBondLoss() {
+		t.Fatal("completed broker did not rearm")
+	}
+	if broker.rearmAfterBondLoss() {
+		t.Fatal("second rearm succeeded without another delivery")
+	}
+	if !broker.claim() {
+		t.Fatal("rearmed broker did not elect a claimant")
+	}
+	if broker.claim() {
+		t.Fatal("rearmed broker elected more than one claimant")
+	}
+	broker.complete(true)
+}
+
+func TestBondConfigRearmOnlyForFullTimeoutOrMissingBond(t *testing.T) {
+	if shouldRearmBondConfig(true, false, errSessionReadTimeout, 1) {
+		t.Fatal("partial worker timeout rearmed the shared bond")
+	}
+	if !shouldRearmBondConfig(true, false, errSessionReadTimeout, 0) {
+		t.Fatal("full worker timeout did not rearm the shared bond")
+	}
+	if !shouldRearmBondConfig(true, false, bondNegotiationError{Reason: "bind wait timeout"}, 3) {
+		t.Fatal("missing server bond did not rearm claimant")
+	}
+	if shouldRearmBondConfig(true, true, bondNegotiationError{Reason: "bind wait timeout"}, 0) {
+		t.Fatal("current claimant tried to rearm itself")
+	}
+	if shouldRearmBondConfig(false, false, errSessionReadTimeout, 0) {
+		t.Fatal("legacy mode rearmed Bond v2 claimant")
+	}
+}
+
 func TestTURNQuotaErrorsRemainRetryableWithBoundedStagger(t *testing.T) {
 	errText := "TURN allocate: Allocate error response (error 486: Allocation Quota Reached)"
 	if !isTURNQuotaError(errText) {

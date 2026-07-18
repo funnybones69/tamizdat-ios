@@ -17,6 +17,28 @@ import (
 	"github.com/pion/turn/v5"
 )
 
+func TestSessionReadTimeoutTracksLastInboundActivity(t *testing.T) {
+	tests := []struct {
+		name string
+		last time.Duration
+		now  time.Duration
+		want time.Duration
+	}{
+		{name: "initial window", last: 0, now: 0, want: 15 * time.Second},
+		{name: "heartbeat extends full window", last: 10 * time.Second, now: 15 * time.Second, want: 10 * time.Second},
+		{name: "just before expiry", last: 10 * time.Second, now: 24*time.Second + 999*time.Millisecond, want: time.Millisecond},
+		{name: "expires after full silence", last: 10 * time.Second, now: 25 * time.Second, want: 0},
+		{name: "monotonic guard", last: 2 * time.Second, now: time.Second, want: 15 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionReadTimeoutRemaining(tc.last, tc.now); got != tc.want {
+				t.Fatalf("remaining=%v want=%v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSelectTurnEndpointFiltersV2ByRequestedUDPTransport(t *testing.T) {
 	creds := &Credentials{
 		TurnURLs: []string{"udp.example:3478", "tcp.example:3478"},
