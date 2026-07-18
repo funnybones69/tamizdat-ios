@@ -86,6 +86,26 @@ func credentialsRevisionAdvanced(captured, current uint64) bool {
 	return current > captured
 }
 
+func (r *Runner) waitForQuotaRetry(ctx context.Context, capturedRevision uint64, delay time.Duration) bool {
+	changed := r.credentialsUpdateSignal()
+	// The revision check after capturing the channel closes both race windows:
+	// an update before this call is observed here, while an update after it
+	// closes `changed` and wakes the select below.
+	if credentialsRevisionAdvanced(capturedRevision, r.credsRevision.Load()) {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-changed:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // getCredsWithRevision returns a credential snapshot paired with a stable
 // external-push revision. The retry is only needed when an iOS credential push
 // races this read; desktop runners never advance credsRevision and therefore do
@@ -337,9 +357,7 @@ func (r *Runner) workerGroup(
 							delay := quotaRetryDelay(quotaAttempt, wid)
 							log.Printf("[ВОРКЕР #%d] Ошибка квоты TURN; повтор через %v: %s", wid, delay, errStr)
 							r.eventf("warn", "quota retry scheduled worker=%d room=%d attempt=%d delay_ms=%d", wid, roomID, quotaAttempt, delay.Milliseconds())
-							select {
-							case <-time.After(delay):
-							case <-batchCtx.Done():
+							if !r.waitForQuotaRetry(batchCtx, workerCredsRevision, delay) {
 								return
 							}
 							currentRevision := r.credsRevision.Load()

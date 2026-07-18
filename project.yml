@@ -112,12 +112,14 @@ targets:
       # restricted-network verdict is comparative TCP+TLS in
       # WhitelistProbeEngine; ICMP does not switch endpoints.
       - path: samizdat-ios/ICMPPinger.swift
-      # IPA-D65b: VK TURN session parameter cache (read-side only — the
-      # extension reads `TURNSession paramsStore.shared.isFresh` in its status
-      # RPC). The write side lives in the main app (WKWebView verification challenge
-      # handler + 5-step VK API client) and is intentionally NOT
-      # compiled into the extension.
+      # VK TURN session parameter cache shared across the app and extension.
+      # The main app owns the CAPTCHA/WebKit flow; the extension may write a
+      # fresh bundle only through the accountless physical-path recovery below.
       - path: samizdat-ios/TURNCredsStore.swift
+      # Foundation-only accountless VK Calls flow. Compiling this into the
+      # extension breaks the fail-closed bootstrap deadlock after a Wi-Fi ↔
+      # cellular transition without bringing WebKit into the NE target.
+      - path: samizdat-ios/TURNAnonymousCredsFetcher.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

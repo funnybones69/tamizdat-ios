@@ -216,8 +216,6 @@ final class TamizdatStatusStore: ObservableObject {
     private var timer: Timer?
     private var quotaStormEpisodeActive = false
     private var quotaStormEpisodeRefreshAttempted = false
-    private static var lastQuotaStormRefreshAt: Date?
-    private static let quotaStormRefreshCooldown: TimeInterval = 120
 
     /// IPA-D65b: True while the main-app refresher is solving a VK
     /// verification challenge (auto WKWebView or manual sheet). Drives a small
@@ -319,6 +317,7 @@ final class TamizdatStatusStore: ObservableObject {
         if snap.turnActiveWorkers > 0 {
             if quotaStormEpisodeActive {
                 TURNLog.info("turncreds", "quota storm episode recovered — active TURN workers observed")
+                TURNCredsStore.shared.clearQuotaStormMarker()
             }
             quotaStormEpisodeActive = false
             quotaStormEpisodeRefreshAttempted = false
@@ -334,21 +333,12 @@ final class TamizdatStatusStore: ObservableObject {
             TURNCredsStore.shared.markQuotaStorm(at: now)
         }
         guard !quotaStormEpisodeRefreshAttempted else { return }
-        if let lastAttempt = Self.lastQuotaStormRefreshAt {
-            let elapsed = now.timeIntervalSince(lastAttempt)
-            guard elapsed >= Self.quotaStormRefreshCooldown else {
-                if enteredNow {
-                    let remaining = Int(Self.quotaStormRefreshCooldown - elapsed)
-                    TURNLog.warn("turncreds", "quota storm entered during refresh cooldown remaining=\(remaining)s")
-                }
-                return
-            }
-        }
-
         quotaStormEpisodeRefreshAttempted = true
-        Self.lastQuotaStormRefreshAt = now
-        TURNLog.warn("turncreds", "quota storm detected — forcing credential refresh")
-        TURNCredsRefresher.shared.forceRefresh(reason: "quotaStorm")
+        TURNLog.warn("turncreds", "quota storm detected — requesting extension physical-path recovery")
+        Task {
+            let result = await VPNProfileStore.shared.recoverVKTurnQuotaStorm()
+            TURNLog.info("turncreds", "extension quota recovery request result=\(result)")
+        }
     }
 
     /// Re-derive uptime / data / rate from the latest snapshot. Called

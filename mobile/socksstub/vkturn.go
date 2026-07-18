@@ -48,8 +48,49 @@ var (
 	vkturnRunDone          <-chan struct{}
 	vkturnDraining         <-chan struct{}
 	vkturnAttachStop       func()
+	vkturnQuotaEpisode     bool // guarded by vkturnMu
 	vkturnMu               sync.Mutex
+	vkturnRecoveryMu       sync.RWMutex
+	vkturnRecoverySink     VKTurnRecoveryCallback
 )
+
+// VKTurnRecoveryCallback is implemented by the packet-tunnel extension. The
+// callback has no credential payload: Swift re-reads configured room hashes
+// from the App Group and performs the accountless refresh on the NE process's
+// physical egress path.
+type VKTurnRecoveryCallback interface {
+	OnQuotaStorm()
+}
+
+func SetVKTurnRecoveryCallback(cb VKTurnRecoveryCallback) {
+	if cb == nil {
+		return
+	}
+	vkturnRecoveryMu.Lock()
+	vkturnRecoverySink = cb
+	vkturnRecoveryMu.Unlock()
+	rt.appendLog("info: vkturn quota recovery sink registered")
+}
+
+// ClearVKTurnRecoveryCallback releases the gomobile proxy retained for the
+// packet-tunnel instance that is stopping. A later tunnel start registers its
+// own bridge before telemetry can request recovery.
+func ClearVKTurnRecoveryCallback() {
+	vkturnRecoveryMu.Lock()
+	vkturnRecoverySink = nil
+	vkturnRecoveryMu.Unlock()
+}
+
+func currentVKTurnRecoveryCallback() VKTurnRecoveryCallback {
+	vkturnRecoveryMu.RLock()
+	defer vkturnRecoveryMu.RUnlock()
+	return vkturnRecoverySink
+}
+
+func vkturnQuotaRecoveryTransition(episode, running bool, active int32, quotaStorm bool) (next, notify bool) {
+	next = running && active == 0 && quotaStorm
+	return next, next && !episode
+}
 
 var errVKTurnRequiredNotReady = errors.New("TURN required but netstack is not ready")
 
@@ -765,6 +806,7 @@ func resetVKTurnAtomicsLocked() {
 	vkturnErr.Store(nil)
 	vkturnRunning.Store(false)
 	vkturnActiveWorkers.Store(0)
+	vkturnQuotaEpisode = false
 }
 
 func isCurrentVKTurnRunner(runner *wgturnclient.Runner) bool {
@@ -890,6 +932,9 @@ func storeVKTurnWorkerCountIfCurrent(runner *wgturnclient.Runner, active int) {
 		return
 	}
 	vkturnActiveWorkers.Store(int64(active))
+	if active > 0 {
+		vkturnQuotaEpisode = false
+	}
 	storeVKTurnStats(active, true)
 }
 
@@ -909,7 +954,20 @@ func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnc
 	running := vkturnRunner == runner && vkturnRunning.Load()
 	vkturnActiveWorkers.Store(int64(snapshot.ActiveConnections))
 	storeVKTurnStats(int(snapshot.ActiveConnections), running)
+	var notifyRecovery bool
+	vkturnQuotaEpisode, notifyRecovery = vkturnQuotaRecoveryTransition(
+		vkturnQuotaEpisode,
+		running,
+		snapshot.ActiveConnections,
+		snapshot.QuotaStorm,
+	)
 	vkturnMu.Unlock()
+	if notifyRecovery {
+		rt.appendLog("warn: vkturn quota storm entered; requesting physical-path credential recovery")
+		if callback := currentVKTurnRecoveryCallback(); callback != nil {
+			go callback.OnQuotaStorm()
+		}
+	}
 
 	if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
 		rt.appendLog(fmt.Sprintf("info: vkturn bond telemetry active=%d frames_up=%d frames_down=%d bytes_up=%d bytes_down=%d drops=%d reorder_gaps_down=%d reorder_late_down=%d room_up_bytes=%v room_down_bytes=%v room_drops=%v",
