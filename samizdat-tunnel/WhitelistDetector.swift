@@ -11,14 +11,18 @@ import UserNotifications
 /// web/TLS reachability.
 final class WhitelistDetector {
 
-    private static let holdDownSeconds: TimeInterval = 60
+    // Keep both directions responsive: after a confirmed switch, allow the
+    // opposite verdict to switch back after the requested 15-second guard.
+    // The old 60-second hold-down made a recovered network look stuck on TURN.
+    private static let holdDownSeconds: TimeInterval = 15
 
-    /// Read user-configured cadence; double it when on backup.
+    /// Read user-configured cadence. Keep the same cadence on backup so the
+    /// reverse (Free Internet) decision is not artificially delayed.
     private static var normalCadence: TimeInterval {
         TimeInterval(WhitelistProbePreferences.probeInterval)
     }
     private static var onBackupCadence: TimeInterval {
-        TimeInterval(WhitelistProbePreferences.probeInterval) * 2
+        TimeInterval(WhitelistProbePreferences.probeInterval)
     }
     private static var failbackSuccessesNeeded: Int {
         WhitelistProbePreferences.successesNeeded

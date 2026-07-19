@@ -1053,11 +1053,30 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
 
+            var turnAttachResult = ""
             if policy.usesTURN {
-                Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer)
+                turnAttachResult = Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer)
+                if !turnAttachResult.isEmpty,
+                   turnAttachResult != "already running",
+                   turnAttachResult != "previous runner still draining" {
+                    // Endpoint switching used to discard this error. When
+                    // the cached room bundle was stale, the detector moved to
+                    // backup but the TURN runner stayed at 0/N until a manual
+                    // VPN reconnect recreated the extension. Start the same
+                    // credential recovery path used for network changes.
+                    self.appendExtLog("warn: rewire gen=\(generation) TURN attach failed result=\(turnAttachResult) — scheduling credential recovery")
+                    self.scheduleTURNCredentialRecovery(
+                        reason: "endpoint-switch-attach-failed",
+                        rewireAfterRefresh: true
+                    )
+                }
             }
 
-            self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
+            if turnAttachResult.isEmpty || turnAttachResult == "already running" {
+                self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
+            } else {
+                self.appendExtLog("warn: rewire gen=\(generation) completed with TURN attach result=\(turnAttachResult)")
+            }
 
             // IPA-D17: after the new upstream policy is in place,
             // force-close every loopback SOCKS5 flow that hev opened over
