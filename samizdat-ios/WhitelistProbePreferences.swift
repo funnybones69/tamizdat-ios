@@ -2,16 +2,13 @@ import Foundation
 
 /// User-facing settings for carrier allowlist detection.
 ///
-/// The old D65 detector used two ICMP targets. The current detector follows
-/// the allowlist research: compare multiple foreign control domains against
-/// multiple domestic allowlisted domains using TCP-connect + TLS-SNI probes.
-/// ICMP remains available as a low-level helper file, but it is not a deciding
-/// censorship signal.
+/// The detector sends ICMP echo requests to normally blocked controls and
+/// domestic allowlisted controls. There are no TCP/TLS/HTTP probes here.
 ///
 /// Persisted in App Group UserDefaults under the historical keys
 /// `tamizdat.whitelistTestHost` and `tamizdat.whitelistWhitelistHost` so older
-/// installs migrate naturally. The values are now comma/semicolon/newline-
-/// separated target lists, not single ping IPs.
+/// installs migrate naturally. Detection deliberately uses one target per
+/// side; if an old value contains a list, only its first target is used.
 enum WhitelistProbePreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let testHostKey = "tamizdat.whitelistTestHost"
@@ -19,8 +16,8 @@ enum WhitelistProbePreferences {
     private static let successesKey = "tamizdat.whitelistSuccessesNeeded"
     private static let intervalKey = "tamizdat.whitelistProbeInterval"
 
-    static let defaultTestHost = "google.com, cloudflare.com"
-    static let defaultWhitelistHost = "ya.ru, ozon.ru, gosuslugi.ru"
+    static let defaultTestHost = "8.8.8.8"
+    static let defaultWhitelistHost = "77.88.8.8"
     static let defaultSuccessesNeeded = 3
     static let defaultProbeInterval = 30
 
@@ -65,11 +62,11 @@ enum WhitelistProbePreferences {
     }
 
     static var foreignControlTargets: [String] {
-        splitTargets(testHost, fallback: defaultTestHost)
+        Array(splitTargets(testHost, fallback: defaultTestHost).prefix(1))
     }
 
     static var domesticAllowlistedTargets: [String] {
-        splitTargets(whitelistHost, fallback: defaultWhitelistHost)
+        Array(splitTargets(whitelistHost, fallback: defaultWhitelistHost).prefix(1))
     }
 
     /// Consecutive agreeing classifications before endpoint flips. Default 3.

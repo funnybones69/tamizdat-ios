@@ -101,13 +101,10 @@ targets:
       # App Group UserDefaults is the source of truth; live updates land
       # through the "refreshWhitelistProbes" provider message.
       - path: samizdat-ios/WhitelistProbePreferences.swift
-      # Comparative TCP+TLS probe wrapper shared by the main app and
-      # extension. The Go primitive lives in SamizdatClient.xcframework;
-      # Swift owns scheduling, interface selection, and hysteresis.
+      # ICMP echo decision wrapper shared by the main app and extension.
+      # Swift owns ping execution, path selection, status, and hysteresis.
       - path: samizdat-ios/WhitelistProbeEngine.swift
-      # Retained as a low-level diagnostic helper only. The production
-      # restricted-network verdict is comparative TCP+TLS in
-      # WhitelistProbeEngine; ICMP does not switch endpoints.
+      # Unprivileged ICMP echo socket used by WhitelistProbeEngine.
       - path: samizdat-ios/ICMPPinger.swift
       # IPA-D65b: VK TURN session parameter cache (read-side only — the
       # extension reads `TURNSession paramsStore.shared.isFresh` in its status

@@ -40,7 +40,7 @@ struct SettingsView: View {
     @State private var vkRoomsDraft: String = VKCredsPreferences.roomHashes.joined(separator: "\n")
     @State private var vkCallHashFeedback: String = ""
 
-    // Whitelist-detection comparative TCP+TLS target lists.
+    // Whitelist-detection ICMP echo target lists.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
     @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
     // Expanded whitelist tunables.
@@ -437,7 +437,7 @@ struct SettingsView: View {
                         Text("Probe targets")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("TCP+TLS-SNI every 30 s outside the tunnel")
+                        Text("ICMP ping outside the tunnel")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
@@ -467,10 +467,10 @@ struct SettingsView: View {
                     }
                 }
 
-                Text("Foreign control targets")
+                Text("Normally blocked ping target")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
-                TextField("google.com, cloudflare.com", text: $testHostDraft)
+                TextField("8.8.8.8", text: $testHostDraft)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .keyboardType(.URL)
@@ -482,10 +482,10 @@ struct SettingsView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                     .onSubmit { saveWhitelistProbes() }
 
-                Text("Domestic allowlisted targets")
+                Text("Allowed ping target")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
-                TextField("ya.ru, ozon.ru, gosuslugi.ru", text: $whitelistHostDraft)
+                TextField("77.88.8.8", text: $whitelistHostDraft)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .keyboardType(.URL)
@@ -498,7 +498,7 @@ struct SettingsView: View {
                     .onSubmit { saveWhitelistProbes() }
 
                 // D45: successes needed before switching back to primary
-                Text("Successes before failback")
+                Text("Matching ping cycles before switch")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
                 Stepper(value: $wlSuccessesDraft, in: 1...10) {
@@ -552,7 +552,7 @@ struct SettingsView: View {
                     .buttonStyle(.plain)
                 }
 
-                Text("Comma-separated target lists. Domestic majority pass + all foreign controls fail flips to Whitelist after the threshold. Target changes are picked up live; reconnect the VPN if DNS returned new probe IPs so excluded routes are rebuilt.")
+                Text("ICMP echo only. If both targets reply: Free internet. If the blocked target times out while the allowed target replies: Whitelist active. Any other result is Error detecting.")
                     .font(.geist(.regular, size: 11))
                     .foregroundStyle(theme.textDim)
             }

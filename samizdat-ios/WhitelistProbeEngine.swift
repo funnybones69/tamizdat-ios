@@ -1,101 +1,43 @@
 import Foundation
 import Network
-import SamizdatClient
 
 struct WhitelistProbePathSelection {
     let interfaceIndex: UInt32?
     let summary: String
 }
 
-struct WhitelistProbeCycleConfig: Encodable {
-    let foreign: [String]
-    let domestic: [String]
-    let timeoutMs: Int
-    let port: Int
-    let interfaceIndex: Int
-
-    enum CodingKeys: String, CodingKey {
-        case foreign
-        case domestic
-        case timeoutMs = "timeout_ms"
-        case port
-        case interfaceIndex = "interface_index"
-    }
-}
-
-struct WhitelistProbeCycleResult: Decodable {
-    enum Classification: String, Decodable {
+struct WhitelistProbeCycleResult {
+    enum Classification: String {
         case normal
         case allowlist
-        case offline
-        case partial
-        case anomalous
         case error
     }
 
-    struct Target: Decodable {
+    struct Target {
         let group: String
         let host: String
-        let port: Int
-        let tcpOK: Bool
-        let tlsOK: Bool
         let pass: Bool
-        let errorClass: String?
-        let error: String?
-        let remoteAddress: String?
         let durationMs: Int64
-
-        enum CodingKeys: String, CodingKey {
-            case group, host, port, pass, error
-            case tcpOK = "tcp_ok"
-            case tlsOK = "tls_ok"
-            case errorClass = "error_class"
-            case remoteAddress = "remote_address"
-            case durationMs = "duration_ms"
-        }
     }
 
-    let ok: Bool
     let classification: Classification
-    let summary: String
     let domesticPass: Int
     let domesticTotal: Int
     let foreignPass: Int
     let foreignTotal: Int
     let targets: [Target]
     let error: String?
-
-    enum CodingKeys: String, CodingKey {
-        case ok, classification, summary, targets, error
-        case domesticPass = "domestic_pass"
-        case domesticTotal = "domestic_total"
-        case foreignPass = "foreign_pass"
-        case foreignTotal = "foreign_total"
-    }
-
-    static let errorResult = WhitelistProbeCycleResult(
-        ok: false,
-        classification: .error,
-        summary: "probe failed before producing JSON",
-        domesticPass: 0,
-        domesticTotal: 0,
-        foreignPass: 0,
-        foreignTotal: 0,
-        targets: [],
-        error: "decode_error"
-    )
 }
 
 enum WhitelistProbeEngine {
-    static let defaultTimeoutMs = 4_000
-    static let defaultPort = 443
+    /// A pair of serial pings stays bounded and avoids Darwin ICMP socket
+    /// identifier reuse races between the blocked and allowed controls.
+    static let pingTimeout: TimeInterval = 3
 
     /// Select an explicit physical interface only when NWPath says that type
-    /// is in use and there is exactly one matching candidate. `availableInterfaces`
-    /// may contain Wi-Fi plus multiple cellular interfaces (dual SIM/eSIM); binding
-    /// to the first entry can send probes over the wrong or inactive data line.
-    /// In ambiguous cases interfaceIndex stays nil and NECP/default routing chooses
-    /// the actual underlying path for the provider process.
+    /// is active and there is exactly one distinct non-utun candidate. Some
+    /// iOS versions expose the same en0/index more than once; dedupe by index
+    /// before deciding that the path is ambiguous.
     static func pathSelection(_ path: NWPath?) -> WhitelistProbePathSelection {
         guard let path else {
             return WhitelistProbePathSelection(interfaceIndex: nil, summary: "status=missing bind=default")
@@ -116,8 +58,15 @@ enum WhitelistProbeEngine {
         ]
         let usedKinds = physicalTypes.filter { path.usesInterfaceType($0.0) }
         let usedNames = usedKinds.map { $0.1 }
+
+        var seenIndexes = Set<Int>()
         let candidates = path.availableInterfaces.filter { iface in
-            usedKinds.contains { $0.0 == iface.type } && !iface.name.hasPrefix("utun")
+            guard usedKinds.contains(where: { $0.0 == iface.type }),
+                  !iface.name.hasPrefix("utun"),
+                  seenIndexes.insert(iface.index).inserted else {
+                return false
+            }
+            return true
         }
         let candidateText = candidates
             .map { "\($0.name)#\($0.index)" }
@@ -141,30 +90,53 @@ enum WhitelistProbeEngine {
         return WhitelistProbePathSelection(interfaceIndex: bindIndex, summary: summary)
     }
 
+    /// Run only ICMP echo probes. There is intentionally no TCP, TLS, HTTP,
+    /// or gomobile probe in the whitelist detector.
     static func run(interfaceIndex: UInt32? = nil) -> WhitelistProbeCycleResult {
-        let cfg = WhitelistProbeCycleConfig(
-            foreign: WhitelistProbePreferences.foreignControlTargets,
-            domestic: WhitelistProbePreferences.domesticAllowlistedTargets,
-            timeoutMs: defaultTimeoutMs,
-            port: defaultPort,
-            interfaceIndex: Int(interfaceIndex ?? 0)
+        let foreign = WhitelistProbePreferences.foreignControlTargets
+        let domestic = WhitelistProbePreferences.domesticAllowlistedTargets
+        guard !foreign.isEmpty, !domestic.isEmpty else {
+            return WhitelistProbeCycleResult(
+                classification: .error,
+                domesticPass: 0,
+                domesticTotal: domestic.count,
+                foreignPass: 0,
+                foreignTotal: foreign.count,
+                targets: [],
+                error: "missing ping target"
+            )
+        }
+
+        // Keep probes serial. Besides making the log easy to read, this avoids
+        // stale ICMP datagrams crossing immediately reused Darwin ping sockets.
+        var targets: [WhitelistProbeCycleResult.Target] = []
+        for host in foreign {
+            targets.append(ping(group: "blocked", host: host, interfaceIndex: interfaceIndex))
+        }
+        for host in domestic {
+            targets.append(ping(group: "allowed", host: host, interfaceIndex: interfaceIndex))
+        }
+
+        let foreignPass = targets.filter { $0.group == "blocked" && $0.pass }.count
+        let domesticPass = targets.filter { $0.group == "allowed" && $0.pass }.count
+        let classification: WhitelistProbeCycleResult.Classification
+        if domesticPass > 0 && foreignPass > 0 {
+            classification = .normal
+        } else if domesticPass > 0 && foreignPass == 0 {
+            classification = .allowlist
+        } else {
+            classification = .error
+        }
+
+        return WhitelistProbeCycleResult(
+            classification: classification,
+            domesticPass: domesticPass,
+            domesticTotal: domestic.count,
+            foreignPass: foreignPass,
+            foreignTotal: foreign.count,
+            targets: targets,
+            error: classification == .error ? "ping matrix is not decisive" : nil
         )
-        let data: Data
-        do {
-            data = try JSONEncoder().encode(cfg)
-        } catch {
-            return WhitelistProbeCycleResult.errorResult
-        }
-        let json = String(data: data, encoding: .utf8) ?? "{}"
-        let out = SocksstubRunWhitelistProbeCycleJSON(json)
-        guard let outData = out.data(using: .utf8) else {
-            return WhitelistProbeCycleResult.errorResult
-        }
-        do {
-            return try JSONDecoder().decode(WhitelistProbeCycleResult.self, from: outData)
-        } catch {
-            return WhitelistProbeCycleResult.errorResult
-        }
     }
 
     static func runAsync(interfaceIndex: UInt32? = nil) async -> WhitelistProbeCycleResult {
@@ -174,37 +146,65 @@ enum WhitelistProbeEngine {
     }
 
     static func shortLog(_ result: WhitelistProbeCycleResult) -> String {
-        "method=tcp_tls_sni icmp=not_used classification=\(result.classification.rawValue) domestic=\(result.domesticPass)/\(result.domesticTotal) foreign=\(result.foreignPass)/\(result.foreignTotal) summary=\"\(sanitize(result.summary))\""
+        let verdict: String
+        switch result.classification {
+        case .normal: verdict = "free_internet"
+        case .allowlist: verdict = "whitelist_active"
+        case .error: verdict = "error_detecting"
+        }
+        return "method=icmp_echo verdict=\(verdict) blocked=\(result.foreignPass)/\(result.foreignTotal) allowed=\(result.domesticPass)/\(result.domesticTotal)"
     }
 
     static func detailedLogLines(_ result: WhitelistProbeCycleResult) -> [String] {
-        var lines: [String] = [shortLog(result)]
-        let ordered = result.targets.sorted { lhs, rhs in
-            if lhs.group != rhs.group {
-                return lhs.group == "foreign"
-            }
-            return lhs.host.localizedCaseInsensitiveCompare(rhs.host) == .orderedAscending
+        var lines = [shortLog(result)]
+        for target in result.targets {
+            let outcome = target.pass ? "reply" : "timeout"
+            lines.append("ping group=\(target.group) target=\(sanitize(target.host)) result=\(outcome) rtt=\(target.durationMs)ms")
         }
-        for target in ordered {
-            let tcp = target.tcpOK ? "ok" : "fail"
-            let tls = target.tlsOK ? "ok" : "fail"
-            let pass = target.pass ? "yes" : "no"
-            let errClass = sanitize(target.errorClass ?? "")
-            let err = sanitize(target.error ?? "")
-            let remote = sanitize(target.remoteAddress ?? "")
-            lines.append("target group=\(target.group) host=\(target.host):\(target.port) remote=\(remote.isEmpty ? "none" : remote) tcp=\(tcp) tls=\(tls) pass=\(pass) dur=\(target.durationMs)ms errorClass=\(errClass.isEmpty ? "none" : errClass) error=\(err.isEmpty ? "none" : err)")
-        }
-        if let error = result.error, !error.isEmpty {
-            lines.append("engineError=\(sanitize(error))")
+        if let error = result.error {
+            lines.append("error=\(sanitize(error))")
         }
         return lines
+    }
+
+    private static func ping(
+        group: String,
+        host: String,
+        interfaceIndex: UInt32?
+    ) -> WhitelistProbeCycleResult.Target {
+        let pinger = ICMPPinger(target: .hostname(host), interfaceIndex: interfaceIndex)
+        let semaphore = DispatchSemaphore(value: 0)
+        let lock = NSLock()
+        var success = false
+        var elapsed = pingTimeout
+
+        pinger.ping(timeout: pingTimeout) { ok, duration in
+            lock.lock()
+            success = ok
+            elapsed = duration
+            lock.unlock()
+            semaphore.signal()
+        }
+
+        if semaphore.wait(timeout: .now() + pingTimeout + 1) == .timedOut {
+            pinger.cancel()
+        }
+        lock.lock()
+        let result = WhitelistProbeCycleResult.Target(
+            group: group,
+            host: host,
+            pass: success,
+            durationMs: Int64((elapsed * 1_000).rounded())
+        )
+        lock.unlock()
+        return result
     }
 
     private static func sanitize(_ text: String) -> String {
         let oneLine = text
             .replacingOccurrences(of: "\n", with: " ")
             .replacingOccurrences(of: "\r", with: " ")
-        if oneLine.count <= 180 { return oneLine }
-        return String(oneLine.prefix(180)) + "…"
+        if oneLine.count <= 120 { return oneLine }
+        return String(oneLine.prefix(120)) + "…"
     }
 }

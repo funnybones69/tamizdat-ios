@@ -3,15 +3,14 @@ import Network
 
 /// WhitelistMonitor runs in the MAIN APP while VPN is disconnected.
 ///
-/// Current detector follows the allowlist research: compare multiple foreign
-/// control domains against multiple domestic allowlisted domains using TCP
-/// connect + TLS-SNI probes. ICMP is no longer a deciding signal.
+/// Uses serial ICMP echo probes against a normally blocked control and a
+/// domestic allowlisted control. Every completed cycle produces a final UI
+/// verdict; ambiguous/offline combinations are surfaced as Error detecting.
 ///
 /// Decision matrix:
 ///   normal      → free internet      → activeEndpoint = primary after threshold
 ///   allowlist   → whitelist active   → activeEndpoint = backup after threshold
-///   offline     → no usable internet → keep current
-///   partial/anomalous/error → uncertain, keep current
+///   error       → Error detecting    → keep current
 @MainActor
 final class WhitelistMonitor: ObservableObject {
 
@@ -52,7 +51,7 @@ final class WhitelistMonitor: ObservableObject {
         let build = (Bundle.main.object(forInfoDictionaryKey: "IPAArtifactName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
             ?? "unknown"
-        TURNLog.info("whitelist", "monitor started build=\(build) method=tcp_tls_sni icmp=not_used threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
+        TURNLog.info("whitelist", "monitor started build=\(build) method=icmp_echo threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
         task = Task { [weak self] in
             while !Task.isCancelled {
                 let delay = await self?.runCycle(generation: gen) ?? Self.cycleInterval
@@ -89,7 +88,7 @@ final class WhitelistMonitor: ObservableObject {
         lastPathSummary = pathSelection.summary
         lastConfigSignature = configSignature
 
-        TURNLog.info("whitelist", "monitor cycle start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
+        TURNLog.info("whitelist", "monitor ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
         let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex)
         guard gen == generation, !Task.isCancelled else { return Self.cycleInterval }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
@@ -119,20 +118,13 @@ final class WhitelistMonitor: ObservableObject {
                 whitelistCount = 0
             }
 
-        case .offline:
+        case .error:
             freeCount = 0
             whitelistCount = 0
-            WhitelistStatusStore.current = .noNetwork
-
-        case .partial, .anomalous, .error:
-            // Ordinary excluded list / stale domestic targets / captive weirdness.
-            // Do not declare allowlist and do not switch endpoint.
-            freeCount = 0
-            whitelistCount = 0
-            WhitelistStatusStore.current = .unknown
+            WhitelistStatusStore.current = .error
         }
 
-        TURNLog.info("whitelist", "monitor counters classification=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
+        TURNLog.info("whitelist", "monitor result=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
         let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && whitelistCount > 0)
             || (WhitelistStatusStore.activeEndpoint == .backup && freeCount > 0)
         return switchPending ? 5 : Self.cycleInterval

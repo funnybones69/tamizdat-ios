@@ -8,6 +8,7 @@ enum WhitelistStatus: String {
     case unknown    // grey  — not monitoring (auto off) OR no decisive cascade yet
     case off        // green — internet reachable, primary endpoint OK
     case detected   // red   — whitelist active, switched to backup
+    case error      // red   — ping cycle completed without a valid verdict
     case frozen     // yellow — captive portal detected, decisions frozen
     case noNetwork  // grey  — path unsatisfied (lift/forest), probes paused
 
@@ -71,7 +72,7 @@ enum WhitelistStatusStore {
         switch current {
         case .detected, .off:
             return activeEndpoint == .backup ? .backup : .primary
-        case .unknown, .frozen, .noNetwork:
+        case .unknown, .error, .frozen, .noNetwork:
             return .primary
         }
     }

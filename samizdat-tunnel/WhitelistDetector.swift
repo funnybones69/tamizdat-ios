@@ -4,11 +4,9 @@ import UserNotifications
 
 /// WhitelistDetector runs inside the PacketTunnelProvider while VPN is up.
 ///
-/// The old D65 detector used two ICMP pings. Current logic follows the
-/// allowlist research: compare foreign control domains against domestic
-/// allowlisted domains with TCP-connect + TLS-SNI probes. ICMP is not a
-/// deciding signal because RU restricted-profile mode can block ICMP independently of
-/// web/TLS reachability.
+/// Runs serial ICMP echo probes against blocked and allowlisted controls.
+/// The UI receives a final verdict after every cycle: Main, Whitelist, or
+/// Error detecting. TCP/TLS/HTTP are not part of detection.
 final class WhitelistDetector {
 
     private static let holdDownSeconds: TimeInterval = 60
@@ -67,7 +65,7 @@ final class WhitelistDetector {
             WhitelistStatusStore.whitelistSuccessesExtension = 0
             self.applyConfigLocked()
             self.scheduleNextProbe(after: 2)
-            self.log("info: WhitelistDetector started method=tcp_tls_sni icmp=not_used threshold=\(Self.failbackSuccessesNeeded) interval=\(Int(Self.normalCadence))s foreign=\(self.foreignTargets) domestic=\(self.domesticTargets)")
+            self.log("info: WhitelistDetector started method=icmp_echo threshold=\(Self.failbackSuccessesNeeded) interval=\(Int(Self.normalCadence))s blocked=\(self.foreignTargets) allowed=\(self.domesticTargets)")
         }
     }
 
@@ -131,7 +129,7 @@ final class WhitelistDetector {
             self.probeGeneration += 1
             self.resetProgressLocked(reason: "network path changed → \(fingerprint)")
             if !satisfied {
-                WhitelistStatusStore.current = .noNetwork
+                WhitelistStatusStore.current = .error
                 self.log("info: detector paused (path unsatisfied)")
             } else {
                 WhitelistStatusStore.current = .unknown
@@ -180,7 +178,7 @@ final class WhitelistDetector {
         let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
         let baseCadence = onBackup ? Self.onBackupCadence : Self.normalCadence
         let cadence = ProcessInfo.processInfo.isLowPowerModeEnabled ? baseCadence * 3 : baseCadence
-        log("info: detector cycle start method=tcp_tls_sni icmp=not_used active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded) path={\(pathSelection.summary)} foreign=\(foreignTargets) domestic=\(domesticTargets)")
+        log("info: detector ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded) path={\(pathSelection.summary)} blocked=\(foreignTargets) allowed=\(domesticTargets)")
         if iface == nil {
             log("info: detector probe uses NECP/default route (no unambiguous physical interface)")
         }
@@ -206,8 +204,7 @@ final class WhitelistDetector {
     private enum Outcome: String {
         case clearAll
         case whitelistOn
-        case uncertain
-        case noNetwork
+        case error
     }
 
     private static func outcome(from result: WhitelistProbeCycleResult) -> Outcome {
@@ -216,10 +213,8 @@ final class WhitelistDetector {
             return .clearAll
         case .allowlist:
             return .whitelistOn
-        case .offline:
-            return .noNetwork
-        case .partial, .anomalous, .error:
-            return .uncertain
+        case .error:
+            return .error
         }
     }
 
@@ -255,16 +250,11 @@ final class WhitelistDetector {
             }
             WhitelistStatusStore.current = .detected
 
-        case .uncertain:
+        case .error:
             failbackSuccesses = 0
             whitelistSuccesses = 0
-            WhitelistStatusStore.current = .unknown
-            log("warn: detector: uncertain comparative probe result — keeping current endpoint")
-
-        case .noNetwork:
-            failbackSuccesses = 0
-            whitelistSuccesses = 0
-            WhitelistStatusStore.current = .noNetwork
+            WhitelistStatusStore.current = .error
+            log("warn: detector: ERROR DETECTING — ping matrix is not decisive; keeping current endpoint")
         }
 
         // Keep counters process-local; only the current verdict/endpoint cross

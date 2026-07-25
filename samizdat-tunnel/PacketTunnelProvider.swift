@@ -1217,9 +1217,9 @@ misc:
         return best >= 0 ? best : nil
     }
 
-    /// Resolve every current IPv4 answer for a probe target so DNS answer
-    /// ordering cannot make the Go dialer select an address that was not
-    /// excluded when tunnel settings were installed.
+    /// Resolve every current IPv4 answer for an ICMP target so a hostname ping
+    /// cannot select an address that was not excluded when tunnel settings
+    /// were installed.
     private static func resolveProbeTargetIPv4(_ target: String, log: (String) -> Void) -> [String] {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return [] }

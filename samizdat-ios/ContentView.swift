@@ -626,11 +626,10 @@ struct ContentView: View {
     }
 
     private var whitelistSub: String {
-        // Detector status takes precedence — it's the live signal user wants
-        // to see ("Paused — no network" matters in elevator/metro).
+        // Unknown is only the short in-flight state before the first ping
+        // result. Every failed/ambiguous completed cycle is an explicit error.
         switch whitelistStatus {
-        case .noNetwork:  return "Paused — no network"
-        case .frozen:     return "Frozen — captive portal?"
+        case .error, .noNetwork, .frozen: return "Error detecting"
         case .detected:   return "Whitelist active"
         case .off:        return isAutoMode ? "Free internet" : "Manual"
         case .unknown:    return isAutoMode ? "Monitoring…" : "Manual"
@@ -719,7 +718,7 @@ struct ContentView: View {
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
         if isAutoMode && bridge.state == .connected
             && WhitelistStatusStore.ageSeconds > 200 {
-            whitelistStatus = .unknown
+            whitelistStatus = .error
         }
     }
 
