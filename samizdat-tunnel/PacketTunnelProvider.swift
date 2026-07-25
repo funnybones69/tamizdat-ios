@@ -858,7 +858,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
             }
-            WhitelistStatusStore.current = .unknown
+            // Auto cannot produce a usable verdict without a failover target.
+            // Surface a terminal error instead of leaving the UI on Monitoring… forever.
+            WhitelistStatusStore.current = .error
             return
         }
         if whitelistDetector != nil {
