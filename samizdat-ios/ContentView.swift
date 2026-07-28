@@ -744,10 +744,6 @@ struct ContentView: View {
     private func refreshWhitelistStatus() {
         whitelistStatus = WhitelistStatusStore.current
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
-        if isAutoMode && bridge.state == .connected
-            && WhitelistStatusStore.ageSeconds > 200 {
-            whitelistStatus = .unknown
-        }
     }
 
     private func startStatusPolling() {

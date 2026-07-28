@@ -654,7 +654,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // tile flips from "Whitelist" to "Main" on every disconnect,
         // even though the network is still whitelist-filtered. The
         // main-app WhitelistMonitor resumes on disconnect and writes
-        // fresh values; the 200s stale-check handles truly stale data.
+        // fresh values without clearing the last decision first.
         pathMonitor.cancel()
         // NE stop must return promptly: cancel/reset synchronously, but drain
         // TURN workers/allocations in Go background. Replacement starts remain
@@ -975,9 +975,52 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: auto-rewire ignored — TURN runner is waiting for GETCONF; preserving attach generation")
         } else {
             let freshness = Self.vkTurnCredsFreshness()
-            appendExtLog("warn: auto-rewire ignored — TURN runner is stopped (\(freshness.reason)); waiting for explicit refresh/reconnect")
+            appendExtLog("warn: auto-rewire found stopped TURN runner (\(freshness.reason)); starting automatic repair")
+            reconcileUpstream(reason: "ping-prober-turn-stopped")
         }
         return true
+    }
+
+    /// Keep the actual Go data plane aligned with the detector's latched
+    /// endpoint. This is intentionally idempotent and is safe to call after
+    /// every decisive probe:
+    ///   - desired TURN but H2 gate is still open → authoritative rewire;
+    ///   - TURN was required but its runner died → credential recovery;
+    ///   - desired H2 but a stale TURN gate/runner remains → H2 rewire.
+    ///
+    /// Build 332 could have activeEndpoint=backup while a transient
+    /// `status=unknown` bootstrapped H2. Because the endpoint was already
+    /// backup, later allowlist probes never emitted another switch callback.
+    private func reconcileUpstream(reason: String) {
+        guard isRunning else { return }
+        let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+        let required = SocksstubVKTurnRequired()
+        let running = SocksstubTURNUpstreamRunning()
+
+        if policy.usesTURN {
+            if !required {
+                guard !isRewiring else { return }
+                appendExtLog("warn: upstream drift detected reason=\(reason): Whitelist requires TURN but H2 is active — rewiring")
+                rewireUpstream()
+                return
+            }
+            if !running {
+                let recoveryRunning = turnCredentialRecoveryState.withLock { $0.running }
+                guard !isRewiring, !recoveryRunning else { return }
+                appendExtLog("warn: upstream drift detected reason=\(reason): TURN required but runner stopped — recovering credentials")
+                scheduleTURNCredentialRecovery(
+                    reason: "turn-runner-stopped-\(reason)",
+                    rewireAfterRefresh: true
+                )
+            }
+            return
+        }
+
+        if required || running {
+            guard !isRewiring else { return }
+            appendExtLog("warn: upstream drift detected reason=\(reason): Main requires H2 but TURN remains active — rewiring")
+            rewireUpstream()
+        }
     }
 
     private static func vkTurnCredsFreshness() -> (isFresh: Bool, reason: String) {
@@ -1163,14 +1206,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let hasWhitelistTarget = Self.whitelistTargetConfigured(backup: backupBlob, whitelistModeRaw: whitelistRaw)
         appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(backupBlob != nil) whitelistMode=\(whitelistRaw) hasWhitelistTarget=\(hasWhitelistTarget) running=\(whitelistDetector != nil)")
         guard mode == .auto else {
-            // Mode is not auto → stop if it was running, paint badge as unknown
-            // so the UI doesn't keep showing a stale verdict.
+            // Mode is not auto → stop if it was running. Preserve the last
+            // probe verdict: changing a control is not a probe result.
             if whitelistDetector != nil {
                 appendExtLog("info: detector stopping (mode is \(mode.rawValue), not auto)")
                 whitelistDetector?.stop()
                 whitelistDetector = nil
             }
-            WhitelistStatusStore.current = .unknown
             return
         }
         guard hasWhitelistTarget else {
@@ -1182,7 +1224,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
             }
-            WhitelistStatusStore.current = .unknown
             return
         }
         if whitelistDetector != nil {
@@ -1197,6 +1238,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // before calling us; just trigger the rewire to apply it.
                 self.appendExtLog("info: detector requested switch → \(target.rawValue)")
                 self.rewireUpstream()
+            },
+            reconcileEndpoint: { [weak self] target in
+                self?.reconcileUpstream(reason: "detector-confirmed-\(target.rawValue)")
             },
             pathProvider: { [weak self] in self?.pathMonitor.currentPath }
         )
@@ -1551,6 +1595,9 @@ misc:
         startPathMonitor()
         startWhitelistDetectorIfNeeded()
         isRunning = true
+        // Repair a failed initial TURN attach as soon as lifecycle state is
+        // fully armed. Healthy H2/TURN starts are no-ops here.
+        reconcileUpstream(reason: "tunnel-start")
         let recoveryBridge = VKTurnRecoveryBridge { [weak self] in
             self?.scheduleTURNCredentialRecovery(reason: "quota-storm", rewireAfterRefresh: true)
         }

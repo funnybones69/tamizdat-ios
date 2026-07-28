@@ -31,6 +31,7 @@ final class WhitelistDetector {
     // Hooks injected by PacketTunnelProvider.
     private let log: (String) -> Void
     private let switchEndpoint: (EndpointMode) -> Void
+    private let reconcileEndpoint: (EndpointMode) -> Void
     private let pathProvider: () -> Network.NWPath?
 
     private let queue = DispatchQueue(label: "com.anarki.samizdat-test.detector", qos: .utility)
@@ -52,9 +53,11 @@ final class WhitelistDetector {
 
     init(log: @escaping (String) -> Void,
          switchEndpoint: @escaping (EndpointMode) -> Void,
+         reconcileEndpoint: @escaping (EndpointMode) -> Void,
          pathProvider: @escaping () -> Network.NWPath?) {
         self.log = log
         self.switchEndpoint = switchEndpoint
+        self.reconcileEndpoint = reconcileEndpoint
         self.pathProvider = pathProvider
     }
 
@@ -85,8 +88,8 @@ final class WhitelistDetector {
             // The last-known detection result should persist so the UI
             // keeps showing "Whitelist active" / "Free internet" across
             // VPN connect/disconnect cycles. The main-app WhitelistMonitor
-            // picks up when the extension stops; the 200s stale-check in
-            // ContentView.refreshWhitelistStatus() handles truly stale data.
+            // picks up when the extension stops and only a new probe result
+            // may replace that verdict.
             self.log("info: WhitelistDetector stopped (status preserved)")
         }
     }
@@ -135,11 +138,9 @@ final class WhitelistDetector {
             self.probeGeneration += 1
             self.resetProgressLocked(reason: "network path changed → \(fingerprint)")
             if !satisfied {
-                WhitelistStatusStore.current = .noNetwork
-                self.log("info: detector paused (path unsatisfied)")
+                self.log("info: detector paused (path unsatisfied; verdict preserved)")
             } else {
-                WhitelistStatusStore.current = .unknown
-                self.log("info: detector resumed on fresh path")
+                self.log("info: detector resumed on fresh path (verdict preserved)")
                 self.scheduleNextProbe(after: 1)
             }
         }
@@ -185,6 +186,7 @@ final class WhitelistDetector {
         let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
         let baseCadence = onBackup ? Self.onBackupCadence : Self.normalCadence
         let cadence = ProcessInfo.processInfo.isLowPowerModeEnabled ? baseCadence * 3 : baseCadence
+        let cycleStartedAt = Date()
         log("info: detector cycle start method=tcp_tls_sni icmp=not_used active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded) path={\(pathSelection.summary)} foreign=\(foreignTargets) domestic=\(domesticTargets)")
         if iface == nil {
             log("info: detector probe uses NECP/default route (no unambiguous physical interface)")
@@ -202,13 +204,27 @@ final class WhitelistDetector {
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 guard !self.stopped, gen == self.probeGeneration else { return }
+                let probeWallTime = Date().timeIntervalSince(cycleStartedAt)
+                if probeWallTime > 30 {
+                    self.resetProgressLocked(
+                        reason: "discarded stale probe after \(Int(probeWallTime))s"
+                    )
+                    self.scheduleNextProbe(after: 1)
+                    return
+                }
                 for line in WhitelistProbeEngine.detailedLogLines(result) {
                     self.log("info: detector probe \(line)")
                 }
                 self.handleOutcome(Self.outcome(from: result))
                 let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && self.whitelistSuccesses > 0)
                     || (WhitelistStatusStore.activeEndpoint == .backup && self.failbackSuccesses > 0)
-                self.scheduleNextProbe(after: switchPending ? 5 : cadence)
+                // Cadence is start-to-start. A blocked foreign TLS probe takes
+                // almost the full timeout; adding another complete interval
+                // turned 3 × 5 s into roughly 25–30 s.
+                let desiredStartInterval = switchPending ? 5 : cadence
+                self.scheduleNextProbe(
+                    after: max(0.25, desiredStartInterval - probeWallTime)
+                )
             }
         }
     }
@@ -243,33 +259,56 @@ final class WhitelistDetector {
         switch outcome {
         case .clearAll:
             whitelistSuccesses = 0
-            failbackSuccesses += 1
-            if WhitelistStatusStore.activeEndpoint == .backup
-                && failbackSuccesses >= Self.failbackSuccessesNeeded
-                && !inHoldDown {
-                log("info: detector: failback → primary (whitelist gone)")
-                applySwitch(to: .primary)
+            var switched = false
+            if WhitelistStatusStore.activeEndpoint == .backup {
+                failbackSuccesses = min(
+                    failbackSuccesses + 1,
+                    Self.failbackSuccessesNeeded
+                )
+                if failbackSuccesses >= Self.failbackSuccessesNeeded
+                    && !inHoldDown {
+                    log("info: detector: failback → primary (whitelist gone)")
+                    applySwitch(to: .primary)
+                    switched = true
+                    failbackSuccesses = 0
+                    WhitelistStatusStore.current = .off
+                }
+            } else {
                 failbackSuccesses = 0
+                WhitelistStatusStore.current = .off
             }
-            WhitelistStatusStore.current = .off
+            if !switched && WhitelistStatusStore.activeEndpoint == .primary {
+                reconcileEndpoint(.primary)
+            }
 
         case .whitelistOn:
             failbackSuccesses = 0
-            whitelistSuccesses += 1
-            if WhitelistStatusStore.activeEndpoint != .backup
-                && whitelistSuccesses >= Self.failbackSuccessesNeeded
-                && !inHoldDown {
-                log("warn: detector: WHITELIST ACTIVE — switching to backup")
-                applySwitch(to: .backup)
+            var switched = false
+            if WhitelistStatusStore.activeEndpoint != .backup {
+                whitelistSuccesses = min(
+                    whitelistSuccesses + 1,
+                    Self.failbackSuccessesNeeded
+                )
+                if whitelistSuccesses >= Self.failbackSuccessesNeeded
+                    && !inHoldDown {
+                    log("warn: detector: WHITELIST ACTIVE — switching to backup")
+                    applySwitch(to: .backup)
+                    switched = true
+                    whitelistSuccesses = 0
+                    WhitelistStatusStore.current = .detected
+                }
+            } else {
                 whitelistSuccesses = 0
+                WhitelistStatusStore.current = .detected
             }
-            WhitelistStatusStore.current = .detected
+            if !switched && WhitelistStatusStore.activeEndpoint == .backup {
+                reconcileEndpoint(.backup)
+            }
 
         case .uncertain:
             failbackSuccesses = 0
             whitelistSuccesses = 0
-            WhitelistStatusStore.current = .unknown
-            log("warn: detector: uncertain comparative probe result — keeping current endpoint")
+            log("warn: detector: uncertain comparative probe result — keeping current verdict and endpoint")
 
         case .noNetwork:
             failbackSuccesses = 0

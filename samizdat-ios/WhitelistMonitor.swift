@@ -62,6 +62,7 @@ final class WhitelistMonitor: ObservableObject {
     }
 
     func stop() {
+        guard task != nil || pathMonitor != nil else { return }
         generation += 1
         task?.cancel()
         task = nil
@@ -74,7 +75,6 @@ final class WhitelistMonitor: ObservableObject {
 
     private func runCycle(generation gen: Int) async -> TimeInterval {
         guard EndpointModeStore.current == .auto else {
-            WhitelistStatusStore.current = .unknown
             return Self.cycleInterval
         }
         let threshold = WhitelistProbePreferences.successesNeeded
@@ -90,8 +90,17 @@ final class WhitelistMonitor: ObservableObject {
         lastConfigSignature = configSignature
 
         TURNLog.info("whitelist", "monitor cycle start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
+        let probeStartedAt = Date()
         let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex, pinnedIPs: [:])
+        let probeWallTime = Date().timeIntervalSince(probeStartedAt)
         guard gen == generation, !Task.isCancelled else { return Self.cycleInterval }
+        // iOS can suspend the main app in the middle of the blocking Go probe.
+        // Such a result may arrive minutes later on a different physical path;
+        // it is not valid evidence for either endpoint.
+        if probeWallTime > 30 {
+            resetProgress(reason: "discarded stale probe after \(Int(probeWallTime))s")
+            return 1
+        }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
             TURNLog.info("whitelist", "monitor probe \(line)")
         }
@@ -100,23 +109,31 @@ final class WhitelistMonitor: ObservableObject {
         case .normal:
             // Free internet — domestic + foreign controls reachable.
             whitelistCount = 0
-            freeCount += 1
-            WhitelistStatusStore.current = .off
-            if WhitelistStatusStore.activeEndpoint == .backup
-                && freeCount >= threshold {
-                WhitelistStatusStore.activeEndpoint = .primary
+            if WhitelistStatusStore.activeEndpoint == .backup {
+                freeCount += 1
+                if freeCount >= threshold {
+                    WhitelistStatusStore.activeEndpoint = .primary
+                    freeCount = 0
+                    WhitelistStatusStore.current = .off
+                }
+            } else {
                 freeCount = 0
+                WhitelistStatusStore.current = .off
             }
 
         case .allowlist:
             // Default-deny allowlist — domestic reachable, foreign controls fail.
             freeCount = 0
-            whitelistCount += 1
-            WhitelistStatusStore.current = .detected
-            if WhitelistStatusStore.activeEndpoint != .backup
-                && whitelistCount >= threshold {
-                WhitelistStatusStore.activeEndpoint = .backup
+            if WhitelistStatusStore.activeEndpoint != .backup {
+                whitelistCount += 1
+                if whitelistCount >= threshold {
+                    WhitelistStatusStore.activeEndpoint = .backup
+                    whitelistCount = 0
+                    WhitelistStatusStore.current = .detected
+                }
+            } else {
                 whitelistCount = 0
+                WhitelistStatusStore.current = .detected
             }
 
         case .offline:
@@ -126,16 +143,20 @@ final class WhitelistMonitor: ObservableObject {
 
         case .partial, .anomalous, .error:
             // Ordinary excluded list / stale domestic targets / captive weirdness.
-            // Do not declare allowlist and do not switch endpoint.
+            // Do not declare allowlist, switch endpoint, or erase the last
+            // decisive verdict. "Uncertain" is not a new network mode.
             freeCount = 0
             whitelistCount = 0
-            WhitelistStatusStore.current = .unknown
         }
 
         TURNLog.info("whitelist", "monitor counters classification=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
         let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && whitelistCount > 0)
             || (WhitelistStatusStore.activeEndpoint == .backup && freeCount > 0)
-        return switchPending ? 5 : Self.cycleInterval
+        // `probeInterval` is a start-to-start cadence. A blocked foreign TLS
+        // probe commonly consumes ~4.75 s; sleeping another full 5 s made a
+        // configured 3 × 5 s decision take ~25–30 s instead of ~15 s.
+        let desiredStartInterval = switchPending ? 5 : Self.cycleInterval
+        return max(0.25, desiredStartInterval - probeWallTime)
     }
 
     private func resetProgress(reason: String) {
