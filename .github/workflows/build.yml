@@ -67,8 +67,8 @@ jobs:
           scripts/build-hev-xcframework.sh
           ls -la Frameworks/HevSocks5Tunnel.xcframework
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
+      - name: Install XcodeGen and artifact encryption
+        run: brew install xcodegen age
 
       - name: Generate Xcode project
         run: xcodegen generate
@@ -198,10 +198,29 @@ jobs:
           cp "${{ env.EXPORT_PATH }}/samizdat-ios.ipa" "${{ env.EXPORT_PATH }}/${NAME}.ipa"
           ls -la "${{ env.EXPORT_PATH }}/${NAME}.ipa"
 
-      - name: Upload IPA artifact
+      # Public-repository Actions artifacts are readable by every signed-in
+      # GitHub user. Ad-hoc IPAs embed provisioning profiles (including device
+      # identifiers), so upload only an age-encrypted envelope. The dedicated
+      # private identity is kept off-repository on the operator workstation.
+      - name: Encrypt IPA artifact for private delivery
+        run: |
+          set -euo pipefail
+          NAME="${{ steps.ipa_name.outputs.name }}"
+          RECIPIENT="$(tr -d '\r\n' < .github/artifact-age-recipient.txt)"
+          age --encrypt \
+            --recipient "$RECIPIENT" \
+            --output "${{ env.EXPORT_PATH }}/${NAME}.ipa.age" \
+            "${{ env.EXPORT_PATH }}/${NAME}.ipa"
+          test -s "${{ env.EXPORT_PATH }}/${NAME}.ipa.age"
+          rm -f \
+            "${{ env.EXPORT_PATH }}/${NAME}.ipa" \
+            "${{ env.EXPORT_PATH }}/samizdat-ios.ipa"
+          ls -la "${{ env.EXPORT_PATH }}/${NAME}.ipa.age"
+
+      - name: Upload encrypted IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.ipa_name.outputs.name }}
-          path: ${{ env.EXPORT_PATH }}/${{ steps.ipa_name.outputs.name }}.ipa
+          name: ${{ steps.ipa_name.outputs.name }}-encrypted
+          path: ${{ env.EXPORT_PATH }}/${{ steps.ipa_name.outputs.name }}.ipa.age
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 7
