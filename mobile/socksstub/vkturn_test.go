@@ -541,14 +541,52 @@ func TestParseVKTurnRoomCredsJSONEnforcesIOSResourceRoomLimit(t *testing.T) {
 		return `{"rooms":[` + strings.Join(rooms, ",") + `]}`
 	}
 
-	if VKTurnMaxRooms() != 3 {
-		t.Fatalf("VKTurnMaxRooms()=%d, want 3", VKTurnMaxRooms())
+	if VKTurnMaxRooms() != 6 {
+		t.Fatalf("VKTurnMaxRooms()=%d, want 6", VKTurnMaxRooms())
 	}
 	if hashes, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms())); err != nil || len(hashes) != VKTurnMaxRooms() {
 		t.Fatalf("max-room bundle rejected: hashes=%d err=%v", len(hashes), err)
 	}
-	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 3") {
+	if _, _, err := parseVKTurnRoomCredsJSON(bundle(VKTurnMaxRooms() + 1)); err == nil || !strings.Contains(err.Error(), "memory-safe maximum 6") {
 		t.Fatalf("max+1 bundle error = %v, want iOS room-limit rejection", err)
+	}
+}
+
+func TestVKTurnWorkersPerRoomForRooms(t *testing.T) {
+	for _, tc := range []struct {
+		rooms int
+		want  int
+	}{
+		{rooms: -1, want: 0},
+		{rooms: 0, want: 0},
+		{rooms: 1, want: 20},
+		{rooms: 3, want: 20},
+		{rooms: 4, want: 12},
+		{rooms: 6, want: 12},
+		{rooms: 7, want: 0},
+	} {
+		if got := VKTurnWorkersPerRoomForRooms(tc.rooms); got != tc.want {
+			t.Fatalf("rooms=%d workersPerRoom=%d, want %d", tc.rooms, got, tc.want)
+		}
+	}
+}
+
+func TestStartVKTurnMultiRoomUpstreamAdaptiveWorkerGate(t *testing.T) {
+	fresh := time.Now().Unix()
+	rooms := make([]string, 6)
+	for i := range rooms {
+		rooms[i] = fmt.Sprintf(`{"hash":"room-%d","credentials":{"username":"user","password":"pass","turn_servers":["relay.example:3478"],"lifetime_sec":3600,"acquired_at_unix":%d}}`, i, fresh)
+	}
+	bundle := `{"rooms":[` + strings.Join(rooms, ",") + `]}`
+
+	oldRunning := vkturnRunning.Load()
+	vkturnRunning.Store(true)
+	t.Cleanup(func() { vkturnRunning.Store(oldRunning) })
+	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 12); got != "already running" {
+		t.Fatalf("6x12 did not pass adaptive gate: %q", got)
+	}
+	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 20); !strings.Contains(got, "workersPerRoom must be 12") {
+		t.Fatalf("6x20 gate error=%q, want expected-worker rejection", got)
 	}
 }
 

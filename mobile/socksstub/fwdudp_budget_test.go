@@ -181,7 +181,9 @@ func TestFwdUDPAdaptiveBudgetShrinksAsTURNWorkerPoolGrows(t *testing.T) {
 		{workers: 0, want: 64},
 		{workers: 20, want: 64},
 		{workers: 40, want: 48},
+		{workers: 48, want: 24},
 		{workers: 60, want: 24},
+		{workers: 72, want: 24},
 		{workers: 80, want: 16},
 	}
 	for _, tc := range cases {

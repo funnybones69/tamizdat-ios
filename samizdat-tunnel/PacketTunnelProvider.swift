@@ -396,7 +396,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let workers = VKCredsPreferences.workers
         let roomCount = VKCredsPreferences.roomHashes.count
-        ExtLog.info("[vkturn] attach: peerNumeric=\(peer != configuredPeer) passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=20")
+        let workersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: roomCount)
+        ExtLog.info("[vkturn] attach: peerNumeric=\(peer != configuredPeer) passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=\(workersPerRoom)")
 
         guard !peer.isEmpty else {
             ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// server not mirrored yet. Open Settings → Proxies and save Main URI.")
@@ -479,7 +480,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let beforeMs = Date()
         let err: String
         if let bundle = roomBundleJSON, !bundle.isEmpty {
-            err = SocksstubStartVKTurnMultiRoomUpstream(bundle, peer, password, deviceID, 9000, VKCredsPreferences.workersPerRoom)
+            err = SocksstubStartVKTurnMultiRoomUpstream(bundle, peer, password, deviceID, 9000, workersPerRoom)
         } else {
             err = SocksstubStartVKTurnUpstream(credsJSON, peer, password, deviceID, 9000, workers)
         }
@@ -1340,7 +1341,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // the active policy. H2/Main users just keep the saved value
             // for the next Restricted+Relay connect.
             let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-            appendExtLog("info: app requested VK TURN restart → rooms=\(VKCredsPreferences.roomHashes.count) workersPerRoom=20 effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
+            let roomCount = VKCredsPreferences.roomHashes.count
+            let workersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: roomCount)
+            appendExtLog("info: app requested VK TURN restart → rooms=\(roomCount) workersPerRoom=\(workersPerRoom) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
             guard policy.usesTURN else {
                 SocksstubStopVKTurnUpstream()
                 SocksstubSetVKTurnRequired(false)
@@ -1411,7 +1414,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 ? (turnNetstackReady ? "turn" : "turn-pending")
                 : "h2"
             let turnStats: (active: Int, expected: Int, quotaStorm: Bool) = {
-                let fallbackExpected = VKCredsPreferences.roomHashes.count * VKCredsPreferences.workersPerRoom
+                let roomCount = VKCredsPreferences.roomHashes.count
+                let fallbackExpected = roomCount * VKCredsPreferences.workersPerRoom(forRooms: roomCount)
                 let raw = SocksstubTURNUpstreamStatsJSON()
                 guard let data = raw.data(using: .utf8),
                       let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]

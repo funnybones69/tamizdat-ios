@@ -250,7 +250,7 @@ struct SettingsView: View {
                         .font(.geist(.medium, size: 12))
                         .foregroundStyle(theme.textMuted)
                     Spacer()
-                    Text("\(roomCount) · \(roomCount * VKCredsPreferences.workersPerRoom) workers")
+                    Text("\(roomCount) · \(roomCount * VKCredsPreferences.workersPerRoom(forRooms: roomCount)) workers")
                         .font(.geistMono(.semibold, size: 12))
                         .foregroundStyle(theme.text)
                         .padding(.horizontal, 10)
@@ -305,12 +305,14 @@ struct SettingsView: View {
         let oldRooms = VKCredsPreferences.roomHashes
         let rooms = Self.roomHashes(from: vkRoomsDraft)
         guard rooms.count <= VKCredsPreferences.maxRooms else {
-            vkCallHashFeedback = "Максимум \(VKCredsPreferences.maxRooms) комнат (\(VKCredsPreferences.maxRooms * VKCredsPreferences.workersPerRoom) workers) для безопасного лимита памяти"
+            let maxRooms = VKCredsPreferences.maxRooms
+            let maxWorkersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: maxRooms)
+            vkCallHashFeedback = "Максимум до \(maxRooms) комнат × \(maxWorkersPerRoom) workers для безопасного лимита памяти"
             return
         }
         let derived = syncVKDerivedH2Config()
         VKCredsPreferences.roomHashes = rooms
-        VKCredsPreferences.workers = VKCredsPreferences.workersPerRoom
+        VKCredsPreferences.workers = VKCredsPreferences.workersPerRoom(forRooms: rooms.count)
         vkRoomsDraft = rooms.joined(separator: "\n")
 
         if rooms != oldRooms {
@@ -327,7 +329,7 @@ struct SettingsView: View {
             return
         }
 
-        let totalWorkers = rooms.count * VKCredsPreferences.workersPerRoom
+        let totalWorkers = rooms.count * VKCredsPreferences.workersPerRoom(forRooms: rooms.count)
         let needsRefresh = (rooms != oldRooms) || TURNCredsStore.shared.needsRefresh
         let turnActive = TURNCredsRefresher.shouldMaintainTurnCredentialsNow()
         if needsRefresh && turnActive {

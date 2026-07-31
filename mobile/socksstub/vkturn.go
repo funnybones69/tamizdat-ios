@@ -122,18 +122,33 @@ func SetVKTurnRequired(required bool) {
 // VKTurnRequired is exposed for status and regression tests.
 func VKTurnRequired() bool { return vkturnRequired.Load() }
 
-const vkturnIOSDeviceMaxRooms = 3
+const vkturnIOSDeviceMaxRooms = 6
+
+// VKTurnWorkersPerRoomForRooms is the memory-budget-derived adaptive iOS
+// profile. At the upper ceiling, 6x12=72 workers fits the 4 MiB aggregate
+// socket and 512 KiB worker-queue budgets at their per-worker floors.
+func VKTurnWorkersPerRoomForRooms(rooms int) int {
+	switch {
+	case rooms <= 0:
+		return 0
+	case rooms <= 3:
+		return 20
+	case rooms <= vkturnIOSDeviceMaxRooms:
+		return 12
+	default:
+		return 0
+	}
+}
 
 // VKTurnMaxRooms exposes the iOS-only room limit to Swift so Settings, App
 // Group storage and the gomobile data-plane gate cannot drift. The generic
 // wgturn protocol remains dynamic; this stricter ceiling is a Network Extension
-// resource gate. At 4x20 (80 workers), the FWD_UDP session/target budget falls
-// to 16 and starves DNS/QUIC during ordinary browsing. The three-room product
-// limit keeps 3x20 (60 workers) at budget 24, the working ceiling. Raising it
-// above three requires both physical-device soak and a review of the FWD_UDP
-// budgets.
+// resource gate. The adaptive profile uses 20 workers per room for up to three
+// rooms and 12 workers per room for four through six rooms. Its 72-worker
+// ceiling remains in the 24-session FWD_UDP budget bucket already soak-proven
+// at 3x20. Raising the ceiling above six still requires physical-device soak.
 func VKTurnMaxRooms() int {
-	budgeted := wgturnclient.MaxBudgetedRooms(vkturnWorkersPerRoom)
+	budgeted := wgturnclient.MaxBudgetedRooms(VKTurnWorkersPerRoomForRooms(vkturnIOSDeviceMaxRooms))
 	if budgeted < vkturnIOSDeviceMaxRooms {
 		return budgeted
 	}
@@ -165,14 +180,15 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, workers, 0, nil, nil, creds, len(credsJSON))
 }
 
-// StartVKTurnMultiRoomUpstream starts one full 20-worker pool per room.
+// StartVKTurnMultiRoomUpstream starts one adaptive worker pool per room.
 func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int, workersPerRoom int) string {
 	hashes, credsByHash, err := parseVKTurnRoomCredsJSON(bundleJSON)
 	if err != nil {
 		return "roomCredsJSON: " + err.Error()
 	}
-	if workersPerRoom != vkturnWorkersPerRoom {
-		return "workersPerRoom must be 20"
+	expected := VKTurnWorkersPerRoomForRooms(len(hashes))
+	if workersPerRoom != expected {
+		return fmt.Sprintf("workersPerRoom must be %d for %d rooms", expected, len(hashes))
 	}
 	maxRooms := VKTurnMaxRooms()
 	if len(hashes) > maxRooms {
@@ -543,7 +559,7 @@ func TURNUpstreamActiveWorkers() int {
 	return int(vkturnActiveWorkers.Load())
 }
 
-// TURNUpstreamExpectedWorkers is the effective runner pool size (rooms × 20).
+// TURNUpstreamExpectedWorkers is the effective adaptive runner pool size.
 func TURNUpstreamExpectedWorkers() int64 { return vkturnExpectedWorkers.Load() }
 
 // TURNUpstreamRunning reports whether the VK TURN runner goroutine is alive.

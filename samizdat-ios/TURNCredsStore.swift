@@ -482,7 +482,11 @@ enum VKCredsPreferences {
         UserDefaults(suiteName: appGroupID)
     }
 
-    static let workersPerRoom = 20
+    static func workersPerRoom(forRooms rooms: Int) -> Int {
+        Int(SocksstubVKTurnWorkersPerRoomForRooms(rooms))
+    }
+    /// Compatibility profile for call sites that do not yet have a room count.
+    static var workersPerRoom: Int { workersPerRoom(forRooms: 3) }
     /// Go derives this from the iOS Network Extension's aggregate socket and
     /// worker-queue budgets. Reading the gomobile value keeps Swift storage
     /// and the data-plane rejection gate in lockstep.
@@ -581,15 +585,16 @@ enum VKCredsPreferences {
         set { defaults?.set(newValue, forKey: connectPasswordKey) }
     }
 
-    /// Legacy accessor kept for existing call sites. Multi-room always uses a
-    /// fixed, experimentally verified pool of 20 workers per room.
+    /// Legacy accessor kept for existing call sites without a room count.
     static var workers: Int {
         get { workersPerRoom }
-        set { defaults?.set(workersPerRoom, forKey: workersKey) }
+        set { defaults?.set(normalizeWorkers(newValue), forKey: workersKey) }
     }
 
-    static var allowedWorkers: [Int] { [workersPerRoom] }
-    static func normalizeWorkers(_ raw: Int) -> Int { workersPerRoom }
+    static var allowedWorkers: [Int] { [12, 20] }
+    static func normalizeWorkers(_ raw: Int) -> Int {
+        allowedWorkers.contains(raw) ? raw : workersPerRoom
+    }
 
     /// Mirror derived H2 identity into App Group keys consumed by the
     /// Network Extension. VK TURN does not have editable peer/password:
