@@ -1455,6 +1455,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let turnRunning = SocksstubTURNUpstreamRunning()
             let turnNetstackReady = !SocksstubTURNUpstreamWGConfig().isEmpty
             let turnRecovery = self.turnRecoveryStatus()
+            let turnMemHeadroomMB = Int(os_proc_available_memory() / (1024 * 1024))
             let actualUpstream = turnRequiredNow
                 ? (turnNetstackReady ? "turn" : "turn-pending")
                 : "h2"
@@ -1508,6 +1509,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "turnQuotaStorm": turnStats.quotaStorm,
                 "turnRecoveryState": turnRecovery.state,
                 "nextRetryInSec": turnRecovery.nextRetryInSec,
+                "turnMemHeadroomMB": turnMemHeadroomMB,
                 // VK TURN relay session parameter status. IPA-D65b: the main
                 // app now acquires session params itself via WKWebView verification challenge
                 // solving and writes them to App Group UserDefaults
@@ -1963,7 +1965,7 @@ misc:
 
     private func startBurstProtection() {
         // IPA-D7: nuclear close pattern from sing-box-for-apple.
-        // IPA-D9: retain one heap profile per tunnel generation for now. The
+        // IPA-D9: retain one heap profile per accepted pressure episode. The
         // shared cooldown below prevents a GC/profile/flow-close feedback loop.
         pressureRecoveryTask.withLock {
             $0?.cancel()
@@ -1995,6 +1997,7 @@ misc:
                     return (false, false)
                 }
                 state.lastNuclearCloseAt = now
+                state.didDumpHeap = false
                 let shouldDump = !state.didDumpHeap
                 state.didDumpHeap = true
                 return (true, shouldDump)
@@ -2038,6 +2041,7 @@ misc:
             let action = nextLadderAction(state: input)
             state.lastNuclearCloseAt = now
             state.pressureEpisodeCount = episode
+            state.didDumpHeap = false
             let shouldDump = !state.didDumpHeap
             state.didDumpHeap = true
             state.headroomStableSince = nil
@@ -2557,8 +2561,31 @@ misc:
         let heapErr = SocksstubWriteHeapProfile(heapURL.path)
         if heapErr.isEmpty {
             appendExtLog("info: heap-dump → \(heapURL.lastPathComponent)")
+            rotateHeapProfiles(in: containerURL, keeping: 5)
         } else {
             appendExtLog("warn: heap-dump failed: \(heapErr)")
+        }
+    }
+
+    private func rotateHeapProfiles(in containerURL: URL, keeping limit: Int) {
+        let manager = FileManager.default
+        guard let profiles = try? manager.contentsOfDirectory(
+            at: containerURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        let heaps = profiles.filter {
+            $0.lastPathComponent.hasPrefix("heap-")
+                && $0.lastPathComponent.hasSuffix(".pb.gz")
+        }.sorted { lhs, rhs in
+            let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? Date.distantPast
+            let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)
+                ?? Date.distantPast
+            return lhsDate > rhsDate
+        }
+        for stale in heaps.dropFirst(max(0, limit)) {
+            try? manager.removeItem(at: stale)
         }
     }
 
@@ -2581,11 +2608,11 @@ misc:
         timer.schedule(deadline: .now() + .seconds(1), repeating: .seconds(30))
         timer.setEventHandler { [weak self] in
             guard let self, self.isRunning else { return }
-            // iOS's apple-supplied "available before jetsam" gauge.
-            let availKB = os_proc_available_memory() / 1024
-
             // IPA-D7/D9: per-process memory backstop with heap dump.
             let availBytes = os_proc_available_memory()
+            // iOS's apple-supplied "available before jetsam" gauge. Use the
+            // same sample for pressure decisions and the periodic log.
+            let availKB = availBytes / 1024
             self.sampleTURNLadderAndRecovery(availableMemory: availBytes, now: Date())
             var nuclearFired = false
             if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
@@ -2623,15 +2650,14 @@ misc:
             self.lastHevTxPkts = Int64(tx_pkts)
             self.lastHevRxPkts = Int64(rx_pkts)
 
-            // IPA-D18: log only every 5 ticks (~150 s) for periodic
+            // Log every 2 ticks (~60 s) for periodic
             // health snapshot, OR immediately when nuclear close
-            // fired. Drops appendExtLog() rate from 3600/hour to
-            // ~24/hour, removing the per-tick file-write that pulled
-            // iOS out of idle state.
+            // fired. The synchronized file write is therefore bounded to
+            // ~60/hour instead of running on every 30-second sampling tick.
             self.hbTick += 1
-            if nuclearFired || (self.hbTick % 5) == 0 {
+            if nuclearFired || (self.hbTick % 2) == 0 {
                 self.appendExtLog(String(
-                    format: "info: hb avail=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps in=%lld out=%lld",
+                    format: "info: пульс памяти headroom=%dKB go.inuse=%lldKB go.sys=%lldKB go.rel=%lldKB gc=%lld pps.in=%lld pps.out=%lld",
                     availKB,
                     goInUseKB, goSysKB, goRelKB,
                     numGC,
@@ -2661,6 +2687,9 @@ misc:
         log.info("\(message, privacy: .public)")
         guard let h = swiftLogHandle else { return }
         do {
+            // gomobile exposes no arbitrary Swift→Go log ingress. Synchronize
+            // every event so pressure/ladder/recovery lines survive extension
+            // death and are visible in the bounded exported log tail.
             try h.write(contentsOf: Data(line.utf8))
             try h.synchronize()
         } catch {

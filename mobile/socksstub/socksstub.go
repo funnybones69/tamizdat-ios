@@ -51,7 +51,6 @@ import (
 	// is github.com/funnybones69/tamizdat (`package tamizdat`). All call
 	// sites continue to use `samizdat.Client` etc. via this alias.
 	samizdat "github.com/funnybones69/tamizdat"
-	singBufio "github.com/sagernet/sing/common/bufio"
 )
 
 const (
@@ -562,16 +561,16 @@ func Start(addrSpec string) error {
 	// aggressive 20% growth threshold caused ~5x more GC cycles than
 	// necessary at idle — each cycle wakes CPU and burns battery.
 	//
-	// IPA-R1: soft limit 37 MB → 26 MB. The 2026-07-17 4x20 speed-test
+	// IPA-R1: soft limit 37 MB → 22 MB. The 2026-07-17 4x20 speed-test
 	// collapse (heap-kernel-critical-1784303711) showed live heap of only
 	// 13 MB but 74 MB allocated in 2.5 min (per-frame TURN/DTLS/reorder
 	// churn), floating go.sys to 29 MB while native (hev/lwIP, DTLS
 	// records in kernel, Swift, NE) needed more than the 13 MB the 37 MB
 	// cap left — kernel-critical fired with the Go arena mostly garbage.
-	// 26 MB still doubles the observed peak live heap (no GC thrash at
-	// idle, GOGC stays 100) but biases GC hard exactly during load
-	// bursts and returns ~11 MB of headroom to the native side.
-	debug.SetMemoryLimit(26 * 1024 * 1024)
+	// 22 MB still leaves ample room above the observed 8.3 MB live heap,
+	// while deliberately reserving more of the jetsam budget for non-Go
+	// footprint (HEV/lwIP, gVisor, Swift and kernel socket buffers).
+	debug.SetMemoryLimit(22 * 1024 * 1024)
 	debug.SetGCPercent(100)
 
 	network := "tcp"
@@ -1211,8 +1210,8 @@ func acceptLoop(state *runtimeState, ctx context.Context, ln net.Listener) {
 		// SOCKS5 to us over 127.0.0.1; Nagle on a localhost socket adds
 		// 40 ms before each small request frame is forwarded — every
 		// HTTP/2 SETTINGS, every short SOCKS5 reply pays this tax. We
-		// already disabled buffering on the tamizdat side (singBufio.Copy
-		// pool); flipping NoDelay here makes loopback handoff symmetric.
+		// already bounded relay buffering on the tamizdat side (16 KiB
+		// io.CopyBuffer pool); flipping NoDelay here makes loopback symmetric.
 		if tc, ok := c.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
 		}
@@ -1837,24 +1836,21 @@ var relayBufPool = sync.Pool{
 func getRelayBuf() *[]byte  { return relayBufPool.Get().(*[]byte) }
 func putRelayBuf(b *[]byte) { relayBufPool.Put(b) }
 
-// IPA-D7: relay using sing-box's bufio.Copy with `with_low_memory` build
-// tag. This forces all copies through copyWaitWithPool — pool-managed
-// refcounted buffers from sing/common/buf/alloc.go (power-of-2 sync.Pool
-// from 64 B to 64 KiB). With the build tag, BufferSize=16 KiB and
-// LowMemory const = true so even non-WaitReader sources go through pool.
-//
-// This is the EXACT pattern sing-box-for-apple uses on iOS to survive
-// the 50 MiB jetsam cap. We copied verbatim because (per operator memory
-// rule "find what works > rollback") working open-source projects on
-// the same platform under same constraints have already solved this.
+// relay keeps exactly one explicit 16 KiB buffer per direction while a copy is
+// active. The package pool above lets GC discard idle buffers under pressure;
+// unlike singBufio.Copy, this path cannot select a larger internal buffer.
 func relay(a, b net.Conn, idx uint64) {
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = singBufio.Copy(b, a)
+		buf := getRelayBuf()
+		_, _ = io.CopyBuffer(b, a, *buf)
+		putRelayBuf(buf)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = singBufio.Copy(a, b)
+		buf := getRelayBuf()
+		_, _ = io.CopyBuffer(a, b, *buf)
+		putRelayBuf(buf)
 		done <- struct{}{}
 	}()
 	<-done
