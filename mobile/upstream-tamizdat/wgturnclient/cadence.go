@@ -14,9 +14,12 @@ const (
 	userTrafficIdleAfter          = 30 * time.Second
 	workerStatsInterval           = 10 * time.Second
 
-	// TURN sockets are per worker. 24 KiB in each direction is ample for the
-	// approximately 64 kbit/s worker ceiling without multiplying kernel buffers.
-	workerSocketBufferSize = 24 * 1024
+	// TURN sockets are per worker. 16 KiB in each direction still buffers
+	// ~2 s of flow at the ~64 kbit/s worker ceiling, and saves 1.7 MiB of
+	// kernel memory at 108 workers vs 24 KiB — heap dumps on build 348
+	// showed the process dying from baseline + game-burst concurrency,
+	// so the permanent baseline goes on a diet.
+	workerSocketBufferSize = 16 * 1024
 )
 
 type userTrafficTracker struct {

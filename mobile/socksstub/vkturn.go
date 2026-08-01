@@ -149,16 +149,15 @@ const vkturnIOSDeviceMaxRooms = 6
 // under VK's hard quota of 20 per credential generation — server long runs
 // show ~zero organic worker deaths, and mass re-allocation events route to
 // fresh credentials anyway, so four slots of slack suffice); five and six
-// rooms get 18 (build 347, up from 12): field logs on 6x12 showed every
-// allocation pinned at VK's ~64 Kbit/s per-allocation cap, so the only
-// remaining lever is more allocations. 18 leaves two slots of slack for
-// respawns; memory: 108 workers x 2 x 24 KiB socket buffers ~= 5.2 MiB.
+// rooms get 12: build 348 proved 6x18 dies under game bursts (baseline +
+// 79-flow spike hit the jetsam budget in seconds), while 6x12 held for
+// hours on builds 344-346. Stability beats the 6.5 Mbit/s peak.
 func VKTurnWorkersPerRoomForRooms(rooms int) int {
 	switch {
 	case rooms >= 1 && rooms <= 4:
 		return 16
 	case rooms >= 5 && rooms <= vkturnIOSDeviceMaxRooms:
-		return 18
+		return 12
 	default:
 		return 0
 	}

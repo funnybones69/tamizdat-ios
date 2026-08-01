@@ -562,8 +562,8 @@ func TestVKTurnWorkersPerRoomForRooms(t *testing.T) {
 		{rooms: 1, want: 16},
 		{rooms: 3, want: 16},
 		{rooms: 4, want: 16},
-		{rooms: 5, want: 18},
-		{rooms: 6, want: 18},
+		{rooms: 5, want: 12},
+		{rooms: 6, want: 12},
 		{rooms: 7, want: 0},
 	} {
 		if got := VKTurnWorkersPerRoomForRooms(tc.rooms); got != tc.want {
