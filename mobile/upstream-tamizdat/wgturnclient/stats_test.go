@@ -81,7 +81,7 @@ func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"room_up_bytes", "room_down_bytes", "bond_reorder_gaps_down"} {
+	for _, key := range []string{"room_up_bytes", "room_down_bytes", "bond_reorder_gaps_down", "turn_reallocations"} {
 		if !strings.Contains(string(encoded), `"`+key+`"`) {
 			t.Fatalf("snapshot JSON missing %q: %s", key, encoded)
 		}

@@ -48,13 +48,16 @@ func TestNewLegacySingleRoomPreservesTwentyWorkers(t *testing.T) {
 	}
 }
 
-func TestSessionMemoryProfilePreservesLegacySingleRoomAndBoundsExplicitRooms(t *testing.T) {
+func TestSessionMemoryProfileFixedSocketBuffersAndQueueBudgets(t *testing.T) {
 	single := memoryProfileForWorkers(20, false)
-	if single.socketBufferSize != 625*1024 || single.workerSendBuffer != 128 {
-		t.Fatalf("single-room profile=%+v, want legacy 625KiB/128", single)
+	if single.socketBufferSize != workerSocketBufferSize || single.workerSendBuffer != singleRoomWorkerSendBuf {
+		t.Fatalf("single-room profile=%+v, want fixed %d/%d", single, workerSocketBufferSize, singleRoomWorkerSendBuf)
 	}
 
 	oneExplicitRoom := memoryProfileForWorkers(20, true)
+	if oneExplicitRoom.socketBufferSize != workerSocketBufferSize {
+		t.Fatalf("explicit-room socket=%d, want fixed %d", oneExplicitRoom.socketBufferSize, workerSocketBufferSize)
+	}
 	if got := 20 * oneExplicitRoom.socketBufferSize * 2; got > multiRoomSocketBudget {
 		t.Fatalf("one explicit room requested socket memory=%d, budget=%d", got, multiRoomSocketBudget)
 	}
@@ -63,11 +66,8 @@ func TestSessionMemoryProfilePreservesLegacySingleRoomAndBoundsExplicitRooms(t *
 	}
 
 	multi := memoryProfileForWorkers(80, true)
-	if multi.socketBufferSize != multiRoomSocketBudget/80/2 || multi.workerSendBuffer != multiRoomQueueBudget/80/readBufSize {
-		t.Fatalf("multi-room profile=%+v, want budget-derived profile", multi)
-	}
-	if got := 80 * multi.socketBufferSize * 2; got > multiRoomSocketBudget {
-		t.Fatalf("multi-room requested socket memory=%d, budget=%d", got, multiRoomSocketBudget)
+	if multi.socketBufferSize != workerSocketBufferSize || multi.workerSendBuffer != multiRoomQueueBudget/80/readBufSize {
+		t.Fatalf("multi-room profile=%+v, want fixed socket + budget-derived queue", multi)
 	}
 	if got := 80 * multi.workerSendBuffer * readBufSize; got > multiRoomQueueBudget {
 		t.Fatalf("multi-room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
@@ -81,9 +81,11 @@ func TestSessionMemoryProfilePreservesLegacySingleRoomAndBoundsExplicitRooms(t *
 		t.Fatalf("two-room queued payload memory=%d, budget=%d", got, multiRoomQueueBudget)
 	}
 
+	// Beyond-admission worker counts keep the fixed socket size; the socket
+	// budget is enforced by MaxBudgetedRooms admission, not by shrinking.
 	scaled := memoryProfileForWorkers(120, true)
-	if got := 120 * scaled.socketBufferSize * 2; got > multiRoomSocketBudget {
-		t.Fatalf("scaled socket memory=%d, budget=%d", got, multiRoomSocketBudget)
+	if scaled.socketBufferSize != workerSocketBufferSize {
+		t.Fatalf("scaled socket=%d, want fixed %d", scaled.socketBufferSize, workerSocketBufferSize)
 	}
 	if scaled.workerSendBuffer != minWorkerSendBuf {
 		t.Fatalf("scaled queue=%d, want floor %d", scaled.workerSendBuffer, minWorkerSendBuf)

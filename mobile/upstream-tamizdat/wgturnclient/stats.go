@@ -18,6 +18,8 @@ type Stats struct {
 	TotalBytesUp      int64
 	TotalBytesDown    int64
 	CredsErrors       int64
+	userTraffic       userTrafficTracker
+	turnAllocations   allocationGenerationTracker
 	lastAllocOKUnix   int64
 	quotaErrStreak    int64
 	runnerStartedUnix int64
@@ -48,7 +50,8 @@ type StatsSnapshot struct {
 	Reconnects           int64   `json:"reconnects"`
 	TotalBytesUp         int64   `json:"total_bytes_up"`
 	TotalBytesDown       int64   `json:"total_bytes_down"`
-	CredsErrors          int64   `json:"credential_errors"`
+	CredsErrors       int64   `json:"credential_errors"`
+	TURNReallocations int64   `json:"turn_reallocations"`
 	LastAllocOKUnix      int64   `json:"last_alloc_ok_unix"`
 	QuotaErrStreak       int64   `json:"quota_error_streak"`
 	QuotaStorm           bool    `json:"quota_storm"`
@@ -107,7 +110,8 @@ func (s *Stats) snapshotAtUnix(nowUnix int64) StatsSnapshot {
 		Reconnects:           atomic.LoadInt64(&s.Reconnects),
 		TotalBytesUp:         atomic.LoadInt64(&s.TotalBytesUp),
 		TotalBytesDown:       atomic.LoadInt64(&s.TotalBytesDown),
-		CredsErrors:          atomic.LoadInt64(&s.CredsErrors),
+		CredsErrors:       atomic.LoadInt64(&s.CredsErrors),
+		TURNReallocations: s.currentTURNReallocations(),
 		LastAllocOKUnix:      lastAllocOKUnix,
 		QuotaErrStreak:       quotaErrStreak,
 		QuotaStorm:           quotaStormActive(active, quotaErrStreak, lastAllocOKUnix, s.runnerStartedUnix, nowUnix),
@@ -188,13 +192,13 @@ func (s *Stats) RunLoop(shutdown <-chan struct{}) {
 }
 
 func (s *Stats) RunLoopWithCallback(shutdown <-chan struct{}, onSnapshot func(StatsSnapshot)) {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(workerStatsInterval)
 	defer ticker.Stop()
 
 	emit := func() {
 		snapshot := s.Snapshot()
 		totalMB := float64(snapshot.TotalBytesUp+snapshot.TotalBytesDown) / (1024.0 * 1024.0)
-		log.Printf("[СТАТИСТИКА] Активных: %d | Трафик: %.2f МБ", snapshot.ActiveConnections, totalMB)
+		log.Printf("[СТАТИСТИКА] Активных: %d | Трафик: %.2f МБ | Переаллокаций TURN: %d", snapshot.ActiveConnections, totalMB, snapshot.TURNReallocations)
 		if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
 			log.Printf("[BOND] frames up=%d down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps=%d late=%d room_up_packets=%v room_up_bytes=%v room_down_packets=%v room_down_bytes=%v room_drops=%v",
 				snapshot.BondFramesUp, snapshot.BondFramesDown, snapshot.BondBytesUp, snapshot.BondBytesDown,
@@ -211,8 +215,10 @@ func (s *Stats) RunLoopWithCallback(shutdown <-chan struct{}, onSnapshot func(St
 		case <-shutdown:
 			emit()
 			return
-		case <-ticker.C:
-			emit()
+		case now := <-ticker.C:
+			if s.shouldEmitPeriodicStatsAt(now) {
+				emit()
+			}
 		}
 	}
 }

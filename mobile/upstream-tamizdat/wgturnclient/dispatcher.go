@@ -237,6 +237,7 @@ func (d *Dispatcher) readLoop() {
 
 		d.clientAddr.Store(&addr)
 		atomic.AddInt64(&d.stats.TotalBytesUp, int64(n))
+		d.stats.recordUserTraffic(time.Now())
 
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
@@ -428,6 +429,7 @@ func (d *Dispatcher) writeWGPacket(pkt []byte) {
 		return
 	}
 	atomic.AddInt64(&d.stats.TotalBytesDown, int64(len(pkt)))
+	d.stats.recordUserTraffic(time.Now())
 }
 
 type stringError []byte

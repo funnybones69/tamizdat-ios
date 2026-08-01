@@ -26,17 +26,12 @@ const (
 	sessionReadTimeout      = 15 * time.Second
 	readBufSize             = 1600
 	singleRoomSocketBufSize = 625 * 1024
-	multiRoomSocketBufSize  = 128 * 1024
 	// iOS Network Extensions have a tight process + kernel memory budget.
-	// SetReadBuffer/SetWriteBuffer are per worker and the kernel may account
-	// more than the requested size, so keep the aggregate request conservative.
-	// Explicit room pools share one fixed iOS budget regardless of room count.
-	// At 4x20 this yields ~25 KiB per socket direction and four queued overlay
-	// frames per worker instead of growing kernel/Go memory with every room.
-	multiRoomSocketBudget  = 4 * 1024 * 1024
-	multiRoomQueueBudget   = 512 * 1024
-	minWorkerSocketBufSize = 8 * 1024
-	minWorkerSendBuf       = 4
+	// Keep aggregate guards for room admission and Go queues. Per-worker TURN
+	// sockets use the explicit fixed workerSocketBufferSize from cadence.go.
+	multiRoomSocketBudget = 4 * 1024 * 1024
+	multiRoomQueueBudget  = 512 * 1024
+	minWorkerSendBuf      = 4
 	// Pion Client.Listen allocates math.MaxUint16 bytes per client. Our TURN
 	// channel carries DTLS records for <=2 KiB overlay frames, so a 4 KiB
 	// inbound buffer preserves protocol headroom while avoiding ~6.1 MiB of
@@ -81,7 +76,7 @@ func MaxBudgetedRooms(workersPerRoom int) int {
 	if workersPerRoom <= 0 {
 		return 0
 	}
-	maxWorkersBySockets := multiRoomSocketBudget / (2 * minWorkerSocketBufSize)
+	maxWorkersBySockets := multiRoomSocketBudget / (2 * workerSocketBufferSize)
 	maxWorkersByQueues := multiRoomQueueBudget / (minWorkerSendBuf * readBufSize)
 	if maxWorkersByQueues < maxWorkersBySockets {
 		return maxWorkersByQueues / workersPerRoom
@@ -90,29 +85,19 @@ func MaxBudgetedRooms(workersPerRoom int) int {
 }
 
 func memoryProfileForWorkers(workers int, explicitRoomPool bool) sessionMemoryProfile {
+	sendBuffer := singleRoomWorkerSendBuf
 	if explicitRoomPool {
-		socketBuffer := multiRoomSocketBudget / workers / 2
-		if socketBuffer > multiRoomSocketBufSize {
-			socketBuffer = multiRoomSocketBufSize
-		}
-		if socketBuffer < minWorkerSocketBufSize {
-			socketBuffer = minWorkerSocketBufSize
-		}
-		sendBuffer := multiRoomQueueBudget / workers / readBufSize
+		sendBuffer = multiRoomQueueBudget / workers / readBufSize
 		if sendBuffer > multiRoomWorkerSendBuf {
 			sendBuffer = multiRoomWorkerSendBuf
 		}
 		if sendBuffer < minWorkerSendBuf {
 			sendBuffer = minWorkerSendBuf
 		}
-		return sessionMemoryProfile{
-			socketBufferSize: socketBuffer,
-			workerSendBuffer: sendBuffer,
-		}
 	}
 	return sessionMemoryProfile{
-		socketBufferSize: singleRoomSocketBufSize,
-		workerSendBuffer: singleRoomWorkerSendBuf,
+		socketBufferSize: workerSocketBufferSize,
+		workerSendBuffer: sendBuffer,
 	}
 }
 
@@ -572,6 +557,7 @@ func RunSession(
 		return false, fmt.Errorf("TURN Allocate: %w", err)
 	}
 	stats.recordAllocateOK(time.Now())
+	stats.recordTURNAllocation(roomID, sessionID, creds.User)
 	defer relay.Close()
 	log.Printf("[СЕССИЯ #%d] Relay: %s", sessionID, relay.LocalAddr())
 	emitEvent(onEvent, "info", "allocate ok worker=%d relayAddrPresent=%t", sessionID, relay.LocalAddr() != nil)
@@ -582,19 +568,25 @@ func RunSession(
 	sessCtx, sessCancel := context.WithCancel(ctx)
 	defer sessCancel()
 
-	// Keepalive goroutine
+	// Keepalive goroutine. The loop wakes at the active cadence so a newly
+	// active bond reacts promptly, but idle workers emit at most every 30s.
 	var sessionWg sync.WaitGroup
 	sessionWg.Add(1)
 	go func() {
 		defer sessionWg.Done()
-		t := time.NewTicker(10 * time.Second)
+		t := time.NewTicker(workerKeepaliveActiveInterval)
 		defer t.Stop()
+		lastKeepalive := time.Now()
 		for {
 			select {
 			case <-sessCtx.Done():
 				return
-			case <-t.C:
+			case now := <-t.C:
+				if !workerKeepaliveDue(now, lastKeepalive, stats.workerKeepaliveIntervalAt(now)) {
+					continue
+				}
 				tc.SendBindingRequest()
+				lastKeepalive = now
 			}
 		}
 	}()
@@ -765,17 +757,21 @@ func RunSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(workerKeepaliveActiveInterval)
 		defer ticker.Stop()
 		var lastWriteDeadline time.Time
+		lastKeepalive := time.Now()
 		for {
 			select {
 			case <-sessCtx.Done():
 				return
-			case <-ticker.C:
-				now := time.Now()
+			case now := <-ticker.C:
+				if !workerKeepaliveDue(now, lastKeepalive, stats.workerKeepaliveIntervalAt(now)) {
+					continue
+				}
 				_ = dtlsConn.SetWriteDeadline(now.Add(5 * time.Second))
 				lastWriteDeadline = now
+				lastKeepalive = now
 				wake := []byte("WAKEUP")
 				if bondV2 {
 					if encoded, encErr := bondFramePayload(bondFrameKeepalive, nil); encErr == nil {

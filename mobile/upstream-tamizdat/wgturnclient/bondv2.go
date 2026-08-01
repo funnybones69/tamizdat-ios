@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -19,6 +20,7 @@ const (
 	bondSmallPacketMax            = 384
 	bondReorderWindow             = 256
 	bondReorderHold               = 30 * time.Millisecond
+	bondReorderCapLogInterval     = 30 * time.Second
 	bondBindMaxAttempts           = 8
 	bondBindInitialBackoff        = 125 * time.Millisecond
 	bondFlagLatency        uint16 = 1 << 0
@@ -299,11 +301,12 @@ func workerQueueAvailable(worker *WorkerSlot) bool {
 }
 
 type bondReorderBuffer struct {
-	expect uint64
-	buf    map[uint64][]byte
-	first  time.Time
-	now    func() time.Time
-	stats  *Stats
+	expect     uint64
+	buf        map[uint64][]byte
+	first      time.Time
+	lastCapLog time.Time
+	now        func() time.Time
+	stats      *Stats
 }
 
 func newBondReorderBuffer(stats *Stats) *bondReorderBuffer {
@@ -332,7 +335,8 @@ func (r *bondReorderBuffer) push(seq uint64, payload []byte) [][]byte {
 		atomic.AddInt64(&r.stats.BondReorderLate, 1)
 		return nil
 	}
-	if seq-r.expect >= bondReorderWindow {
+	if len(r.buf) >= bondReorderWindow || seq-r.expect >= bondReorderWindow {
+		r.logWindowCap(r.now())
 		atomic.AddInt64(&r.stats.BondReorderGaps, 1)
 		r.expect = seq
 		r.buf = make(map[uint64][]byte, bondReorderWindow)
@@ -345,6 +349,14 @@ func (r *bondReorderBuffer) push(seq uint64, payload []byte) [][]byte {
 		r.first = r.now()
 	}
 	return nil
+}
+
+func (r *bondReorderBuffer) logWindowCap(now time.Time) {
+	if !r.lastCapLog.IsZero() && now.Sub(r.lastCapLog) < bondReorderCapLogInterval {
+		return
+	}
+	r.lastCapLog = now
+	log.Printf("[BOND] Reorder-окно: сработал лимит %d пакетов", bondReorderWindow)
 }
 
 func (r *bondReorderBuffer) flushExpired() [][]byte {
