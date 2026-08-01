@@ -199,9 +199,13 @@ final class VPNProfileStore {
 
     /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
     /// the extension. Used by the main-screen lamp at 500 ms cadence.
-    /// Returns `.offline` on any failure (extension not running, RPC
-    /// timeout, JSON malformed) — caller renders this as "— offline —".
-    func fetchTamizdatStatus() async -> TamizdatStatusSnapshot {
+    /// Returns nil when the status RPC itself fails while NEVPN claims the
+    /// tunnel is up — that means "unknown" (extension suspended/waking or a
+    /// transient XPC hiccup), NOT "offline". Callers must keep their
+    /// last-known-good snapshot instead of flashing amber on every app
+    /// foregrounding. `.offline` is returned only for authoritative states:
+    /// no manager/session, or NEVPN reporting a non-connected status.
+    func fetchTamizdatStatus() async -> TamizdatStatusSnapshot? {
         guard let manager = await currentManager(),
               let session = manager.connection as? NETunnelProviderSession else {
             return .offline
@@ -223,10 +227,9 @@ final class VPNProfileStore {
             }
         }
         guard let response, !response.isEmpty else {
-            return .offline
+            return nil
         }
-        let decoded = try? JSONDecoder().decode(TamizdatStatusSnapshot.self, from: response)
-        return decoded ?? .offline
+        return try? JSONDecoder().decode(TamizdatStatusSnapshot.self, from: response)
     }
 
     @discardableResult

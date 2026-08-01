@@ -217,6 +217,18 @@ final class TamizdatStatusStore: ObservableObject {
     private var quotaStormEpisodeActive = false
     private var quotaStormEpisodeRefreshAttempted = false
 
+    /// Count of consecutive polls whose status RPC came back "unknown"
+    /// (nil) while NEVPN still reports the tunnel as up. The classic case
+    /// is app foregrounding: iOS has suspended the extension, the first
+    /// sendProviderMessage wakes it but returns empty, and a naive store
+    /// would publish `.offline` for one 500 ms frame — flashing the amber
+    /// "Connecting…" shield even though the bond sits at 72/72. We keep
+    /// the last-known-good snapshot for a short grace window instead.
+    private var consecutiveUnknownRPC = 0
+    /// ~2 s at the 500 ms cadence: long enough to cover extension wake-up,
+    /// short enough to still surface a genuinely dead extension.
+    static let unknownRPCTolerance = 4
+
     /// IPA-D65b: True while the main-app refresher is solving a VK
     /// verification challenge (auto WKWebView or manual sheet). Drives a small
     /// "Решаем капчу..." indicator under the shield. Backed by a
@@ -293,7 +305,18 @@ final class TamizdatStatusStore: ObservableObject {
     }
 
     private func poll() async {
-        let result = await VPNProfileStore.shared.fetchTamizdatStatus()
+        guard let result = await VPNProfileStore.shared.fetchTamizdatStatus() else {
+            // RPC unknown while NEVPN is up — extension is suspended or
+            // waking. Hold the last-known-good snapshot through the grace
+            // window; only declare offline if the silence persists.
+            consecutiveUnknownRPC += 1
+            if consecutiveUnknownRPC >= Self.unknownRPCTolerance,
+               !snapshot.realShape.isEmpty {
+                snapshot = .offline
+            }
+            return
+        }
+        consecutiveUnknownRPC = 0
         // Avoid re-publishing identical snapshots — saves SwiftUI
         // re-render work when nothing changed.
         if result != snapshot {
