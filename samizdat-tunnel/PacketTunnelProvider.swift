@@ -1578,7 +1578,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } else if configuredRoomCount == 2 {
                 maxSessionCount = 128
             } else {
-                maxSessionCount = 96
+                // Build 352: 96 -> 64, mirroring socksFlowThreePlusRoomLimit.
+                // 96 live flows under a shorts+game burst caused two nuclear
+                // closes on build 351; ~100 KB all-in per flow overfills the
+                // jetsam budget next to 72 bond workers.
+                maxSessionCount = 64
             }
         } else {
             maxSessionCount = 500

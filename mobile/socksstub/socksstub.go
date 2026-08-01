@@ -169,10 +169,16 @@ const (
 	// 4x20 pressure episode closed 171 live flows, so FWD_UDP target/session caps
 	// alone are not a process-wide memory bound. Keep a high non-TURN safety
 	// ceiling, but shrink TURN admission as worker/socket pressure grows.
+	// Build 352: 96 -> 64 for 3+ rooms. Build 351 hit 96 live flows under a
+	// shorts+game burst and ate two nuclear closes; ~100 KB all-in per flow
+	// (buffers + goroutines + netstack + kernel sockets) makes 96 a ~9.6 MB
+	// swing the jetsam budget cannot absorb next to 72 workers. 64 bounds
+	// the swing to ~6.4 MB; excess connections get a clean refusal and the
+	// apps retry, which is invisible next to losing game flows in a nuclear.
 	socksFlowDefaultLimit       int64 = 500
 	socksFlowOneRoomLimit       int64 = 160
 	socksFlowTwoRoomLimit       int64 = 128
-	socksFlowThreePlusRoomLimit int64 = 96
+	socksFlowThreePlusRoomLimit int64 = 64
 )
 
 var (
