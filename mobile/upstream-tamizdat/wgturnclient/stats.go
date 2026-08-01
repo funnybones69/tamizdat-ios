@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	defaultStatsRoomCount = 4
+	defaultStatsRoomCount = MaxRooms
 	quotaStormMinErrors   = 8
 	quotaStormMinAgeSecs  = 15
 )
@@ -22,44 +22,52 @@ type Stats struct {
 	quotaErrStreak    int64
 	runnerStartedUnix int64
 
-	BondFramesUp        int64
-	BondFramesDown      int64
-	BondBytesUp         int64
-	BondBytesDown       int64
-	BondQueueDrops      int64
-	BondReorderGaps     int64
-	BondReorderLate     int64
-	BondRoomPackets     []int64
-	BondRoomBytes       []int64
-	BondRoomDrops       []int64
-	BondRoomDownPackets []int64
-	BondRoomDownBytes   []int64
+	BondFramesUp             int64
+	BondFramesDown           int64
+	BondBytesUp              int64
+	BondBytesDown            int64
+	BondQueueDrops           int64
+	BondShaperDrops          int64
+	BondReorderGaps          int64
+	BondReorderLate          int64
+	BondRoomPackets          []int64
+	BondRoomBytes            []int64
+	BondRoomDrops            []int64
+	BondRoomDownPackets      []int64
+	BondRoomDownBytes        []int64
+	BondRoomCredentialErrors []int64
+	BondRoomSessionErrors    []int64
+	BondRoomQuotaErrors      []int64
 }
 
 // StatsSnapshot is an atomic view used by physical A/B telemetry.
 // Per-room arrays are sized to the configured room count instead of a protocol
 // constant, so adding rooms does not silently discard telemetry after room 4.
 type StatsSnapshot struct {
-	ActiveConnections int32   `json:"active_connections"`
-	Reconnects        int64   `json:"reconnects"`
-	TotalBytesUp      int64   `json:"total_bytes_up"`
-	TotalBytesDown    int64   `json:"total_bytes_down"`
-	CredsErrors       int64   `json:"credential_errors"`
-	LastAllocOKUnix   int64   `json:"last_alloc_ok_unix"`
-	QuotaErrStreak    int64   `json:"quota_error_streak"`
-	QuotaStorm        bool    `json:"quota_storm"`
-	BondFramesUp      int64   `json:"bond_frames_up"`
-	BondFramesDown    int64   `json:"bond_frames_down"`
-	BondBytesUp       int64   `json:"bond_bytes_up"`
-	BondBytesDown     int64   `json:"bond_bytes_down"`
-	BondQueueDrops    int64   `json:"bond_queue_drops"`
-	BondReorderGaps   int64   `json:"bond_reorder_gaps_down"`
-	BondReorderLate   int64   `json:"bond_reorder_late_down"`
-	RoomUpPackets     []int64 `json:"room_up_packets"`
-	RoomUpBytes       []int64 `json:"room_up_bytes"`
-	RoomDrops         []int64 `json:"room_drops"`
-	RoomDownPackets   []int64 `json:"room_down_packets"`
-	RoomDownBytes     []int64 `json:"room_down_bytes"`
+	ActiveConnections    int32   `json:"active_connections"`
+	Reconnects           int64   `json:"reconnects"`
+	TotalBytesUp         int64   `json:"total_bytes_up"`
+	TotalBytesDown       int64   `json:"total_bytes_down"`
+	CredsErrors          int64   `json:"credential_errors"`
+	LastAllocOKUnix      int64   `json:"last_alloc_ok_unix"`
+	QuotaErrStreak       int64   `json:"quota_error_streak"`
+	QuotaStorm           bool    `json:"quota_storm"`
+	BondFramesUp         int64   `json:"bond_frames_up"`
+	BondFramesDown       int64   `json:"bond_frames_down"`
+	BondBytesUp          int64   `json:"bond_bytes_up"`
+	BondBytesDown        int64   `json:"bond_bytes_down"`
+	BondQueueDrops       int64   `json:"bond_queue_drops"`
+	BondShaperDrops      int64   `json:"bond_shaper_drops"`
+	BondReorderGaps      int64   `json:"bond_reorder_gaps_down"`
+	BondReorderLate      int64   `json:"bond_reorder_late_down"`
+	RoomUpPackets        []int64 `json:"room_up_packets"`
+	RoomUpBytes          []int64 `json:"room_up_bytes"`
+	RoomDrops            []int64 `json:"room_drops"`
+	RoomDownPackets      []int64 `json:"room_down_packets"`
+	RoomDownBytes        []int64 `json:"room_down_bytes"`
+	RoomCredentialErrors []int64 `json:"room_credential_errors"`
+	RoomSessionErrors    []int64 `json:"room_session_errors"`
+	RoomQuotaErrors      []int64 `json:"room_quota_errors"`
 }
 
 // NewStats accepts an optional configured room count. The variadic form keeps
@@ -73,12 +81,15 @@ func NewStats(roomCounts ...int) *Stats {
 		}
 	}
 	return &Stats{
-		runnerStartedUnix:   time.Now().Unix(),
-		BondRoomPackets:     make([]int64, rooms),
-		BondRoomBytes:       make([]int64, rooms),
-		BondRoomDrops:       make([]int64, rooms),
-		BondRoomDownPackets: make([]int64, rooms),
-		BondRoomDownBytes:   make([]int64, rooms),
+		runnerStartedUnix:        time.Now().Unix(),
+		BondRoomPackets:          make([]int64, rooms),
+		BondRoomBytes:            make([]int64, rooms),
+		BondRoomDrops:            make([]int64, rooms),
+		BondRoomDownPackets:      make([]int64, rooms),
+		BondRoomDownBytes:        make([]int64, rooms),
+		BondRoomCredentialErrors: make([]int64, rooms),
+		BondRoomSessionErrors:    make([]int64, rooms),
+		BondRoomQuotaErrors:      make([]int64, rooms),
 	}
 }
 
@@ -92,26 +103,30 @@ func (s *Stats) snapshotAtUnix(nowUnix int64) StatsSnapshot {
 	lastAllocOKUnix := atomic.LoadInt64(&s.lastAllocOKUnix)
 	quotaErrStreak := atomic.LoadInt64(&s.quotaErrStreak)
 	out := StatsSnapshot{
-		ActiveConnections: active,
-		Reconnects:        atomic.LoadInt64(&s.Reconnects),
-		TotalBytesUp:      atomic.LoadInt64(&s.TotalBytesUp),
-		TotalBytesDown:    atomic.LoadInt64(&s.TotalBytesDown),
-		CredsErrors:       atomic.LoadInt64(&s.CredsErrors),
-		LastAllocOKUnix:   lastAllocOKUnix,
-		QuotaErrStreak:    quotaErrStreak,
-		QuotaStorm:        quotaStormActive(active, quotaErrStreak, lastAllocOKUnix, s.runnerStartedUnix, nowUnix),
-		BondFramesUp:      atomic.LoadInt64(&s.BondFramesUp),
-		BondFramesDown:    atomic.LoadInt64(&s.BondFramesDown),
-		BondBytesUp:       atomic.LoadInt64(&s.BondBytesUp),
-		BondBytesDown:     atomic.LoadInt64(&s.BondBytesDown),
-		BondQueueDrops:    atomic.LoadInt64(&s.BondQueueDrops),
-		BondReorderGaps:   atomic.LoadInt64(&s.BondReorderGaps),
-		BondReorderLate:   atomic.LoadInt64(&s.BondReorderLate),
-		RoomUpPackets:     make([]int64, rooms),
-		RoomUpBytes:       make([]int64, rooms),
-		RoomDrops:         make([]int64, rooms),
-		RoomDownPackets:   make([]int64, rooms),
-		RoomDownBytes:     make([]int64, rooms),
+		ActiveConnections:    active,
+		Reconnects:           atomic.LoadInt64(&s.Reconnects),
+		TotalBytesUp:         atomic.LoadInt64(&s.TotalBytesUp),
+		TotalBytesDown:       atomic.LoadInt64(&s.TotalBytesDown),
+		CredsErrors:          atomic.LoadInt64(&s.CredsErrors),
+		LastAllocOKUnix:      lastAllocOKUnix,
+		QuotaErrStreak:       quotaErrStreak,
+		QuotaStorm:           quotaStormActive(active, quotaErrStreak, lastAllocOKUnix, s.runnerStartedUnix, nowUnix),
+		BondFramesUp:         atomic.LoadInt64(&s.BondFramesUp),
+		BondFramesDown:       atomic.LoadInt64(&s.BondFramesDown),
+		BondBytesUp:          atomic.LoadInt64(&s.BondBytesUp),
+		BondBytesDown:        atomic.LoadInt64(&s.BondBytesDown),
+		BondQueueDrops:       atomic.LoadInt64(&s.BondQueueDrops),
+		BondShaperDrops:      atomic.LoadInt64(&s.BondShaperDrops),
+		BondReorderGaps:      atomic.LoadInt64(&s.BondReorderGaps),
+		BondReorderLate:      atomic.LoadInt64(&s.BondReorderLate),
+		RoomUpPackets:        make([]int64, rooms),
+		RoomUpBytes:          make([]int64, rooms),
+		RoomDrops:            make([]int64, rooms),
+		RoomDownPackets:      make([]int64, rooms),
+		RoomDownBytes:        make([]int64, rooms),
+		RoomCredentialErrors: make([]int64, rooms),
+		RoomSessionErrors:    make([]int64, rooms),
+		RoomQuotaErrors:      make([]int64, rooms),
 	}
 	for i := 0; i < rooms; i++ {
 		out.RoomUpPackets[i] = atomic.LoadInt64(&s.BondRoomPackets[i])
@@ -119,6 +134,9 @@ func (s *Stats) snapshotAtUnix(nowUnix int64) StatsSnapshot {
 		out.RoomDrops[i] = atomic.LoadInt64(&s.BondRoomDrops[i])
 		out.RoomDownPackets[i] = atomic.LoadInt64(&s.BondRoomDownPackets[i])
 		out.RoomDownBytes[i] = atomic.LoadInt64(&s.BondRoomDownBytes[i])
+		out.RoomCredentialErrors[i] = atomic.LoadInt64(&s.BondRoomCredentialErrors[i])
+		out.RoomSessionErrors[i] = atomic.LoadInt64(&s.BondRoomSessionErrors[i])
+		out.RoomQuotaErrors[i] = atomic.LoadInt64(&s.BondRoomQuotaErrors[i])
 	}
 	return out
 }
@@ -178,9 +196,9 @@ func (s *Stats) RunLoopWithCallback(shutdown <-chan struct{}, onSnapshot func(St
 		totalMB := float64(snapshot.TotalBytesUp+snapshot.TotalBytesDown) / (1024.0 * 1024.0)
 		log.Printf("[СТАТИСТИКА] Активных: %d | Трафик: %.2f МБ", snapshot.ActiveConnections, totalMB)
 		if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
-			log.Printf("[BOND] frames up=%d down=%d bytes_up=%d bytes_down=%d queue_drops=%d reorder_gaps=%d late=%d room_up_packets=%v room_up_bytes=%v room_down_packets=%v room_down_bytes=%v room_drops=%v",
+			log.Printf("[BOND] frames up=%d down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps=%d late=%d room_up_packets=%v room_up_bytes=%v room_down_packets=%v room_down_bytes=%v room_drops=%v",
 				snapshot.BondFramesUp, snapshot.BondFramesDown, snapshot.BondBytesUp, snapshot.BondBytesDown,
-				snapshot.BondQueueDrops, snapshot.BondReorderGaps, snapshot.BondReorderLate,
+				snapshot.BondQueueDrops, snapshot.BondShaperDrops, snapshot.BondReorderGaps, snapshot.BondReorderLate,
 				snapshot.RoomUpPackets, snapshot.RoomUpBytes, snapshot.RoomDownPackets, snapshot.RoomDownBytes, snapshot.RoomDrops)
 		}
 		if onSnapshot != nil {

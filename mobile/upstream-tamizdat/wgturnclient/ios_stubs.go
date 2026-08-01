@@ -33,8 +33,8 @@ func (r *Runner) getCredsWithFallback(ctx context.Context, tp *TurnParams, hash 
 		}
 		return nil, fmt.Errorf("wgturnclient (iOS build): missing credentials for configured room")
 	}
-	if pc := r.preloadedCreds.Load(); pc != nil {
-		return cloneCredentials(pc), nil
+	if pc := r.currentPreloadedCreds(); pc != nil {
+		return pc, nil
 	}
 	return nil, fmt.Errorf("wgturnclient (iOS build): PreloadedCreds is required — VK API solver is not compiled in")
 }

@@ -13,14 +13,18 @@ import (
 )
 
 const (
-	defaultListen      = "127.0.0.1:9000"
-	defaultWorkers     = workersPerGroup
-	maxWorkers         = 72 // legacy single-room compatibility
-	maxWorkersPerRoom  = 20
-	defaultVKAppID     = "6287487"
-	defaultVKAppSecret = "QbYic1K3lEV5kTGiqlq2"
-	defaultUserAgent   = "Mozilla/5.0"
-	peerResolveTimeout = 3 * time.Second
+	defaultListen  = "127.0.0.1:9000"
+	defaultWorkers = workersPerGroup
+	maxWorkers     = 72 // legacy single-room compatibility
+	// Exported limits keep the vendored client aligned with the merged core.
+	// The outer iOS bridge applies the stricter adaptive 72-worker budget.
+	MaxRooms            = 6
+	MaxWorkersPerRoom   = 20
+	MaxMultiRoomWorkers = MaxRooms * MaxWorkersPerRoom
+	defaultVKAppID      = "6287487"
+	defaultVKAppSecret  = "QbYic1K3lEV5kTGiqlq2"
+	defaultUserAgent    = "Mozilla/5.0"
+	peerResolveTimeout  = 3 * time.Second
 )
 
 type peerIPLookupFunc func(context.Context, string) ([]net.IPAddr, error)
@@ -85,7 +89,9 @@ type Config struct {
 	PreloadedCreds       *Credentials
 	PreloadedCredsByHash map[string]*Credentials
 	BondV2               bool
+	WorkerRateBPS        int
 	OnConfig             func(string)
+	OnQuota              func(string)
 	OnWorkerCount        func(int)
 	OnEvent              EventFunc
 	OnStats              func(StatsSnapshot)
@@ -99,15 +105,16 @@ type Config struct {
 type Runner struct {
 	cfg Config
 
-	vkAppID        atomic.Value
-	vkAppSecret    atomic.Value
-	captchaMode    atomic.Value
-	noDNS          atomic.Bool
-	userAgent      atomic.Value
-	preloadedCreds atomic.Pointer[Credentials]
-	credsRevision  atomic.Uint64
-	credsSignalMu  sync.Mutex
-	credsChanged   chan struct{}
+	vkAppID          atomic.Value
+	vkAppSecret      atomic.Value
+	captchaMode      atomic.Value
+	noDNS            atomic.Bool
+	userAgent        atomic.Value
+	preloadedCreds   atomic.Pointer[Credentials]
+	preloadedCredsMu sync.Mutex
+	credsRevision    atomic.Uint64
+	credsSignalMu    sync.Mutex
+	credsChanged     chan struct{}
 
 	captchaResultCh chan string
 	vkSemaphore     chan struct{}
@@ -119,6 +126,10 @@ type Runner struct {
 	groupAuthMutex     sync.Mutex
 	roomCredsMu        sync.Mutex
 	roomCreds          map[string]roomCredentialCacheEntry
+	roomAuthMu         sync.Mutex
+	roomAuthLocks      map[string]*sync.Mutex
+	forcedCredsMu      sync.Mutex
+	forcedCredsAt      map[string]time.Time
 
 	pauseFlag int32
 
@@ -157,6 +168,9 @@ func New(cfg Config) (*Runner, error) {
 	if !cfg.UseTCP && !cfg.UseUDP {
 		cfg.UseTCP = true
 	}
+	if cfg.WorkerRateBPS <= 0 {
+		cfg.WorkerRateBPS = DefaultWorkerRateBPS
+	}
 	cfg.VKHashes = normalizeHashes(cfg.VKHashes)
 	if cfg.WorkersPerRoom > 0 {
 		if len(cfg.VKHashes) < 1 {
@@ -165,8 +179,11 @@ func New(cfg Config) (*Runner, error) {
 		if cfg.BondV2 && len(cfg.VKHashes) < 2 {
 			return nil, fmt.Errorf("Bond v2 requires multi-room mode with at least 2 rooms")
 		}
-		if cfg.WorkersPerRoom < 1 || cfg.WorkersPerRoom > maxWorkersPerRoom {
-			return nil, fmt.Errorf("workers per room must be between 1 and %d", maxWorkersPerRoom)
+		if len(cfg.VKHashes) > MaxRooms {
+			return nil, fmt.Errorf("multi-room supports at most %d rooms", MaxRooms)
+		}
+		if cfg.WorkersPerRoom < 1 || cfg.WorkersPerRoom > MaxWorkersPerRoom {
+			return nil, fmt.Errorf("workers per room must be between 1 and %d", MaxWorkersPerRoom)
 		}
 		if cfg.SecondaryHash != "" || cfg.PreloadedCreds != nil {
 			return nil, fmt.Errorf("legacy fallback/preloaded credentials are incompatible with multi-room mode")
@@ -183,6 +200,9 @@ func New(cfg Config) (*Runner, error) {
 			return nil, fmt.Errorf("multi-room worker count overflows int")
 		}
 		cfg.Workers = len(cfg.VKHashes) * cfg.WorkersPerRoom
+		if cfg.Workers > MaxMultiRoomWorkers {
+			return nil, fmt.Errorf("multi-room worker total exceeds %d", MaxMultiRoomWorkers)
+		}
 	} else {
 		if cfg.BondV2 {
 			return nil, fmt.Errorf("Bond v2 requires WorkersPerRoom multi-room mode")
@@ -202,6 +222,8 @@ func New(cfg Config) (*Runner, error) {
 		vkSemaphore:     make(chan struct{}, 2),
 		captchaWVSem:    make(chan struct{}, 1),
 		roomCreds:       make(map[string]roomCredentialCacheEntry),
+		roomAuthLocks:   make(map[string]*sync.Mutex),
+		forcedCredsAt:   make(map[string]time.Time),
 		credsChanged:    make(chan struct{}),
 	}
 	r.vkAppID.Store(cfg.VKAppID)
@@ -313,7 +335,7 @@ func (r *Runner) Start(ctx context.Context) error {
 		stats.RunLoopWithCallback(statsShutdown, r.cfg.OnStats)
 	}()
 
-	disp := NewDispatcherWithOptions(runCtx, localConn, stats, r.cfg.BondV2, len(r.cfg.VKHashes), r.cfg.OnEvent)
+	disp := NewDispatcherWithOptions(runCtx, localConn, stats, r.cfg.BondV2, len(r.cfg.VKHashes), r.cfg.WorkerRateBPS, r.cfg.OnEvent)
 	disp.onWorkerCount = r.cfg.OnWorkerCount
 	defer func() {
 		// The callback emitted when statsShutdown closes is the final snapshot.
@@ -413,10 +435,18 @@ func (r *Runner) UpdatePreloadedCreds(creds *Credentials) {
 	if len(creds.TurnServers) > 0 {
 		dup.TurnServers = append([]TurnServer(nil), creds.TurnServers...)
 	}
+	r.preloadedCredsMu.Lock()
 	r.preloadedCreds.Store(&dup)
+	r.preloadedCredsMu.Unlock()
 	r.credsRevision.Add(1)
 	r.signalCredentialsUpdated()
 	r.eventf("info", "preloaded creds updated %s", credentialsSummary(&dup))
+}
+
+func (r *Runner) currentPreloadedCreds() *Credentials {
+	r.preloadedCredsMu.Lock()
+	defer r.preloadedCredsMu.Unlock()
+	return cloneCredentials(r.preloadedCreds.Load())
 }
 
 func (r *Runner) credentialsUpdateSignal() <-chan struct{} {
@@ -525,6 +555,21 @@ func normalizeWorkerCount(n int) int {
 	// The planner supports a final partial group (for example 20 => 12+8).
 	// Preserve the exact requested count instead of silently flooring it.
 	return n
+}
+
+func (r *Runner) credentialLock(hash string) *sync.Mutex {
+	if r.cfg.WorkersPerRoom <= 0 {
+		return &r.groupAuthMutex
+	}
+	key := strings.TrimSpace(hash)
+	r.roomAuthMu.Lock()
+	defer r.roomAuthMu.Unlock()
+	lock := r.roomAuthLocks[key]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		r.roomAuthLocks[key] = lock
+	}
+	return lock
 }
 
 func normalizeHashes(hashes []string) []string {

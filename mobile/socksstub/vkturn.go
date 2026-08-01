@@ -52,6 +52,7 @@ var (
 	vkturnMu               sync.Mutex
 	vkturnRecoveryMu       sync.RWMutex
 	vkturnRecoverySink     VKTurnRecoveryCallback
+	vkturnRecoveryLastUnix atomic.Int64
 )
 
 // VKTurnRecoveryCallback is implemented by the packet-tunnel extension. The
@@ -85,6 +86,23 @@ func currentVKTurnRecoveryCallback() VKTurnRecoveryCallback {
 	vkturnRecoveryMu.RLock()
 	defer vkturnRecoveryMu.RUnlock()
 	return vkturnRecoverySink
+}
+
+func requestVKTurnQuotaRecovery() {
+	now := time.Now().Unix()
+	for {
+		last := vkturnRecoveryLastUnix.Load()
+		if last > 0 && now-last < 60 {
+			return
+		}
+		if vkturnRecoveryLastUnix.CompareAndSwap(last, now) {
+			break
+		}
+	}
+	rt.appendLog("warn: vkturn TURN quota detected; requesting physical-path credential recovery")
+	if callback := currentVKTurnRecoveryCallback(); callback != nil {
+		go callback.OnQuotaStorm()
+	}
 }
 
 func vkturnQuotaRecoveryTransition(episode, running bool, active int32, quotaStorm bool) (next, notify bool) {
@@ -245,6 +263,7 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 			}
 		},
 		OnEvent: func(level, message string) { appendVKTurnEvent(level, message) },
+		OnQuota: func(_ string) { requestVKTurnQuotaRecovery() },
 		OnStats: func(snapshot wgturnclient.StatsSnapshot) {
 			storeVKTurnTelemetryIfCurrent(runner, snapshot)
 		},
@@ -966,6 +985,9 @@ func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnc
 	copy.RoomDrops = append([]int64(nil), snapshot.RoomDrops...)
 	copy.RoomDownPackets = append([]int64(nil), snapshot.RoomDownPackets...)
 	copy.RoomDownBytes = append([]int64(nil), snapshot.RoomDownBytes...)
+	copy.RoomCredentialErrors = append([]int64(nil), snapshot.RoomCredentialErrors...)
+	copy.RoomSessionErrors = append([]int64(nil), snapshot.RoomSessionErrors...)
+	copy.RoomQuotaErrors = append([]int64(nil), snapshot.RoomQuotaErrors...)
 	vkturnTelemetry.Store(&copy)
 	running := vkturnRunner == runner && vkturnRunning.Load()
 	vkturnActiveWorkers.Store(int64(snapshot.ActiveConnections))
@@ -979,16 +1001,13 @@ func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnc
 	)
 	vkturnMu.Unlock()
 	if notifyRecovery {
-		rt.appendLog("warn: vkturn quota storm entered; requesting physical-path credential recovery")
-		if callback := currentVKTurnRecoveryCallback(); callback != nil {
-			go callback.OnQuotaStorm()
-		}
+		requestVKTurnQuotaRecovery()
 	}
 
 	if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
-		rt.appendLog(fmt.Sprintf("info: vkturn bond telemetry active=%d frames_up=%d frames_down=%d bytes_up=%d bytes_down=%d drops=%d reorder_gaps_down=%d reorder_late_down=%d room_up_bytes=%v room_down_bytes=%v room_drops=%v",
+		rt.appendLog(fmt.Sprintf("info: vkturn bond telemetry active=%d frames_up=%d frames_down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps_down=%d reorder_late_down=%d room_up_bytes=%v room_down_bytes=%v room_drops=%v",
 			snapshot.ActiveConnections, snapshot.BondFramesUp, snapshot.BondFramesDown,
-			snapshot.BondBytesUp, snapshot.BondBytesDown, snapshot.BondQueueDrops,
+			snapshot.BondBytesUp, snapshot.BondBytesDown, snapshot.BondQueueDrops, snapshot.BondShaperDrops,
 			snapshot.BondReorderGaps, snapshot.BondReorderLate,
 			snapshot.RoomUpBytes, snapshot.RoomDownBytes, snapshot.RoomDrops))
 	}

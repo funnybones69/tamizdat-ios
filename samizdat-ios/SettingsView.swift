@@ -329,7 +329,8 @@ struct SettingsView: View {
             return
         }
 
-        let totalWorkers = rooms.count * VKCredsPreferences.workersPerRoom(forRooms: rooms.count)
+        let workersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: rooms.count)
+        let totalWorkers = rooms.count * workersPerRoom
         let needsRefresh = (rooms != oldRooms) || TURNCredsStore.shared.needsRefresh
         let turnActive = TURNCredsRefresher.shouldMaintainTurnCredentialsNow()
         if needsRefresh && turnActive {
@@ -345,9 +346,9 @@ struct SettingsView: View {
             let result = await VPNProfileStore.shared.restartVKTurnUpstream()
             switch result {
             case "attachStarted":
-                vkCallHashFeedback = "TURN перезапущен: \(rooms.count)×20"
+                vkCallHashFeedback = "TURN перезапущен: \(rooms.count)×\(workersPerRoom)"
             case let value where value.hasPrefix("turnDisabled"):
-                vkCallHashFeedback = "Сохранено: \(rooms.count)×20 применится при Whitelist+TURN"
+                vkCallHashFeedback = "Сохранено: \(rooms.count)×\(workersPerRoom) применится при Whitelist+TURN"
             case "noCreds":
                 vkCallHashFeedback = "Сохранено: жду credentials для всех \(rooms.count) комнат"
             case "sendError":

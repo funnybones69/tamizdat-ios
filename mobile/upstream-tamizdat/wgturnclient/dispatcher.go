@@ -15,6 +15,7 @@ type WorkerSlot struct {
 	ID     int
 	RoomID int
 	SendCh chan []byte
+	bucket *workerTokenBucket
 }
 
 type Dispatcher struct {
@@ -42,29 +43,35 @@ type Dispatcher struct {
 	bondEvent          EventFunc
 	bondRooms          int
 	reorderTicker      *time.Ticker
+	workerRateBPS      int
+	lastShaperLog      time.Time // guarded by mu
 }
 
 func NewDispatcher(ctx context.Context, localConn net.PacketConn, stats *Stats) *Dispatcher {
-	return NewDispatcherWithOptions(ctx, localConn, stats, false, 0, nil)
+	return NewDispatcherWithOptions(ctx, localConn, stats, false, 0, DefaultWorkerRateBPS, nil)
 }
 
-func NewDispatcherWithOptions(ctx context.Context, localConn net.PacketConn, stats *Stats, bondV2 bool, rooms int, onEvent EventFunc) *Dispatcher {
+func NewDispatcherWithOptions(ctx context.Context, localConn net.PacketConn, stats *Stats, bondV2 bool, rooms int, workerRateBPS int, onEvent EventFunc) *Dispatcher {
+	if workerRateBPS <= 0 {
+		workerRateBPS = DefaultWorkerRateBPS
+	}
 	dctx, dcancel := context.WithCancel(ctx)
 	d := &Dispatcher{
-		localConn: localConn,
-		ReturnCh:  make(chan []byte, returnChBuf),
-		ctx:       dctx,
-		cancel:    dcancel,
-		stats:     stats,
-		bondV2:    bondV2,
-		bondEvent: onEvent,
-		bondRooms: rooms,
+		localConn:     localConn,
+		ReturnCh:      make(chan []byte, returnChBuf),
+		ctx:           dctx,
+		cancel:        dcancel,
+		stats:         stats,
+		bondV2:        bondV2,
+		bondEvent:     onEvent,
+		bondRooms:     rooms,
+		workerRateBPS: workerRateBPS,
 	}
 	if d.stats == nil {
 		d.stats = NewStats()
 	}
 	if bondV2 {
-		d.bondSched = newBondScheduler()
+		d.bondSched = newBondScheduler(workerRateBPS)
 		d.bondReorder = newBondReorderBuffer(d.stats)
 		d.bondLatencyReorder = newBondReorderBuffer(d.stats)
 		d.reorderTicker = time.NewTicker(bondReorderHold / 2)
@@ -148,6 +155,7 @@ func (d *Dispatcher) notifyWorkerCount(generation uint64, count int) {
 
 func (d *Dispatcher) Register(w *WorkerSlot) {
 	d.mu.Lock()
+	w.bucket = newWorkerTokenBucket(d.workerRateBPS, nil)
 	d.workers = append(d.workers, w)
 	if d.bondV2 {
 		d.bondSched.invalidateTopology()
@@ -176,6 +184,7 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 	}
 	remaining := len(d.workers)
 	if removed {
+		slot.bucket = nil
 		if d.bondV2 {
 			d.bondSched.invalidateTopology()
 		}
@@ -187,6 +196,25 @@ func (d *Dispatcher) Unregister(slot *WorkerSlot) {
 		d.notifyWorkerCount(generation, remaining)
 	}
 	log.Printf("[ДИСП] Воркер #%d отключён (осталось: %d)", slot.ID, remaining)
+}
+
+// workerGroupState scopes rolling-restart readiness to one lifecycle group.
+func (d *Dispatcher) workerGroupState(workerIDs map[int]struct{}, requiredID int) (count int, requiredActive bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, worker := range d.workers {
+		if worker == nil {
+			continue
+		}
+		if _, ok := workerIDs[worker.ID]; !ok {
+			continue
+		}
+		count++
+		if worker.ID == requiredID {
+			requiredActive = true
+		}
+	}
+	return count, requiredActive
 }
 
 func (d *Dispatcher) readLoop() {
@@ -229,15 +257,27 @@ func (d *Dispatcher) dispatchLegacy(pkt []byte) {
 	}
 
 	sent := false
+	latency := len(pkt) <= bondSmallPacketMax
 	startIdx := d.rrIndex % nw
 	for i := 0; i < nw; i++ {
 		idx := (startIdx + i) % nw
 		w := d.workers[idx]
+		if !workerQueueAvailable(w) {
+			continue
+		}
+		if w.bucket == nil {
+			w.bucket = newWorkerTokenBucket(d.workerRateBPS, nil)
+		}
+		if !w.bucket.admit(len(pkt), latency) {
+			continue
+		}
 		select {
 		case w.SendCh <- pkt:
 			d.rrIndex = (idx + 1) % nw
 			sent = true
 		default:
+			w.bucket.refund(len(pkt))
+			atomic.AddInt64(&d.stats.BondQueueDrops, 1)
 		}
 		if sent {
 			break
@@ -245,46 +285,76 @@ func (d *Dispatcher) dispatchLegacy(pkt []byte) {
 	}
 	if !sent {
 		d.rrIndex = (startIdx + 1) % nw
+		d.recordShaperDropLocked(len(pkt))
 	}
 	d.mu.Unlock()
 }
 
 func (d *Dispatcher) dispatchBond(payload []byte) {
-	flags := uint16(0)
-	var seq uint64
-	if len(payload) <= bondSmallPacketMax {
-		flags = bondFlagLatency
-		seq = d.bondLatencySeq.Add(1)
-	} else {
-		seq = d.bondSeq.Add(1)
-	}
-	frame, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: flags, Seq: seq, Payload: payload})
-	if err != nil {
-		emitEvent(d.bondEvent, "error", "bond encode data error err=%s", sanitizeErrForEvent(err))
-		return
-	}
 	d.mu.Lock()
 	if len(d.workers) == 0 {
 		d.mu.Unlock()
 		return
 	}
-	w, sent := d.bondSched.chooseAndSend(d.workers, frame, len(payload))
-	if sent {
+	w, admitted := d.bondSched.choose(d.workers, len(payload))
+	if !admitted {
+		d.recordShaperDropLocked(len(payload))
+		d.recordAllRoomDropsLocked()
+		d.mu.Unlock()
+		return
+	}
+
+	flags := uint16(0)
+	seqCounter := &d.bondSeq
+	if len(payload) <= bondSmallPacketMax {
+		flags = bondFlagLatency
+		seqCounter = &d.bondLatencySeq
+	}
+	seq := seqCounter.Add(1)
+	frame, err := encodeBondFrame(bondFrame{Type: bondFrameData, Flags: flags, Seq: seq, Payload: payload})
+	if err != nil {
+		// Admission and sequencing are serialized under d.mu, so refund and
+		// rollback cannot race a later packet.
+		seqCounter.Add(^uint64(0))
+		w.bucket.refund(len(payload))
+		d.mu.Unlock()
+		emitEvent(d.bondEvent, "error", "bond encode data error err=%s", sanitizeErrForEvent(err))
+		return
+	}
+	select {
+	case w.SendCh <- frame:
 		atomic.AddInt64(&d.stats.BondFramesUp, 1)
 		atomic.AddInt64(&d.stats.BondBytesUp, int64(len(payload)))
 		if w.RoomID >= 0 && w.RoomID < len(d.stats.BondRoomPackets) {
 			atomic.AddInt64(&d.stats.BondRoomPackets[w.RoomID], 1)
 			atomic.AddInt64(&d.stats.BondRoomBytes[w.RoomID], int64(len(payload)))
 		}
-	} else {
+	default:
+		seqCounter.Add(^uint64(0))
+		w.bucket.refund(len(payload))
 		atomic.AddInt64(&d.stats.BondQueueDrops, 1)
-		for _, room := range d.bondSched.activeRooms(d.workers) {
-			if room >= 0 && room < len(d.stats.BondRoomDrops) {
-				atomic.AddInt64(&d.stats.BondRoomDrops[room], 1)
-			}
+		if w.RoomID >= 0 && w.RoomID < len(d.stats.BondRoomDrops) {
+			atomic.AddInt64(&d.stats.BondRoomDrops[w.RoomID], 1)
 		}
 	}
 	d.mu.Unlock()
+}
+
+func (d *Dispatcher) recordShaperDropLocked(size int) {
+	atomic.AddInt64(&d.stats.BondShaperDrops, 1)
+	now := time.Now()
+	if d.lastShaperLog.IsZero() || now.Sub(d.lastShaperLog) >= shaperLogInterval {
+		d.lastShaperLog = now
+		log.Printf("[ДИСП] Шейпер: нет доступного воркера для пакета %d байт; дроп", size)
+	}
+}
+
+func (d *Dispatcher) recordAllRoomDropsLocked() {
+	for _, room := range d.bondSched.activeRooms(d.workers) {
+		if room >= 0 && room < len(d.stats.BondRoomDrops) {
+			atomic.AddInt64(&d.stats.BondRoomDrops[room], 1)
+		}
+	}
 }
 
 func (d *Dispatcher) writeLoop() {

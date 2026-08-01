@@ -143,19 +143,25 @@ func bondFramePayload(ft bondFrameType, payload []byte) ([]byte, error) {
 }
 
 type bondScheduler struct {
-	roomRR      int
-	primary     int
-	workerRR    map[int]int
-	workers     []*WorkerSlot
-	workerRooms []int
-	rooms       []int
-	roomWorkers map[int][]*WorkerSlot
+	roomRR        int
+	primary       int
+	workerRateBPS int
+	workerRR      map[int]int
+	workers       []*WorkerSlot
+	workerRooms   []int
+	rooms         []int
+	roomWorkers   map[int][]*WorkerSlot
 }
 
-func newBondScheduler() *bondScheduler {
+func newBondScheduler(workerRates ...int) *bondScheduler {
+	rate := DefaultWorkerRateBPS
+	if len(workerRates) > 0 && workerRates[0] > 0 {
+		rate = workerRates[0]
+	}
 	return &bondScheduler{
-		workerRR:    make(map[int]int),
-		roomWorkers: make(map[int][]*WorkerSlot),
+		workerRateBPS: rate,
+		workerRR:      make(map[int]int),
+		roomWorkers:   make(map[int][]*WorkerSlot),
 	}
 }
 
@@ -210,7 +216,7 @@ func (s *bondScheduler) sameWorkerTopology(current []*WorkerSlot) bool {
 	return true
 }
 
-func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*WorkerSlot, bool) {
+func (s *bondScheduler) choose(workers []*WorkerSlot, size int) (*WorkerSlot, bool) {
 	s.ensureTopology(workers)
 	rooms := s.rooms
 	if len(rooms) == 0 {
@@ -226,7 +232,7 @@ func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*Wo
 		}
 		for i := 0; i < len(rooms); i++ {
 			room := rooms[(start+i)%len(rooms)]
-			if w, ok := s.chooseInRoom(room, pkt); ok {
+			if w, ok := s.chooseInRoom(room, size); ok {
 				s.primary = room
 				return w, true
 			}
@@ -237,7 +243,7 @@ func (s *bondScheduler) choose(workers []*WorkerSlot, pkt []byte, size int) (*Wo
 	for i := 0; i < len(rooms); i++ {
 		roomIdx := (start + i) % len(rooms)
 		room := rooms[roomIdx]
-		if w, ok := s.chooseInRoom(room, pkt); ok {
+		if w, ok := s.chooseInRoom(room, size); ok {
 			s.roomRR = (roomIdx + 1) % len(rooms)
 			return w, true
 		}
@@ -250,7 +256,7 @@ func (s *bondScheduler) activeRooms(workers []*WorkerSlot) []int {
 	return s.rooms
 }
 
-func (s *bondScheduler) chooseInRoom(room int, pkt []byte) (*WorkerSlot, bool) {
+func (s *bondScheduler) chooseInRoom(room, size int) (*WorkerSlot, bool) {
 	roomWorkers := s.roomWorkers[room]
 	if len(roomWorkers) == 0 {
 		return nil, false
@@ -259,18 +265,37 @@ func (s *bondScheduler) chooseInRoom(room int, pkt []byte) (*WorkerSlot, bool) {
 	for i := 0; i < len(roomWorkers); i++ {
 		idx := (start + i) % len(roomWorkers)
 		w := roomWorkers[idx]
-		select {
-		case w.SendCh <- pkt:
-			s.workerRR[room] = (idx + 1) % len(roomWorkers)
-			return w, true
-		default:
+		if !workerQueueAvailable(w) {
+			continue
 		}
+		if w.bucket == nil {
+			w.bucket = newWorkerTokenBucket(s.workerRateBPS, nil)
+		}
+		if !w.bucket.admit(size, size <= bondSmallPacketMax) {
+			continue
+		}
+		s.workerRR[room] = (idx + 1) % len(roomWorkers)
+		return w, true
 	}
 	return nil, false
 }
 
 func (s *bondScheduler) chooseAndSend(workers []*WorkerSlot, pkt []byte, size int) (*WorkerSlot, bool) {
-	return s.choose(workers, pkt, size)
+	w, ok := s.choose(workers, size)
+	if !ok {
+		return nil, false
+	}
+	select {
+	case w.SendCh <- pkt:
+		return w, true
+	default:
+		w.bucket.refund(size)
+		return nil, false
+	}
+}
+
+func workerQueueAvailable(worker *WorkerSlot) bool {
+	return worker != nil && worker.SendCh != nil && cap(worker.SendCh) > 0 && len(worker.SendCh) < cap(worker.SendCh)
 }
 
 type bondReorderBuffer struct {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,15 +112,17 @@ func TestMaxBudgetedRoomsHonorsPerWorkerFloors(t *testing.T) {
 	}
 }
 
-func TestMultiRoomPlannerFourByTwenty(t *testing.T) {
+func TestMultiRoomPlannerUsesOneWorkerRollingGroups(t *testing.T) {
 	plans := buildWorkerGroupPlans(80, 4, 20)
-	if len(plans) != 8 {
-		t.Fatalf("plans=%d, want 8", len(plans))
+	if len(plans) != 80 {
+		t.Fatalf("plans=%d, want 80", len(plans))
 	}
 	for room := 0; room < 4; room++ {
-		first, second := plans[room*2], plans[room*2+1]
-		if first.hashIndex != room || first.workerCount != 12 || second.hashIndex != room || second.workerCount != 8 {
-			t.Fatalf("room %d plans=%+v %+v, want 12+8", room, first, second)
+		for worker := 0; worker < 20; worker++ {
+			plan := plans[room*20+worker]
+			if plan.hashIndex != room || plan.roomID != room || plan.workerCount != 1 {
+				t.Fatalf("room %d worker %d plan=%+v, want single-worker room plan", room, worker, plan)
+			}
 		}
 	}
 }
@@ -168,6 +171,17 @@ func TestNewSupportsRoomsBeyondLegacyFour(t *testing.T) {
 	}
 	if runner.cfg.Workers != 120 {
 		t.Fatalf("workers=%d, want 120", runner.cfg.Workers)
+	}
+	tooMany := append(append([]string(nil), hashes...), "room-g")
+	tooManyCreds := make(map[string]*Credentials, len(tooMany))
+	for _, hash := range tooMany {
+		tooManyCreds[hash] = testRoomCreds(hash)
+	}
+	if _, err := New(Config{
+		PeerAddr: "127.0.0.1:443", UseUDP: true, BondV2: true,
+		WorkersPerRoom: 12, VKHashes: tooMany, PreloadedCredsByHash: tooManyCreds,
+	}); err == nil || !strings.Contains(err.Error(), "at most 6 rooms") {
+		t.Fatalf("seven-room error=%v, want six-room cap", err)
 	}
 }
 
