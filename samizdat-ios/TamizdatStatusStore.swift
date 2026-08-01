@@ -91,6 +91,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     let turnActiveWorkers: Int
     let turnExpectedWorkers: Int
     let turnQuotaStorm: Bool
+    let turnRecoveryState: String
+    let nextRetryInSec: Int
 
     /// VK TURN relay session parameters available from the server.
     let hasTURNCreds: Bool
@@ -103,6 +105,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         rewireGeneration: 0, endpointMode: "primary", effectiveEndpoint: "primary",
         desiredUpstream: "h2", upstreamKind: "h2", turnRunning: 0, turnNetstackReady: 0,
         turnActiveWorkers: 0, turnExpectedWorkers: 0, turnQuotaStorm: false,
+        turnRecoveryState: "idle", nextRetryInSec: 0,
         hasTURNCreds: false
     )
 
@@ -117,6 +120,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case rxBytes, txBytes, uptimeSec, isRewiring
         case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
         case turnRunning, turnNetstackReady, turnActiveWorkers, turnExpectedWorkers, turnQuotaStorm
+        case turnRecoveryState, nextRetryInSec
         case hasTURNCreds
     }
 
@@ -134,6 +138,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
          turnActiveWorkers: Int = 0,
          turnExpectedWorkers: Int = 0,
          turnQuotaStorm: Bool = false,
+         turnRecoveryState: String = "idle",
+         nextRetryInSec: Int = 0,
          hasTURNCreds: Bool = false) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
@@ -158,6 +164,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.turnActiveWorkers = turnActiveWorkers
         self.turnExpectedWorkers = turnExpectedWorkers
         self.turnQuotaStorm = turnQuotaStorm
+        self.turnRecoveryState = turnRecoveryState
+        self.nextRetryInSec = nextRetryInSec
         self.hasTURNCreds = hasTURNCreds
     }
 
@@ -186,6 +194,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.turnActiveWorkers = (try? c.decode(Int.self, forKey: .turnActiveWorkers)) ?? 0
         self.turnExpectedWorkers = (try? c.decode(Int.self, forKey: .turnExpectedWorkers)) ?? 0
         self.turnQuotaStorm = (try? c.decode(Bool.self, forKey: .turnQuotaStorm)) ?? false
+        self.turnRecoveryState = (try? c.decode(String.self, forKey: .turnRecoveryState)) ?? "idle"
+        self.nextRetryInSec = (try? c.decode(Int.self, forKey: .nextRetryInSec)) ?? 0
         self.hasTURNCreds = (try? c.decode(Bool.self, forKey: .hasTURNCreds)) ?? false
     }
 }

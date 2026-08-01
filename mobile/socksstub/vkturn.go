@@ -194,15 +194,16 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, workers, 0, nil, nil, creds, len(credsJSON))
 }
 
-// StartVKTurnMultiRoomUpstream starts one uniform worker pool per room.
+// StartVKTurnMultiRoomUpstream starts one worker pool per room. Twelve workers
+// is the normal connection profile; 8 and 6 are runtime-only pressure ladder
+// levels. Settings continue to expose 12 as the default.
 func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int, workersPerRoom int) string {
 	hashes, credsByHash, err := parseVKTurnRoomCredsJSON(bundleJSON)
 	if err != nil {
 		return "roomCredsJSON: " + err.Error()
 	}
-	expected := VKTurnWorkersPerRoomForRooms(len(hashes))
-	if workersPerRoom != expected {
-		return fmt.Sprintf("workersPerRoom must be %d for %d rooms", expected, len(hashes))
+	if workersPerRoom != 6 && workersPerRoom != 8 && workersPerRoom != 12 {
+		return fmt.Sprintf("workersPerRoom must be one of 6, 8, 12 for %d rooms", len(hashes))
 	}
 	maxRooms := VKTurnMaxRooms()
 	if len(hashes) > maxRooms {

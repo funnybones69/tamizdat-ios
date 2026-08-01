@@ -37,8 +37,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // pressure.
         var lastCriticalEventAt = Date.distantPast
         var didDumpHeap = false
+        var pressureEpisodeCount = 0
+        var currentWorkersPerRoom = 12
+        var stepEnteredAt = Date()
+        var headroomStableSince: Date?
+        var recentUpshiftAt: [Date] = []
         var recoveryScheduled = false
-        var recoveryAttempted = false
+        var recoveryAttaching = false
+        var recoveryAttemptIndex = 0
+        var nextRetryAt: Date?
+        var runnerDeadSince: Date?
+        var transitionGeneration = 0
+        var ladderTransitionActive = false
     }
 
     private let log = Logger(subsystem: "com.anarki.samizdat-test.tunnel", category: "extension")
@@ -66,11 +76,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var memPressureSrc: DispatchSourceMemoryPressure?
     private let memoryPressureState = OSAllocatedUnfairLock<MemoryPressureState>(initialState: .init())
     private let pressureRecoveryTask = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
+    private let ladderTransitionTask = OSAllocatedUnfairLock<Task<Void, Never>?>(initialState: nil)
     private static let memoryPressureCooldown: TimeInterval = 60
     private static let turnPressureRecoveryHeadroomBytes: UInt64 = 20 * 1024 * 1024
     private static let turnPressureRecoveryStableSamples = 2
     private static let turnPressureRecoveryPollNanoseconds: UInt64 = 2_000_000_000
     private static let turnPressureRecoveryMaxPolls = 150
+    private static let turnUpshiftHeadroomBytes: UInt64 = 28 * 1024 * 1024
+    private static let turnUpshiftStableDuration: TimeInterval = 3 * 60
+    private static let turnRecoveryWatchdogDelay: TimeInterval = 90
+    private static let turnRecoveryBackoffSeconds: [TimeInterval] = [60, 5 * 60, 15 * 60, 30 * 60]
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
@@ -381,7 +396,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// `ExtLog` open/write/fsync/close every call, so the timeline
     /// survives the block.
     @discardableResult
-    private static func attachVKTurnUpstream(resolvedPeer: ResolvedPeer? = nil, scheduleDrainRetry: Bool = true) -> String {
+    private static func attachVKTurnUpstream(
+        resolvedPeer: ResolvedPeer? = nil,
+        scheduleDrainRetry: Bool = true,
+        workersPerRoomOverride: Int? = nil
+    ) -> String {
         ExtLog.info("[vkturn] attach: entering helper")
 
         // Read runtime values from App Group UserDefaults — these keys
@@ -396,7 +415,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let workers = VKCredsPreferences.workers
         let roomCount = VKCredsPreferences.roomHashes.count
-        let workersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: roomCount)
+        let workersPerRoom = workersPerRoomOverride
+            ?? VKCredsPreferences.workersPerRoom(forRooms: roomCount)
         ExtLog.info("[vkturn] attach: peerNumeric=\(peer != configuredPeer) passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=\(workersPerRoom)")
 
         guard !peer.isEmpty else {
@@ -664,6 +684,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pressureRecoveryTask.withLock {
             $0?.cancel()
             $0 = nil
+        }
+        ladderTransitionTask.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        memoryPressureState.withLock {
+            $0.recoveryScheduled = false
+            $0.recoveryAttaching = false
+            $0.nextRetryAt = nil
+            $0.transitionGeneration += 1
         }
         SocksstubStopVKTurnUpstreamAsync()
         hev_socks5_tunnel_quit()
@@ -1099,7 +1129,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             var turnAttachResult = ""
             if policy.usesTURN {
-                turnAttachResult = Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer)
+                let runtimeWorkers = self.memoryPressureState.withLock { $0.currentWorkersPerRoom }
+                turnAttachResult = Self.attachVKTurnUpstream(
+                    resolvedPeer: self.resolvedPeer,
+                    workersPerRoomOverride: runtimeWorkers
+                )
                 if !turnAttachResult.isEmpty,
                    turnAttachResult != "already running",
                    turnAttachResult != "previous runner still draining" {
@@ -1328,7 +1362,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 // refresh should start the runner immediately, but only
                 // while the effective endpoint is Restricted+Relay.
                 appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
-                let attachResult = Self.attachVKTurnUpstream(resolvedPeer: resolvedPeer)
+                let runtimeWorkers = memoryPressureState.withLock { $0.currentWorkersPerRoom }
+                let attachResult = Self.attachVKTurnUpstream(
+                    resolvedPeer: resolvedPeer,
+                    workersPerRoomOverride: runtimeWorkers
+                )
                 let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
                 completionHandler?(response.data(using: .utf8))
             } else {
@@ -1352,6 +1390,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             SocksstubSetVKTurnRequired(true)
             SocksstubStopVKTurnUpstream()
+            memoryPressureState.withLock {
+                $0.currentWorkersPerRoom = 12
+                $0.stepEnteredAt = Date()
+                $0.headroomStableSince = nil
+                $0.recentUpshiftAt = []
+            }
             let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
             let roomBundleJSON = TURNCredsStore.shared.validatedRoomBundleJSON()
             let hasBundle = roomBundleJSON?.isEmpty == false
@@ -1410,12 +1454,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let policy = Self.upstreamPolicy(mode: mode, backup: backupBlob)
             let turnRunning = SocksstubTURNUpstreamRunning()
             let turnNetstackReady = !SocksstubTURNUpstreamWGConfig().isEmpty
+            let turnRecovery = self.turnRecoveryStatus()
             let actualUpstream = turnRequiredNow
                 ? (turnNetstackReady ? "turn" : "turn-pending")
                 : "h2"
             let turnStats: (active: Int, expected: Int, quotaStorm: Bool) = {
                 let roomCount = VKCredsPreferences.roomHashes.count
-                let fallbackExpected = roomCount * VKCredsPreferences.workersPerRoom(forRooms: roomCount)
+                let runtimeWorkers = self.memoryPressureState.withLock { $0.currentWorkersPerRoom }
+                let fallbackExpected = roomCount * runtimeWorkers
                 let raw = SocksstubTURNUpstreamStatsJSON()
                 guard let data = raw.data(using: .utf8),
                       let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -1460,6 +1506,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "turnExpectedWorkers": turnStats.expected,
                 "turnWorkers": turnStats.expected,
                 "turnQuotaStorm": turnStats.quotaStorm,
+                "turnRecoveryState": turnRecovery.state,
+                "nextRetryInSec": turnRecovery.nextRetryInSec,
                 // VK TURN relay session parameter status. IPA-D65b: the main
                 // app now acquires session params itself via WKWebView verification challenge
                 // solving and writes them to App Group UserDefaults
@@ -1915,10 +1963,13 @@ misc:
 
     private func startBurstProtection() {
         // IPA-D7: nuclear close pattern from sing-box-for-apple.
-        // IPA-D9: dump one heap profile per pressure episode. iOS may
-        // repeatedly deliver `.critical`; the shared cooldown below prevents
-        // a GC/profile/flow-close feedback loop.
+        // IPA-D9: retain one heap profile per tunnel generation for now. The
+        // shared cooldown below prevents a GC/profile/flow-close feedback loop.
         pressureRecoveryTask.withLock {
+            $0?.cancel()
+            $0 = nil
+        }
+        ladderTransitionTask.withLock {
             $0?.cancel()
             $0 = nil
         }
@@ -1934,366 +1985,563 @@ misc:
 
     private func handleCriticalMemoryPressure(reason: String) -> Bool {
         let now = Date()
-        // Capture ownership before any side effect: a handler delivered just
-        // before Disconnect must not stop TURN/flows of the next tunnel.
         let handlerTunnelGeneration = Self.turnTunnelGenerationLock.withLock { $0 }
-        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool, scheduleRecovery: Bool, manualRecovery: Bool) in
+        let turnRequired = SocksstubVKTurnRequired()
+
+        if !turnRequired {
+            let h2Decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool) in
+                state.lastCriticalEventAt = now
+                guard now.timeIntervalSince(state.lastNuclearCloseAt) >= Self.memoryPressureCooldown else {
+                    return (false, false)
+                }
+                state.lastNuclearCloseAt = now
+                let shouldDump = !state.didDumpHeap
+                state.didDumpHeap = true
+                return (true, shouldDump)
+            }
+            guard h2Decision.run else { return false }
+            guard Self.turnTunnelGenerationLock.withLock({ $0 }) == handlerTunnelGeneration else {
+                appendExtLog("warn: memorypressure CRITICAL reason=\(reason) ignored — tunnel generation changed")
+                return false
+            }
+            let availKB = os_proc_available_memory() / 1024
+            appendExtLog("error: memorypressure CRITICAL reason=\(reason) avail=\(availKB)KB — H2 shed")
+            if h2Decision.dump {
+                dumpProfileBeforeNuclear(reason: reason)
+            }
+            let closed = SocksstubCloseAllFlows()
+            appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — H2 closed \(closed) flows")
+            return true
+        }
+
+        let decision = memoryPressureState.withLock { state -> (run: Bool, dump: Bool, episode: Int, action: TURNPressureLadderAction) in
             state.lastCriticalEventAt = now
             guard now.timeIntervalSince(state.lastNuclearCloseAt) >= Self.memoryPressureCooldown else {
-                return (false, false, false, false)
+                return (false, false, state.pressureEpisodeCount, .none)
             }
+            let previousPressure = state.lastNuclearCloseAt == .distantPast
+                ? nil
+                : state.lastNuclearCloseAt.timeIntervalSinceReferenceDate
+            let input = TURNPressureLadderDecisionState(
+                now: now.timeIntervalSinceReferenceDate,
+                pressureEvent: true,
+                pressureEpisodeCount: state.pressureEpisodeCount,
+                lastPressureAt: previousPressure,
+                currentWorkersPerRoom: state.currentWorkersPerRoom,
+                stepEnteredAt: state.stepEnteredAt.timeIntervalSinceReferenceDate,
+                headroomStableSince: state.headroomStableSince?.timeIntervalSinceReferenceDate,
+                recentUpshiftAt: state.recentUpshiftAt.map(\.timeIntervalSinceReferenceDate),
+                turnRequired: true,
+                runnerAlive: SocksstubTURNUpstreamRunning()
+            )
+            let episode = nextPressureEpisode(state: input)
+            let action = nextLadderAction(state: input)
             state.lastNuclearCloseAt = now
+            state.pressureEpisodeCount = episode
             let shouldDump = !state.didDumpHeap
             state.didDumpHeap = true
-            if state.recoveryScheduled {
-                return (true, shouldDump, false, false)
-            }
-            if state.recoveryAttempted {
-                return (true, shouldDump, false, true)
-            }
-            state.recoveryScheduled = true
-            return (true, shouldDump, true, false)
+            state.headroomStableSince = nil
+            return (true, shouldDump, episode, action)
         }
         guard decision.run else { return false }
 
-        // Re-check after the decision: stopTunnel may have advanced the
-        // generation while this handler was queued or dumping. The side
-        // effects below (stop TURN, close flows, schedule recovery) must
-        // never land on the next tunnel's runtime.
         guard Self.turnTunnelGenerationLock.withLock({ $0 }) == handlerTunnelGeneration else {
             appendExtLog("warn: memorypressure CRITICAL reason=\(reason) ignored — tunnel generation changed mid-handler")
             return false
         }
 
         let availKB = os_proc_available_memory() / 1024
-        appendExtLog("error: memorypressure CRITICAL reason=\(reason) avail=\(availKB)KB — entering fail-closed pressure recovery")
-        // Preserve the triggering state in the one diagnostic heap before any
-        // worker/flow teardown changes it.
+        appendExtLog("error: memorypressure CRITICAL reason=\(reason) avail=\(availKB)KB episode=\(decision.episode)")
         if decision.dump {
             dumpProfileBeforeNuclear(reason: reason)
         }
-        // The dump above can stall for hundreds of milliseconds; re-check
-        // ownership once more so a Disconnect/Connect completed meanwhile
-        // keeps its fresh runtime. (A microsecond race remains between this
-        // check and the calls below; its worst case is the pre-recovery
-        // behavior — TURN stopped, manual reconnect.)
         guard Self.turnTunnelGenerationLock.withLock({ $0 }) == handlerTunnelGeneration else {
             appendExtLog("warn: memorypressure CRITICAL reason=\(reason) ignored after dump — tunnel generation changed")
             return false
         }
-        // Stop is idempotent and also clears a stale netstack whose runner has
-        // already exited. Desired TURN policy remains required throughout.
-        SocksstubStopVKTurnUpstreamAsync()
-        let closed = SocksstubCloseAllFlows()
-        appendExtLog("warn: memorypressure CRITICAL reason=\(reason) — stopped TURN and closed \(closed) flows; cooldown=60s")
 
-        if decision.scheduleRecovery {
-            scheduleTURNPressureRecovery(pressureAt: now)
-        } else if decision.manualRecovery {
-            appendExtLog("error: memorypressure repeated after automatic recovery — circuit breaker open; manual reconnect required")
-        } else {
-            appendExtLog("warn: memorypressure recovery already scheduled; keeping TURN fail-closed")
+        switch decision.action {
+        case .none:
+            return false
+        case .shedFlows:
+            let cancelledLadder = memoryPressureState.withLock { state -> Bool in
+                guard state.ladderTransitionActive else { return false }
+                state.transitionGeneration += 1
+                state.ladderTransitionActive = false
+                state.recoveryAttaching = false
+                return true
+            }
+            if cancelledLadder {
+                ladderTransitionTask.withLock {
+                    $0?.cancel()
+                    $0 = nil
+                }
+            }
+            let closed = SocksstubCloseAllFlows()
+            appendExtLog("warn: ladder step \(decision.episode): shed flows+GC; TURN runner preserved; closed=\(closed)")
+        case let .downshift(workersPerRoom):
+            let closed = SocksstubCloseAllFlows()
+            appendExtLog("warn: ladder step \(decision.episode): downshift to \(workersPerRoom) workers/room; closed=\(closed)")
+            scheduleLadderTransition(
+                workersPerRoom: workersPerRoom,
+                reason: "pressure-step-\(decision.episode)",
+                isUpshift: false
+            )
+        case .failClosed:
+            ladderTransitionTask.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            pressureRecoveryTask.withLock {
+                $0?.cancel()
+                $0 = nil
+            }
+            SocksstubStopVKTurnUpstreamAsync()
+            let closed = SocksstubCloseAllFlows()
+            appendExtLog("error: ladder step \(decision.episode): fail-closed; TURN stopped; closed=\(closed)")
+            memoryPressureState.withLock {
+                $0.recoveryAttaching = false
+                $0.recoveryScheduled = false
+                $0.nextRetryAt = nil
+                $0.ladderTransitionActive = false
+                $0.transitionGeneration += 1
+            }
+            scheduleTURNPressureRecovery(reason: "ladder-fail-closed", immediate: false)
+        case .upshift:
+            break
         }
         return true
     }
 
-    /// One bounded automatic recovery is allowed per Network Extension tunnel
-    /// generation. It waits for the old runner's drain/release barrier, the
-    /// full 60-second pressure cooldown, and two stable >=20 MiB headroom
-    /// samples. A second critical episode opens the circuit breaker instead of
-    /// creating a stop/start pressure loop. Room preferences are never reduced.
-    /// Pressure state is owned per tunnel generation: startBurstProtection
-    /// resets it on every tunnel start. Rewire changes within one tunnel
-    /// intentionally do NOT block these writes — an exiting recovery task must
-    /// still reset the shared per-tunnel state (e.g. after a rewire or policy
-    /// change) or recoveryScheduled would stay latched and both auto-recovery
-    /// and the circuit breaker would be dead for the rest of the tunnel.
-    private func mutatePressureStateIfOwned(
-        tunnelGeneration: Int,
-        _ mutate: (inout MemoryPressureState) -> Void
-    ) -> Bool {
-        Self.turnTunnelGenerationLock.withLock { currentTunnelGeneration -> Bool in
-            guard currentTunnelGeneration == tunnelGeneration else { return false }
-            memoryPressureState.withLock { state in
-                mutate(&state)
-            }
-            return true
+    private func scheduleLadderTransition(
+        workersPerRoom: Int,
+        reason: String,
+        isUpshift: Bool
+    ) {
+        guard [6, 8, 12].contains(workersPerRoom),
+              isRunning,
+              SocksstubVKTurnRequired() else { return }
+        pressureRecoveryTask.withLock {
+            $0?.cancel()
+            $0 = nil
         }
-    }
-
-    private func scheduleTURNPressureRecovery(pressureAt: Date) {
-        // Tunnel-authoritative gate: recover only what this tunnel actually
-        // runs (the Go-side TURN-required flag), never live App Group prefs.
-        // The 2026-07-17 field hang (0/80 zombie on the reverted v1) came
-        // from recovery consulting instantaneous prefs the user had already
-        // flipped for the NEXT connect while the running tunnel was still
-        // TURN-required fail-closed.
-        guard SocksstubVKTurnRequired() else {
-            memoryPressureState.withLock { $0.recoveryScheduled = false }
-            appendExtLog("info: memorypressure recovery not scheduled — tunnel is not TURN-required")
-            return
+        ladderTransitionTask.withLock {
+            $0?.cancel()
+            $0 = nil
         }
         let capturedTunnelGeneration = Self.turnTunnelGenerationLock.withLock { $0 }
         let capturedRewireGeneration = rewireGeneration
-        appendExtLog("info: memorypressure auto-recovery scheduled tunnelGeneration=\(capturedTunnelGeneration) rewireGeneration=\(capturedRewireGeneration) rooms=\(VKCredsPreferences.roomHashes.count) cooldown=60s headroom=20MiB")
+        let transitionGeneration = memoryPressureState.withLock { state -> Int in
+            state.transitionGeneration += 1
+            state.recoveryScheduled = false
+            state.recoveryAttaching = true
+            state.nextRetryAt = nil
+            state.ladderTransitionActive = true
+            return state.transitionGeneration
+        }
+        let direction = isUpshift ? "upshift" : "downshift"
+        appendExtLog("info: ladder \(direction) attaching target=\(workersPerRoom) workers/room reason=\(reason)")
 
         let task = Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
+            let success = await self.restartTURNWithFreshBundle(
+                workersPerRoom: workersPerRoom,
+                reason: reason,
+                tunnelGeneration: capturedTunnelGeneration,
+                capturedRewireGeneration: capturedRewireGeneration,
+                transitionGeneration: transitionGeneration
+            )
+            let ownsTransition = Self.turnTunnelGenerationLock.withLock { $0 } == capturedTunnelGeneration
+                && self.memoryPressureState.withLock { state -> Bool in
+                guard state.transitionGeneration == transitionGeneration,
+                      state.ladderTransitionActive else { return false }
+                state.recoveryAttaching = false
+                state.ladderTransitionActive = false
+                state.nextRetryAt = nil
+                if success {
+                    state.currentWorkersPerRoom = workersPerRoom
+                    state.stepEnteredAt = Date()
+                    state.headroomStableSince = nil
+                    state.recoveryAttemptIndex = 0
+                    state.runnerDeadSince = nil
+                    if isUpshift {
+                        state.recentUpshiftAt.append(Date())
+                        state.recentUpshiftAt.removeAll { Date().timeIntervalSince($0) >= 60 * 60 }
+                    }
+                }
+                return true
+            }
+            guard ownsTransition else { return }
+
+            if success {
+                self.appendExtLog("info: ladder \(direction) READY target=\(workersPerRoom) workers/room")
+            } else {
+                self.appendExtLog("error: ladder \(direction) failed target=\(workersPerRoom) workers/room")
+                if SocksstubVKTurnRequired() && !SocksstubTURNUpstreamRunning() {
+                    self.scheduleTURNPressureRecovery(reason: "ladder-transition-failed", immediate: true)
+                }
+            }
+        }
+        ladderTransitionTask.withLock {
+            $0?.cancel()
+            $0 = task
+        }
+    }
+
+    private func restartTURNWithFreshBundle(
+        workersPerRoom: Int,
+        reason: String,
+        tunnelGeneration: Int,
+        capturedRewireGeneration: Int,
+        transitionGeneration: Int
+    ) async -> Bool {
+        guard Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration,
+              self.rewireGeneration == capturedRewireGeneration,
+              isRunning,
+              SocksstubVKTurnRequired() else { return false }
+        let hashes = VKCredsPreferences.roomHashes
+        guard !hashes.isEmpty else {
+            appendExtLog("error: ladder/recovery fetch skipped — no configured rooms")
+            return false
+        }
+
+        do {
+            appendExtLog("info: ladder/recovery fetching fresh multi-room bundle rooms=\(hashes.count) reason=\(reason)")
+            let rooms = try await TURNAnonymousCredsFetcher.fetchRooms(
+                hashes,
+                perRequestTimeout: 5,
+                overallTimeout: 30
+            )
+            guard !Task.isCancelled,
+                  Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration,
+              self.rewireGeneration == capturedRewireGeneration,
+                  isRunning,
+                  SocksstubVKTurnRequired(),
+                  hashes == VKCredsPreferences.roomHashes,
+                  memoryPressureState.withLock({ $0.transitionGeneration == transitionGeneration }) else {
+                appendExtLog("info: ladder/recovery fresh bundle discarded — lifecycle changed")
+                return false
+            }
+            guard TURNCredsStore.shared.saveRooms(rooms) else {
+                appendExtLog("error: ladder/recovery fresh bundle save failed")
+                return false
+            }
+            appendExtLog("info: ladder/recovery fresh multi-room bundle saved rooms=\(rooms.count)")
+        } catch {
+            appendExtLog("warn: ladder/recovery fresh bundle fetch failed reason=\(reason) error=\(error.localizedDescription)")
+            return false
+        }
+
+        guard !Task.isCancelled,
+              Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration,
+              self.rewireGeneration == capturedRewireGeneration,
+              memoryPressureState.withLock({ $0.transitionGeneration == transitionGeneration }) else {
+            return false
+        }
+        SocksstubStopVKTurnUpstream()
+        guard !Task.isCancelled,
+              Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration,
+              self.rewireGeneration == capturedRewireGeneration,
+              isRunning,
+              SocksstubVKTurnRequired(),
+              memoryPressureState.withLock({ $0.transitionGeneration == transitionGeneration }) else {
+            return false
+        }
+        SocksstubSetVKTurnRequired(true)
+
+        var result = Self.attachVKTurnUpstream(
+            resolvedPeer: resolvedPeer,
+            scheduleDrainRetry: false,
+            workersPerRoomOverride: workersPerRoom
+        )
+        if result == "previous runner still draining" {
+            for _ in 0..<120 {
+                if Task.isCancelled { return false }
+                guard Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration,
+              self.rewireGeneration == capturedRewireGeneration,
+                      isRunning,
+                      SocksstubVKTurnRequired(),
+                      memoryPressureState.withLock({ $0.transitionGeneration == transitionGeneration }) else {
+                    return false
+                }
+                if !SocksstubTURNUpstreamDraining() {
+                    result = Self.attachVKTurnUpstream(
+                        resolvedPeer: resolvedPeer,
+                        scheduleDrainRetry: false,
+                        workersPerRoomOverride: workersPerRoom
+                    )
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        guard result.isEmpty || result == "already running" else {
+            appendExtLog("error: ladder/recovery runner start failed result=\(result)")
+            return false
+        }
+
+        for _ in 0..<120 {
+            if Task.isCancelled { return false }
+            guard Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration,
+              self.rewireGeneration == capturedRewireGeneration,
+                  isRunning,
+                  SocksstubVKTurnRequired(),
+                  memoryPressureState.withLock({ $0.transitionGeneration == transitionGeneration }) else {
+                return false
+            }
+            if !SocksstubTURNUpstreamWGConfig().isEmpty {
+                return true
+            }
+            if !SocksstubTURNUpstreamRunning() {
+                return false
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        appendExtLog("error: ladder/recovery timed out waiting for WG netstack")
+        return false
+    }
+
+    private func recoveryDelay(forAttempt attempt: Int) -> TimeInterval {
+        guard attempt >= 0 else { return Self.turnRecoveryBackoffSeconds[0] }
+        if attempt < Self.turnRecoveryBackoffSeconds.count {
+            return Self.turnRecoveryBackoffSeconds[attempt]
+        }
+        return 60 * 60
+    }
+
+    private func scheduleTURNPressureRecovery(reason: String, immediate: Bool) {
+        guard isRunning, SocksstubVKTurnRequired() else { return }
+        let capturedTunnelGeneration = Self.turnTunnelGenerationLock.withLock { $0 }
+        let capturedRewireGeneration = rewireGeneration
+        let schedule = memoryPressureState.withLock { state -> (attempt: Int, delay: TimeInterval, transition: Int)? in
+            guard !state.recoveryScheduled, !state.recoveryAttaching else { return nil }
+            let attempt = state.recoveryAttemptIndex
+            let delay = immediate ? 0 : recoveryDelay(forAttempt: attempt)
+            state.recoveryScheduled = true
+            state.recoveryAttaching = false
+            state.nextRetryAt = Date().addingTimeInterval(delay)
+            state.ladderTransitionActive = false
+            state.transitionGeneration += 1
+            return (attempt, delay, state.transitionGeneration)
+        }
+        guard let schedule else { return }
+        appendExtLog("info: TURN recovery scheduled attempt=\(schedule.attempt + 1) delay=\(Int(schedule.delay))s reason=\(reason)")
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            if schedule.delay > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(schedule.delay * 1_000_000_000))
+                } catch {
+                    return
+                }
+            }
+            let ownsSchedule = Self.turnTunnelGenerationLock.withLock { $0 } == capturedTunnelGeneration
+                && self.memoryPressureState.withLock { state -> Bool in
+                guard state.transitionGeneration == schedule.transition,
+                      state.recoveryScheduled else { return false }
+                state.recoveryScheduled = false
+                state.recoveryAttaching = true
+                state.nextRetryAt = nil
+                return true
+            }
+            guard ownsSchedule,
+                  self.isRunning,
+                  SocksstubVKTurnRequired() else { return }
+
+            self.appendExtLog("info: TURN recovery attaching attempt=\(schedule.attempt + 1)")
             var stableHeadroomSamples = 0
             var requestedCompaction = false
-            var previousLastPressure = pressureAt
-
+            var gatePassed = false
             for poll in 1...Self.turnPressureRecoveryMaxPolls {
                 if Task.isCancelled { return }
                 guard Self.turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration,
-                      self.isRunning else {
-                    // Do not mutate recovery state here: the same provider
-                    // object may already have reset it for a newer generation.
-                    self.appendExtLog("info: memorypressure auto-recovery cancelled — tunnel generation stopped or changed")
+                      self.isRunning,
+                      SocksstubVKTurnRequired(),
+                      self.memoryPressureState.withLock({ $0.transitionGeneration == schedule.transition }) else {
                     return
                 }
-                guard self.rewireGeneration == capturedRewireGeneration else {
-                    let didMutate = self.mutatePressureStateIfOwned(
-                        tunnelGeneration: capturedTunnelGeneration
-                    ) {
-                        $0.recoveryScheduled = false
-                        $0.recoveryAttempted = false
-                    }
-                    guard didMutate else {
-                        self.appendExtLog("info: memorypressure auto-recovery state reset skipped, ownership changed")
-                        return
-                    }
-                    self.appendExtLog("info: memorypressure auto-recovery cancelled — authoritative rewire generation changed")
+                if self.rewireGeneration != capturedRewireGeneration {
+                    self.appendExtLog("info: TURN recovery attach ownership changed by rewire")
+                    break
+                }
+                if SocksstubTURNUpstreamRunning(),
+                   !SocksstubTURNUpstreamDraining(),
+                   !SocksstubTURNUpstreamWGConfig().isEmpty {
+                    self.finishTURNRecoverySuccess(
+                        tunnelGeneration: capturedTunnelGeneration,
+                        transitionGeneration: schedule.transition
+                    )
                     return
                 }
-
-                // Tunnel-authoritative: the Go TURN-required flag flips only
-                // through this tunnel's own wiring (attach/rewire), unlike
-                // App Group prefs which describe the NEXT connect.
-                guard SocksstubVKTurnRequired() else {
-                    let didMutate = self.mutatePressureStateIfOwned(
-                        tunnelGeneration: capturedTunnelGeneration
-                    ) {
-                        $0.recoveryScheduled = false
-                        $0.recoveryAttempted = false
-                    }
-                    guard didMutate else {
-                        self.appendExtLog("info: memorypressure auto-recovery state reset skipped, ownership changed")
-                        return
-                    }
-                    self.appendExtLog("info: memorypressure auto-recovery cancelled — tunnel no longer TURN-required (rewired)")
-                    return
-                }
-
                 let lastPressure = self.memoryPressureState.withLock { max($0.lastNuclearCloseAt, $0.lastCriticalEventAt) }
-                if lastPressure > previousLastPressure {
-                    previousLastPressure = lastPressure
+                if Date().timeIntervalSince(lastPressure) < Self.memoryPressureCooldown || SocksstubTURNUpstreamDraining() {
                     stableHeadroomSamples = 0
-                    self.appendExtLog("info: memorypressure auto-recovery cooldown re-armed by repeated pressure")
-                }
-                let cooldownComplete = Date().timeIntervalSince(lastPressure) >= Self.memoryPressureCooldown
-                if !cooldownComplete || SocksstubTURNUpstreamDraining() {
-                    do {
-                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
-                    } catch {
-                        return
-                    }
+                    try? await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
                     continue
                 }
-
-                let availableBeforeCompaction = os_proc_available_memory()
-                if availableBeforeCompaction < Self.turnPressureRecoveryHeadroomBytes,
-                   !requestedCompaction {
-                    // Limit this recovery poller to one post-drain compaction;
-                    // never repeat it every two seconds as the reverted loop did.
-                    // The 30 s heartbeat backstop and nuclear-close compaction
-                    // remain independent pressure-safety mechanisms.
+                let available = os_proc_available_memory()
+                if available < Self.turnPressureRecoveryHeadroomBytes, !requestedCompaction {
                     requestedCompaction = true
                     SocksstubFreeOSMemory()
-                    self.appendExtLog("info: memorypressure auto-recovery requested one post-drain memory compaction")
-                    do {
-                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
-                    } catch {
-                        return
-                    }
-                    continue
+                    self.appendExtLog("info: TURN recovery requested one post-drain memory compaction")
                 }
-
-                let available = os_proc_available_memory()
                 if available >= Self.turnPressureRecoveryHeadroomBytes {
                     stableHeadroomSamples += 1
                 } else {
                     stableHeadroomSamples = 0
                 }
+                if stableHeadroomSamples >= Self.turnPressureRecoveryStableSamples {
+                    gatePassed = true
+                    break
+                }
+                if poll % 15 == 0 {
+                    self.appendExtLog("info: TURN recovery waiting headroom=\(available / 1024)KB stable=\(stableHeadroomSamples)/\(Self.turnPressureRecoveryStableSamples)")
+                }
+                try? await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
+            }
 
-                if stableHeadroomSamples < Self.turnPressureRecoveryStableSamples {
-                    if poll % 15 == 0 {
-                        self.appendExtLog("info: memorypressure auto-recovery waiting headroom=\(available / 1024)KB stable=\(stableHeadroomSamples)/\(Self.turnPressureRecoveryStableSamples)")
-                    }
-                    do {
-                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
-                    } catch {
-                        return
-                    }
-                    continue
-                }
-
-                // Re-check ownership immediately before consuming the one-shot
-                // attempt. A rewire may have started while headroom was sampled.
-                guard Self.turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration,
-                      self.isRunning else {
-                    self.appendExtLog("info: memorypressure auto-recovery cancelled before attach — tunnel generation changed")
-                    return
-                }
-                guard self.rewireGeneration == capturedRewireGeneration,
-                      SocksstubVKTurnRequired() else {
-                    let didMutate = self.mutatePressureStateIfOwned(
-                        tunnelGeneration: capturedTunnelGeneration
-                    ) {
-                        $0.recoveryScheduled = false
-                        $0.recoveryAttempted = false
-                    }
-                    guard didMutate else {
-                        self.appendExtLog("info: memorypressure auto-recovery state reset before attach skipped, ownership changed")
-                        return
-                    }
-                    self.appendExtLog("info: memorypressure auto-recovery cancelled before attach — rewire/policy ownership changed")
-                    return
-                }
-
-                var ownsAttempt = false
-                let didMutate = self.mutatePressureStateIfOwned(
-                    tunnelGeneration: capturedTunnelGeneration
-                ) { state in
-                    guard state.recoveryScheduled, !state.recoveryAttempted else { return }
-                    state.recoveryScheduled = false
-                    state.recoveryAttempted = true
-                    ownsAttempt = true
-                }
-                guard didMutate else {
-                    self.appendExtLog("info: memorypressure auto-recovery attempt consume skipped, ownership changed")
-                    return
-                }
-                guard ownsAttempt else {
-                    self.appendExtLog("info: memorypressure auto-recovery skipped — recovery ownership changed")
-                    return
-                }
-
-                // Desired TURN remains fail-closed before, during and after
-                // attach. attachVKTurnUpstream re-reads the same complete App
-                // Group room bundle; it does not silently truncate 4 rooms.
-                // Holding both generation locks across attach closes the
-                // check-to-attach race with stopTunnel/rewire. This is only
-                // legal with scheduleDrainRetry:false — the drain-retry path
-                // (scheduleVKTurnAttachAfterDrain) takes the same non-recursive
-                // turnTunnelGenerationLock and would deadlock here.
-                let ownedResult = Self.turnTunnelGenerationLock.withLock { currentTunnelGeneration -> String? in
-                    guard currentTunnelGeneration == capturedTunnelGeneration,
-                          !Task.isCancelled,
-                          self.isRunning
-                    else { return nil }
-                    return self.rewireGenerationLock.withLock { currentRewireGeneration -> String? in
-                        guard currentRewireGeneration == capturedRewireGeneration,
-                              !Task.isCancelled,
-                              self.isRunning,
-                              SocksstubVKTurnRequired()
-                        else { return nil }
-                        SocksstubSetVKTurnRequired(true)
-                        return Self.attachVKTurnUpstream(resolvedPeer: self.resolvedPeer, scheduleDrainRetry: false)
-                    }
-                }
-                guard let result = ownedResult else {
-                    // The consumed one-shot never attached. Hand the allowance
-                    // back (tunnel-guarded) so a later critical in this tunnel
-                    // schedules a fresh recovery instead of instantly opening
-                    // the breaker for an attach that never ran.
-                    _ = self.mutatePressureStateIfOwned(
-                        tunnelGeneration: capturedTunnelGeneration
-                    ) {
-                        $0.recoveryScheduled = false
-                        $0.recoveryAttempted = false
-                    }
-                    self.appendExtLog("info: memorypressure auto-recovery attach skipped, ownership changed; attempt returned")
-                    return
-                }
-                self.appendExtLog("info: memorypressure auto-recovery attach result=\(result.isEmpty ? "started" : result) headroom=\(available / 1024)KB")
-
-                if result == "previous runner still draining" {
-                    let didMutate = self.mutatePressureStateIfOwned(
-                        tunnelGeneration: capturedTunnelGeneration
-                    ) {
-                        $0.recoveryScheduled = true
-                        $0.recoveryAttempted = false
-                    }
-                    guard didMutate else {
-                        self.appendExtLog("info: memorypressure auto-recovery drain retry state skipped, ownership changed")
-                        return
-                    }
-                    stableHeadroomSamples = 0
-                    do {
-                        try await Task.sleep(nanoseconds: Self.turnPressureRecoveryPollNanoseconds)
-                    } catch {
-                        return
-                    }
-                    continue
-                }
-                guard result.isEmpty || result == "already running" else {
-                    self.appendExtLog("error: memorypressure auto-recovery failed before runner readiness; manual reconnect required")
-                    return
-                }
-
-                for _ in 0..<120 { // 60 s bound for runner + GETCONF + WG attach
-                    if Task.isCancelled { return }
-                    guard Self.turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration,
-                          self.rewireGeneration == capturedRewireGeneration,
-                          self.isRunning else {
-                        self.appendExtLog("info: memorypressure auto-recovery readiness poll cancelled — lifecycle generation changed")
-                        return
-                    }
-                    if !SocksstubTURNUpstreamWGConfig().isEmpty {
-                        self.appendExtLog("info: memorypressure auto-recovery READY workers=\(SocksstubTURNUpstreamActiveWorkers())/\(SocksstubTURNUpstreamExpectedWorkers()) rooms=\(VKCredsPreferences.roomHashes.count)")
-                        return
-                    }
-                    if !SocksstubTURNUpstreamRunning() {
-                        self.appendExtLog("error: memorypressure auto-recovery runner exited before ready; manual reconnect required")
-                        return
-                    }
-                    do {
-                        try await Task.sleep(nanoseconds: 500_000_000)
-                    } catch {
-                        return
-                    }
-                }
-                let didMutateAfterReadinessTimeout = self.mutatePressureStateIfOwned(
-                    tunnelGeneration: capturedTunnelGeneration
-                ) {
-                    $0.recoveryScheduled = false
-                    $0.recoveryAttempted = true
-                }
-                guard didMutateAfterReadinessTimeout else {
-                    self.appendExtLog("info: memorypressure auto-recovery readiness timeout state skipped, ownership changed")
-                    return
-                }
-                self.appendExtLog("error: memorypressure auto-recovery timed out waiting for WG netstack; manual reconnect required")
+            let targetWorkers = self.memoryPressureState.withLock { $0.currentWorkersPerRoom }
+            var success = false
+            if gatePassed {
+                success = await self.restartTURNWithFreshBundle(
+                    workersPerRoom: targetWorkers,
+                    reason: "auto-recovery-\(schedule.attempt + 1)",
+                    tunnelGeneration: capturedTunnelGeneration,
+                    capturedRewireGeneration: capturedRewireGeneration,
+                    transitionGeneration: schedule.transition
+                )
+            }
+            if success {
+                self.finishTURNRecoverySuccess(
+                    tunnelGeneration: capturedTunnelGeneration,
+                    transitionGeneration: schedule.transition
+                )
+                self.appendExtLog("info: TURN recovery READY attempt=\(schedule.attempt + 1) workersPerRoom=\(targetWorkers)")
                 return
             }
 
-            if Task.isCancelled { return }
-            let didMutate = self.mutatePressureStateIfOwned(
-                tunnelGeneration: capturedTunnelGeneration
-            ) {
-                $0.recoveryScheduled = false
-                $0.recoveryAttempted = true
+            let ownsFailure = Self.turnTunnelGenerationLock.withLock { $0 } == capturedTunnelGeneration
+                && self.memoryPressureState.withLock { state -> Bool in
+                guard state.transitionGeneration == schedule.transition else { return false }
+                state.recoveryAttaching = false
+                state.recoveryScheduled = false
+                state.nextRetryAt = nil
+                state.recoveryAttemptIndex += 1
+                return true
             }
-            guard didMutate else {
-                self.appendExtLog("info: memorypressure auto-recovery drain/headroom timeout state skipped, ownership changed")
-                return
-            }
-            self.appendExtLog("error: memorypressure auto-recovery timed out waiting for drain/headroom; manual reconnect required")
+            guard ownsFailure,
+                  self.isRunning,
+                  SocksstubVKTurnRequired() else { return }
+            self.appendExtLog("warn: TURN recovery attempt=\(schedule.attempt + 1) failed; scheduling next backoff")
+            self.scheduleTURNPressureRecovery(reason: "retry-after-failure", immediate: false)
         }
         pressureRecoveryTask.withLock {
             $0?.cancel()
             $0 = task
+        }
+    }
+
+    private func finishTURNRecoverySuccess(tunnelGeneration: Int, transitionGeneration: Int) {
+        guard Self.turnTunnelGenerationLock.withLock({ $0 }) == tunnelGeneration else { return }
+        memoryPressureState.withLock { state in
+            guard state.transitionGeneration == transitionGeneration else { return }
+            state.recoveryScheduled = false
+            state.recoveryAttaching = false
+            state.recoveryAttemptIndex = 0
+            state.nextRetryAt = nil
+            state.runnerDeadSince = nil
+        }
+    }
+
+    private func sampleTURNLadderAndRecovery(availableMemory: UInt64, now: Date) {
+        guard isRunning else { return }
+        let turnRequired = SocksstubVKTurnRequired()
+        let runnerAlive = SocksstubTURNUpstreamRunning()
+        var watchdogImmediate = false
+        var upshiftTarget: Int?
+
+        memoryPressureState.withLock { state in
+            if !turnRequired {
+                state.headroomStableSince = nil
+                state.runnerDeadSince = nil
+                state.recoveryScheduled = false
+                state.recoveryAttaching = false
+                state.nextRetryAt = nil
+                return
+            }
+
+            if availableMemory >= Self.turnUpshiftHeadroomBytes,
+               now.timeIntervalSince(max(state.lastNuclearCloseAt, state.lastCriticalEventAt)) >= Self.turnUpshiftStableDuration {
+                if state.headroomStableSince == nil {
+                    state.headroomStableSince = now
+                }
+            } else {
+                state.headroomStableSince = nil
+            }
+
+            if runnerAlive {
+                state.runnerDeadSince = nil
+            } else if state.runnerDeadSince == nil {
+                state.runnerDeadSince = now
+            } else if now.timeIntervalSince(state.runnerDeadSince!) >= Self.turnRecoveryWatchdogDelay,
+                      !state.recoveryScheduled,
+                      !state.recoveryAttaching {
+                watchdogImmediate = true
+            }
+
+            let input = TURNPressureLadderDecisionState(
+                now: now.timeIntervalSinceReferenceDate,
+                pressureEvent: false,
+                pressureEpisodeCount: state.pressureEpisodeCount,
+                lastPressureAt: state.lastNuclearCloseAt == .distantPast
+                    ? nil
+                    : state.lastNuclearCloseAt.timeIntervalSinceReferenceDate,
+                currentWorkersPerRoom: state.currentWorkersPerRoom,
+                stepEnteredAt: state.stepEnteredAt.timeIntervalSinceReferenceDate,
+                headroomStableSince: state.headroomStableSince?.timeIntervalSinceReferenceDate,
+                recentUpshiftAt: state.recentUpshiftAt.map(\.timeIntervalSinceReferenceDate),
+                turnRequired: true,
+                runnerAlive: runnerAlive
+            )
+            if case let .upshift(workersPerRoom) = nextLadderAction(state: input),
+               !state.recoveryScheduled,
+               !state.recoveryAttaching {
+                upshiftTarget = workersPerRoom
+                // Reserve the transition before leaving the lock; another
+                // heartbeat cannot schedule the same upshift.
+                state.recoveryAttaching = true
+            }
+        }
+
+        if watchdogImmediate {
+            appendExtLog("warn: TURN recovery watchdog: runner dead >90s without scheduled recovery")
+            scheduleTURNPressureRecovery(reason: "watchdog", immediate: true)
+        }
+        if let upshiftTarget {
+            memoryPressureState.withLock { $0.recoveryAttaching = false }
+            appendExtLog("info: ladder headroom stable 28MiB/3m; scheduling upshift to \(upshiftTarget) workers/room")
+            scheduleLadderTransition(
+                workersPerRoom: upshiftTarget,
+                reason: "stable-headroom",
+                isUpshift: true
+            )
+        }
+    }
+
+    private func turnRecoveryStatus(now: Date = Date()) -> (state: String, nextRetryInSec: Int) {
+        memoryPressureState.withLock { state in
+            if state.recoveryScheduled {
+                let seconds = max(0, Int(ceil(state.nextRetryAt?.timeIntervalSince(now) ?? 0)))
+                return ("scheduled", seconds)
+            }
+            if state.recoveryAttaching {
+                return ("attaching", 0)
+            }
+            if state.currentWorkersPerRoom < 12 {
+                return ("degraded-\(state.currentWorkersPerRoom)", 0)
+            }
+            return ("idle", 0)
         }
     }
 
@@ -2338,6 +2586,7 @@ misc:
 
             // IPA-D7/D9: per-process memory backstop with heap dump.
             let availBytes = os_proc_available_memory()
+            self.sampleTURNLadderAndRecovery(availableMemory: availBytes, now: Date())
             var nuclearFired = false
             if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
                 nuclearFired = self.handleCriticalMemoryPressure(reason: "avail8mib")

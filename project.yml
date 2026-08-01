@@ -141,3 +141,17 @@ targets:
         SKIP_INSTALL: YES
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: NO
         SWIFT_OBJC_BRIDGING_HEADER: samizdat-tunnel/Bridging-Header.h
+
+  # Pure TURN pressure-ladder tests compile without an app host or gomobile
+  # dependency. The production state-machine source is shared directly so the
+  # tests exercise the exact function used by PacketTunnelProvider.
+  samizdat-tunnel-tests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: samizdat-tunnel-tests
+      - path: samizdat-tunnel/TURNMemoryPressureLadder.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.anarki.samizdat-test.tunnel-tests
+        GENERATE_INFOPLIST_FILE: YES

@@ -571,7 +571,7 @@ func TestVKTurnWorkersPerRoomForRooms(t *testing.T) {
 	}
 }
 
-func TestStartVKTurnMultiRoomUpstreamUniformWorkerGate(t *testing.T) {
+func TestStartVKTurnMultiRoomUpstreamPressureLadderWorkerGate(t *testing.T) {
 	fresh := time.Now().Unix()
 	rooms := make([]string, 6)
 	for i := range rooms {
@@ -582,11 +582,13 @@ func TestStartVKTurnMultiRoomUpstreamUniformWorkerGate(t *testing.T) {
 	oldRunning := vkturnRunning.Load()
 	vkturnRunning.Store(true)
 	t.Cleanup(func() { vkturnRunning.Store(oldRunning) })
-	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 12); got != "already running" {
-		t.Fatalf("6x12 did not pass uniform gate: %q", got)
+	for _, workers := range []int{6, 8, 12} {
+		if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, workers); got != "already running" {
+			t.Fatalf("6x%d did not pass pressure-ladder gate: %q", workers, got)
+		}
 	}
-	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 20); !strings.Contains(got, "workersPerRoom must be 12") {
-		t.Fatalf("6x20 gate error=%q, want uniform-worker rejection", got)
+	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 20); !strings.Contains(got, "workersPerRoom must be one of 6, 8, 12") {
+		t.Fatalf("6x20 gate error=%q, want allowed-set rejection", got)
 	}
 }
 
