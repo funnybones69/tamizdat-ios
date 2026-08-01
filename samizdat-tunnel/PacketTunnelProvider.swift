@@ -38,7 +38,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         var lastCriticalEventAt = Date.distantPast
         var didDumpHeap = false
         var pressureEpisodeCount = 0
-        var currentWorkersPerRoom = 12
+        var currentWorkersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: max(1, VKCredsPreferences.roomHashes.count))
         var stepEnteredAt = Date()
         var headroomStableSince: Date?
         var recentUpshiftAt: [Date] = []
@@ -523,10 +523,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let generation = SocksstubTURNUpstreamGeneration()
         ExtLog.info("[vkturn] runner OK generation=\(generation), polling for WG config + netstack (up to 60 s)")
-        memoryPressureState.withLock {
-            $0.currentWorkersPerRoom = workersPerRoom
-            $0.stepEnteredAt = Date()
-        }
+        // NOTE: no memoryPressureState write here — this func is static.
+        // state.currentWorkersPerRoom defaults to the adaptive profile and is
+        // maintained by the instance-side ladder/recovery paths, which also
+        // pass workersPerRoomOverride on re-attach, so belief and runner
+        // stay in sync without touching the lock from a type context.
 
         Task.detached(priority: .utility) {
             ExtLog.info("[vkturn] async polling task started generation=\(generation)")
