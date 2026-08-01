@@ -2623,7 +2623,7 @@ misc:
             // iOS's apple-supplied "available before jetsam" gauge. Use the
             // same sample for pressure decisions and the periodic log.
             let availKB = availBytes / 1024
-            self.sampleTURNLadderAndRecovery(availableMemory: availBytes, now: Date())
+            self.sampleTURNLadderAndRecovery(availableMemory: UInt64(max(0, availBytes)), now: Date())
             var nuclearFired = false
             if availBytes > 0 && availBytes < 8 * 1024 * 1024 {
                 nuclearFired = self.handleCriticalMemoryPressure(reason: "avail8mib")
