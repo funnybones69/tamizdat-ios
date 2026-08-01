@@ -562,8 +562,8 @@ func TestVKTurnWorkersPerRoomForRooms(t *testing.T) {
 		{rooms: 1, want: 16},
 		{rooms: 3, want: 16},
 		{rooms: 4, want: 16},
-		{rooms: 5, want: 12},
-		{rooms: 6, want: 12},
+		{rooms: 5, want: 18},
+		{rooms: 6, want: 18},
 		{rooms: 7, want: 0},
 	} {
 		if got := VKTurnWorkersPerRoomForRooms(tc.rooms); got != tc.want {
@@ -583,12 +583,12 @@ func TestStartVKTurnMultiRoomUpstreamPressureLadderWorkerGate(t *testing.T) {
 	oldRunning := vkturnRunning.Load()
 	vkturnRunning.Store(true)
 	t.Cleanup(func() { vkturnRunning.Store(oldRunning) })
-	for _, workers := range []int{6, 8, 12, 16} {
+	for _, workers := range []int{6, 8, 12, 16, 18} {
 		if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, workers); got != "already running" {
 			t.Fatalf("6x%d did not pass pressure-ladder gate: %q", workers, got)
 		}
 	}
-	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 20); !strings.Contains(got, "workersPerRoom must be one of 6, 8, 12, 16") {
+	if got := StartVKTurnMultiRoomUpstream(bundle, "127.0.0.1:443", "password", "device", 9000, 20); !strings.Contains(got, "workersPerRoom must be one of 6, 8, 12, 16, 18") {
 		t.Fatalf("6x20 gate error=%q, want allowed-set rejection", got)
 	}
 }

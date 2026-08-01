@@ -149,14 +149,16 @@ const vkturnIOSDeviceMaxRooms = 6
 // under VK's hard quota of 20 per credential generation — server long runs
 // show ~zero organic worker deaths, and mass re-allocation events route to
 // fresh credentials anyway, so four slots of slack suffice); five and six
-// rooms get 12 so the aggregate stays within the 72-worker socket/queue
-// budgets (4x16=64, 6x12=72).
+// rooms get 18 (build 347, up from 12): field logs on 6x12 showed every
+// allocation pinned at VK's ~64 Kbit/s per-allocation cap, so the only
+// remaining lever is more allocations. 18 leaves two slots of slack for
+// respawns; memory: 108 workers x 2 x 24 KiB socket buffers ~= 5.2 MiB.
 func VKTurnWorkersPerRoomForRooms(rooms int) int {
 	switch {
 	case rooms >= 1 && rooms <= 4:
 		return 16
 	case rooms >= 5 && rooms <= vkturnIOSDeviceMaxRooms:
-		return 12
+		return 18
 	default:
 		return 0
 	}
@@ -210,8 +212,8 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 	if err != nil {
 		return "roomCredsJSON: " + err.Error()
 	}
-	if workersPerRoom != 6 && workersPerRoom != 8 && workersPerRoom != 12 && workersPerRoom != 16 {
-		return fmt.Sprintf("workersPerRoom must be one of 6, 8, 12, 16 for %d rooms", len(hashes))
+	if workersPerRoom != 6 && workersPerRoom != 8 && workersPerRoom != 12 && workersPerRoom != 16 && workersPerRoom != 18 {
+		return fmt.Sprintf("workersPerRoom must be one of 6, 8, 12, 16, 18 for %d rooms", len(hashes))
 	}
 	maxRooms := VKTurnMaxRooms()
 	if len(hashes) > maxRooms {

@@ -29,8 +29,11 @@ const (
 	// iOS Network Extensions have a tight process + kernel memory budget.
 	// Keep aggregate guards for room admission and Go queues. Per-worker TURN
 	// sockets use the explicit fixed workerSocketBufferSize from cadence.go.
-	multiRoomSocketBudget = 4 * 1024 * 1024
-	multiRoomQueueBudget  = 512 * 1024
+	// Build 347: raised for 6x18=108 workers (was sized for 72): sockets
+	// 108x48 KiB = 5.06 MiB, queues 108x6.25 KiB = 0.66 MiB live worst case;
+	// still far under the 22 MiB Go limit with the pressure ladder armed.
+	multiRoomSocketBudget = 6 * 1024 * 1024
+	multiRoomQueueBudget  = 768 * 1024
 	minWorkerSendBuf      = 4
 	// Pion Client.Listen allocates math.MaxUint16 bytes per client. Our TURN
 	// channel carries DTLS records for <=2 KiB overlay frames, so a 4 KiB

@@ -83,21 +83,21 @@ func TestSessionMemoryProfileFixedSocketBuffersAndQueueBudgets(t *testing.T) {
 
 	// Beyond-admission worker counts keep the fixed socket size; the socket
 	// budget is enforced by MaxBudgetedRooms admission, not by shrinking.
-	scaled := memoryProfileForWorkers(120, true)
+	scaled := memoryProfileForWorkers(160, true)
 	if scaled.socketBufferSize != workerSocketBufferSize {
 		t.Fatalf("scaled socket=%d, want fixed %d", scaled.socketBufferSize, workerSocketBufferSize)
 	}
 	if scaled.workerSendBuffer != minWorkerSendBuf {
 		t.Fatalf("scaled queue=%d, want floor %d", scaled.workerSendBuffer, minWorkerSendBuf)
 	}
-	if got := 120 * scaled.workerSendBuffer * readBufSize; got <= multiRoomQueueBudget {
+	if got := 160 * scaled.workerSendBuffer * readBufSize; got <= multiRoomQueueBudget {
 		t.Fatalf("scaled queue memory=%d unexpectedly fits four-room budget=%d", got, multiRoomQueueBudget)
 	}
 }
 
 func TestMaxBudgetedRoomsHonorsPerWorkerFloors(t *testing.T) {
-	if got := MaxBudgetedRooms(20); got != 4 {
-		t.Fatalf("MaxBudgetedRooms(20)=%d, want 4", got)
+	if got := MaxBudgetedRooms(20); got != 6 {
+		t.Fatalf("MaxBudgetedRooms(20)=%d, want 6", got)
 	}
 	maxWorkers := MaxBudgetedRooms(20) * 20
 	maxProfile := memoryProfileForWorkers(maxWorkers, true)
