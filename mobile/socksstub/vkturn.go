@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1010,12 +1011,36 @@ func storeVKTurnTelemetryIfCurrent(runner *wgturnclient.Runner, snapshot wgturnc
 	}
 
 	if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
-		rt.appendLog(fmt.Sprintf("info: vkturn bond telemetry active=%d frames_up=%d frames_down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps_down=%d reorder_late_down=%d room_up_bytes=%v room_down_bytes=%v room_drops=%v",
+		rt.appendLog(fmt.Sprintf("info: vkturn bond telemetry active=%d frames_up=%d frames_down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps_down=%d reorder_late_down=%d room_up_bytes=%v room_down_bytes=%v room_drops=%v worker_up=%v worker_down=%v ep_down=%s",
 			snapshot.ActiveConnections, snapshot.BondFramesUp, snapshot.BondFramesDown,
 			snapshot.BondBytesUp, snapshot.BondBytesDown, snapshot.BondQueueDrops, snapshot.BondShaperDrops,
 			snapshot.BondReorderGaps, snapshot.BondReorderLate,
-			snapshot.RoomUpBytes, snapshot.RoomDownBytes, snapshot.RoomDrops))
+			snapshot.RoomUpBytes, snapshot.RoomDownBytes, snapshot.RoomDrops,
+			snapshot.WorkerUpBytes, snapshot.WorkerDownBytes, formatVKTurnEndpointBytes(snapshot.EndpointDownBytes)))
 	}
+}
+
+// formatVKTurnEndpointBytes renders per-TURN-server down bytes with sorted
+// keys so successive telemetry lines are diff-stable (diag 345).
+func formatVKTurnEndpointBytes(m map[string]int64) string {
+	if len(m) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%s:%d", k, m[k])
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 func storeVKTurnStats(active int, running bool) {
