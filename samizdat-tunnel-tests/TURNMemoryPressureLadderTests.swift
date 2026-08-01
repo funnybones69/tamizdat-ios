@@ -12,7 +12,8 @@ final class TURNMemoryPressureLadderTests: XCTestCase {
         headroomStableSince: TimeInterval? = nil,
         upshifts: [TimeInterval] = [],
         required: Bool = true,
-        runnerAlive: Bool = true
+        runnerAlive: Bool = true,
+        profile: Int = 12
     ) -> TURNPressureLadderDecisionState {
         TURNPressureLadderDecisionState(
             now: now,
@@ -24,7 +25,8 @@ final class TURNMemoryPressureLadderTests: XCTestCase {
             headroomStableSince: headroomStableSince,
             recentUpshiftAt: upshifts,
             turnRequired: required,
-            runnerAlive: runnerAlive
+            runnerAlive: runnerAlive,
+            profileWorkersPerRoom: profile
         )
     }
 
@@ -78,6 +80,34 @@ final class TURNMemoryPressureLadderTests: XCTestCase {
 
         ready.currentWorkersPerRoom = 8
         XCTAssertEqual(nextLadderAction(state: ready), .upshift(workersPerRoom: 12))
+    }
+
+    func testUpshiftTopsOutAtSixteenWorkerProfile() {
+        var ready = state(
+            now: 1_000,
+            pressureEvent: false,
+            episodes: 2,
+            lastPressureAt: 700,
+            workers: 16,
+            stepEnteredAt: 700,
+            headroomStableSince: 700,
+            profile: 16
+        )
+        // Already at the profile ceiling: no upshift.
+        XCTAssertEqual(nextLadderAction(state: ready), .none)
+
+        // From a downshifted step the ladder returns to the 16 profile,
+        // skipping 12.
+        ready.currentWorkersPerRoom = 8
+        XCTAssertEqual(nextLadderAction(state: ready), .upshift(workersPerRoom: 16))
+        ready.currentWorkersPerRoom = 6
+        XCTAssertEqual(nextLadderAction(state: ready), .upshift(workersPerRoom: 8))
+
+        // Pressure on the 16-worker profile downshifts straight to 8.
+        XCTAssertEqual(
+            nextLadderAction(state: state(episodes: 1, lastPressureAt: 900, workers: 16, profile: 16)),
+            .downshift(workersPerRoom: 8)
+        )
     }
 
     func testUpshiftHysteresisBlocksRecentPressureAndShortDwell() {

@@ -144,9 +144,10 @@ const (
 	// More sessions cannot obtain a target while all target slots are occupied.
 	fwdUDPGlobalMaxSessions = fwdUDPGlobalMaxEntries
 	// Preserve more app-flow concurrency for smaller TURN pools, but trade part
-	// of it for worker/socket headroom as rooms are added. Room count is derived
-	// from the uniform 12-worker connection profile, never from the legacy
-	// vkturnWorkersPerRoom constant used by the independent SOCKS-flow budget.
+	// of it for worker/socket headroom as rooms are added. Room count is tracked
+	// physically at runner start (vkturnActiveRooms), never derived from worker
+	// counts or the legacy vkturnWorkersPerRoom constant used by the independent
+	// SOCKS-flow budget.
 	// The same values bound reverse buffers, outer HEV sessions, loopback
 	// sockets, goroutines and sweep tickers.
 	fwdUDPFourPlusRoomLimit = 24
@@ -195,17 +196,19 @@ var (
 )
 
 func currentFwdUDPGlobalLimit() int {
-	// Expected worker count intentionally survives parts of runner teardown for
-	// status diagnostics. Do not let that stale TURN value throttle ordinary H2
-	// traffic after the policy gate has been reopened.
+	// Physical room count is tracked at runner start (vkturnActiveRooms) and
+	// intentionally survives parts of runner teardown for status diagnostics,
+	// just like the expected worker count. Do not let that stale TURN value
+	// throttle ordinary H2 traffic after the policy gate has been reopened.
+	// Deriving rooms from expected workers would lie on pressure-ladder
+	// downshift steps (8/6 workers per room) and on the 16-worker profile.
 	if !vkturnRequired.Load() {
 		return fwdUDPGlobalMaxEntries
 	}
-	expected := vkturnExpectedWorkers.Load()
-	if expected <= 0 {
+	rooms := vkturnActiveRooms.Load()
+	if rooms <= 0 {
 		return fwdUDPGlobalMaxEntries
 	}
-	rooms := expected / 12
 	if rooms >= 4 {
 		return fwdUDPFourPlusRoomLimit
 	}

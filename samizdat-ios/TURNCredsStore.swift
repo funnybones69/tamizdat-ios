@@ -592,8 +592,8 @@ enum VKCredsPreferences {
     }
 
     // Runtime pressure downshifts (8/6) are intentionally not persisted. Old
-    // saved 20-worker values normalize to the uniform 12-worker connect profile.
-    static var allowedWorkers: [Int] { [12] }
+    // saved 20-worker values normalize to the adaptive connect profile default.
+    static var allowedWorkers: [Int] { [12, 16] }
     static func normalizeWorkers(_ raw: Int) -> Int {
         allowedWorkers.contains(raw) ? raw : workersPerRoom
     }

@@ -21,8 +21,10 @@ func resetFwdUDPBudgetForTest(t *testing.T) {
 		t.Fatalf("global FWD_UDP session budget is dirty before test: %d", got)
 	}
 	oldExpectedWorkers := vkturnExpectedWorkers.Load()
+	oldActiveRooms := vkturnActiveRooms.Load()
 	oldRequired := vkturnRequired.Load()
 	vkturnExpectedWorkers.Store(0)
+	vkturnActiveRooms.Store(0)
 	vkturnRequired.Store(false)
 	rt = &runtimeState{logsMax: 100}
 	fwdUDPBudgetLogAt.Store(0)
@@ -41,6 +43,7 @@ func resetFwdUDPBudgetForTest(t *testing.T) {
 			releaseFwdUDPGlobalSession()
 		}
 		vkturnExpectedWorkers.Store(oldExpectedWorkers)
+		vkturnActiveRooms.Store(oldActiveRooms)
 		vkturnRequired.Store(oldRequired)
 	})
 }
@@ -172,36 +175,46 @@ func TestFwdUDPGlobalEntryBudget(t *testing.T) {
 	}
 }
 
-func TestFwdUDPAdaptiveBudgetShrinksAsTURNWorkerPoolGrows(t *testing.T) {
+func TestFwdUDPAdaptiveBudgetShrinksAsTURNRoomCountGrows(t *testing.T) {
 	resetFwdUDPBudgetForTest(t)
 	vkturnRequired.Store(true)
 
 	cases := []struct {
-		workers int64
-		want    int
+		rooms int64
+		want  int
 	}{
-		{workers: 0, want: 64},
-		{workers: 11, want: 64},
-		{workers: 12, want: 64},
-		{workers: 24, want: 48},
-		{workers: 36, want: 32},
-		{workers: 48, want: 24},
-		{workers: 72, want: 24},
+		{rooms: 0, want: 64},
+		{rooms: 1, want: 64},
+		{rooms: 2, want: 48},
+		{rooms: 3, want: 32},
+		{rooms: 4, want: 24},
+		{rooms: 6, want: 24},
 	}
 	for _, tc := range cases {
-		vkturnExpectedWorkers.Store(tc.workers)
+		vkturnActiveRooms.Store(tc.rooms)
 		if got := currentFwdUDPGlobalLimit(); got != tc.want {
-			t.Fatalf("workers=%d limit=%d, want %d", tc.workers, got, tc.want)
+			t.Fatalf("rooms=%d limit=%d, want %d", tc.rooms, got, tc.want)
 		}
 	}
+	// Worker-count derivation must NOT leak into the budget: a downshifted
+	// ladder step (6/8 workers per room) or the 16-worker profile keeps the
+	// physical room budget.
+	vkturnActiveRooms.Store(3)
+	vkturnExpectedWorkers.Store(18)
+	if got := currentFwdUDPGlobalLimit(); got != 32 {
+		t.Fatalf("downshifted three-room limit=%d, want 32", got)
+	}
+	vkturnExpectedWorkers.Store(48)
+	if got := currentFwdUDPGlobalLimit(); got != 32 {
+		t.Fatalf("16-worker three-room limit=%d, want 32", got)
+	}
 	vkturnRequired.Store(false)
-	vkturnExpectedWorkers.Store(72)
+	vkturnActiveRooms.Store(6)
 	if got := currentFwdUDPGlobalLimit(); got != fwdUDPGlobalMaxEntries {
-		t.Fatalf("H2 with stale expected workers limit=%d, want %d", got, fwdUDPGlobalMaxEntries)
+		t.Fatalf("H2 with stale room count limit=%d, want %d", got, fwdUDPGlobalMaxEntries)
 	}
 
 	vkturnRequired.Store(true)
-	vkturnExpectedWorkers.Store(72)
 	for i := 0; i < currentFwdUDPGlobalLimit(); i++ {
 		if !tryAcquireFwdUDPGlobalSession() {
 			t.Fatalf("six-room session slot %d rejected before adaptive cap", i)
@@ -533,7 +546,7 @@ func TestFwdUDPGlobalSessionBudgetRejectsBeforeAllocatingTargetResources(t *test
 func TestFwdUDPAdaptiveFourRoomSessionCapRejectsBeforeDial(t *testing.T) {
 	resetFwdUDPBudgetForTest(t)
 	vkturnRequired.Store(true)
-	vkturnExpectedWorkers.Store(48)
+	vkturnActiveRooms.Store(4)
 	limit := currentFwdUDPGlobalLimit()
 	if limit != 24 {
 		t.Fatalf("four-room adaptive limit=%d, want 24", limit)

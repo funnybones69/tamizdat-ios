@@ -523,6 +523,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let generation = SocksstubTURNUpstreamGeneration()
         ExtLog.info("[vkturn] runner OK generation=\(generation), polling for WG config + netstack (up to 60 s)")
+        memoryPressureState.withLock {
+            $0.currentWorkersPerRoom = workersPerRoom
+            $0.stepEnteredAt = Date()
+        }
 
         Task.detached(priority: .utility) {
             ExtLog.info("[vkturn] async polling task started generation=\(generation)")
@@ -1390,8 +1394,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             SocksstubSetVKTurnRequired(true)
             SocksstubStopVKTurnUpstream()
+            let profileWorkersPerRoom = VKCredsPreferences.workersPerRoom(forRooms: max(1, VKCredsPreferences.roomHashes.count))
             memoryPressureState.withLock {
-                $0.currentWorkersPerRoom = 12
+                $0.currentWorkersPerRoom = profileWorkersPerRoom
                 $0.stepEnteredAt = Date()
                 $0.headroomStableSince = nil
                 $0.recentUpshiftAt = []
@@ -2035,7 +2040,8 @@ misc:
                 headroomStableSince: state.headroomStableSince?.timeIntervalSinceReferenceDate,
                 recentUpshiftAt: state.recentUpshiftAt.map(\.timeIntervalSinceReferenceDate),
                 turnRequired: true,
-                runnerAlive: SocksstubTURNUpstreamRunning()
+                runnerAlive: SocksstubTURNUpstreamRunning(),
+                profileWorkersPerRoom: VKCredsPreferences.workersPerRoom(forRooms: max(1, VKCredsPreferences.roomHashes.count))
             )
             let episode = nextPressureEpisode(state: input)
             let action = nextLadderAction(state: input)
@@ -2506,7 +2512,8 @@ misc:
                 headroomStableSince: state.headroomStableSince?.timeIntervalSinceReferenceDate,
                 recentUpshiftAt: state.recentUpshiftAt.map(\.timeIntervalSinceReferenceDate),
                 turnRequired: true,
-                runnerAlive: runnerAlive
+                runnerAlive: runnerAlive,
+                profileWorkersPerRoom: VKCredsPreferences.workersPerRoom(forRooms: max(1, VKCredsPreferences.roomHashes.count))
             )
             if case let .upshift(workersPerRoom) = nextLadderAction(state: input),
                !state.recoveryScheduled,
@@ -2542,7 +2549,7 @@ misc:
             if state.recoveryAttaching {
                 return ("attaching", 0)
             }
-            if state.currentWorkersPerRoom < 12 {
+            if state.currentWorkersPerRoom < VKCredsPreferences.workersPerRoom(forRooms: max(1, VKCredsPreferences.roomHashes.count)) {
                 return ("degraded-\(state.currentWorkersPerRoom)", 0)
             }
             return ("idle", 0)

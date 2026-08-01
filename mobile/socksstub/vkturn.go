@@ -43,6 +43,7 @@ var (
 	vkturnRequired         atomic.Bool
 	vkturnActiveWorkers    atomic.Int64
 	vkturnExpectedWorkers  atomic.Int64
+	vkturnActiveRooms      atomic.Int64
 	vkturnGeneration       atomic.Int64
 	vkturnRestartNotBefore atomic.Int64
 	vkturnRunDone          <-chan struct{}
@@ -142,25 +143,31 @@ func VKTurnRequired() bool { return vkturnRequired.Load() }
 
 const vkturnIOSDeviceMaxRooms = 6
 
-// VKTurnWorkersPerRoomForRooms is the uniform iOS connection profile. Every
-// accepted room gets 12 workers, independent of the configured room count.
-// Besides making room bundles and status denominators predictable, 12 leaves
-// eight spare allocations under VK's hard quota of 20 per credential
-// generation; the former 20-worker profile left no room for reallocation.
+// VKTurnWorkersPerRoomForRooms is the memory-budget-derived adaptive iOS
+// profile. One to four rooms get 16 workers each (four spare allocations
+// under VK's hard quota of 20 per credential generation — server long runs
+// show ~zero organic worker deaths, and mass re-allocation events route to
+// fresh credentials anyway, so four slots of slack suffice); five and six
+// rooms get 12 so the aggregate stays within the 72-worker socket/queue
+// budgets (4x16=64, 6x12=72).
 func VKTurnWorkersPerRoomForRooms(rooms int) int {
-	if rooms >= 1 && rooms <= vkturnIOSDeviceMaxRooms {
+	switch {
+	case rooms >= 1 && rooms <= 4:
+		return 16
+	case rooms >= 5 && rooms <= vkturnIOSDeviceMaxRooms:
 		return 12
+	default:
+		return 0
 	}
-	return 0
 }
 
 // VKTurnMaxRooms exposes the iOS-only room limit to Swift so Settings, App
 // Group storage and the gomobile data-plane gate cannot drift. The generic
 // wgturn protocol remains dynamic; this stricter ceiling is a Network Extension
-// resource gate. The uniform profile uses 12 workers per room for all one to
-// six-room configurations. Its 72-worker ceiling remains within the aggregate
-// socket/queue budgets. Raising the ceiling above six still requires a
-// physical-device soak.
+// resource gate. The adaptive profile uses 16 workers per room for up to four
+// rooms and 12 workers per room for five and six rooms. Its 72-worker
+// ceiling remains within the aggregate socket/queue budgets. Raising the
+// ceiling above six still requires a physical-device soak.
 func VKTurnMaxRooms() int {
 	budgeted := wgturnclient.MaxBudgetedRooms(VKTurnWorkersPerRoomForRooms(vkturnIOSDeviceMaxRooms))
 	if budgeted < vkturnIOSDeviceMaxRooms {
@@ -202,8 +209,8 @@ func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword
 	if err != nil {
 		return "roomCredsJSON: " + err.Error()
 	}
-	if workersPerRoom != 6 && workersPerRoom != 8 && workersPerRoom != 12 {
-		return fmt.Sprintf("workersPerRoom must be one of 6, 8, 12 for %d rooms", len(hashes))
+	if workersPerRoom != 6 && workersPerRoom != 8 && workersPerRoom != 12 && workersPerRoom != 16 {
+		return fmt.Sprintf("workersPerRoom must be one of 6, 8, 12, 16 for %d rooms", len(hashes))
 	}
 	maxRooms := VKTurnMaxRooms()
 	if len(hashes) > maxRooms {
@@ -235,6 +242,7 @@ func startVKTurnRunner(peerAddr, wgPassword, deviceID string, listenPort, worker
 
 	resetVKTurnAtomicsLocked()
 	vkturnExpectedWorkers.Store(int64(workers))
+	vkturnActiveRooms.Store(int64(maxInt(1, len(hashes))))
 	attachOnce := &sync.Once{}
 	firstCreds := singleCreds
 	if firstCreds == nil && len(hashes) > 0 {

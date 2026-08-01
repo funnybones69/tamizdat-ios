@@ -36,7 +36,7 @@ struct SettingsView: View {
     @State private var pingURLDraft: String = PingURLPreferences.url
 
     // One VK invite per line, up to the resource-derived iOS limit. Each room automatically gets
-    // the uniform pool size of 12 workers; peer/password still derive from Main.
+    // the adaptive pool size (16 workers for up to four rooms, 12 for five or six); peer/password still derive from Main.
     @State private var vkRoomsDraft: String = VKCredsPreferences.roomHashes.joined(separator: "\n")
     @State private var vkCallHashFeedback: String = VKCredsPreferences.consumeRoomLimitResetNotice()
         ? "Старые настройки свыше \(VKCredsPreferences.maxRooms) комнат сброшены для защиты памяти. Добавьте комнаты заново и сохраните."

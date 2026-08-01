@@ -22,6 +22,10 @@ struct TURNPressureLadderDecisionState: Equatable {
     var recentUpshiftAt: [TimeInterval]
     var turnRequired: Bool
     var runnerAlive: Bool
+    /// Connection profile default for the active room count (16 for one to
+    /// four rooms, 12 for five or six). Upshift tops out here, not at a
+    /// hardcoded value.
+    var profileWorkersPerRoom: Int
 }
 
 private let turnPressureEpisodeWindow: TimeInterval = 10 * 60
@@ -74,5 +78,7 @@ func nextLadderAction(state: TURNPressureLadderDecisionState) -> TURNPressureLad
     }
     guard recentUpshifts.count < turnUpshiftHourlyLimit else { return .none }
 
-    return .upshift(workersPerRoom: state.currentWorkersPerRoom == 6 ? 8 : 12)
+    let upshiftTarget = state.currentWorkersPerRoom == 6 ? 8 : state.profileWorkersPerRoom
+    guard upshiftTarget > state.currentWorkersPerRoom else { return .none }
+    return .upshift(workersPerRoom: upshiftTarget)
 }
