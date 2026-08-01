@@ -54,9 +54,11 @@ const (
 	// IPA-D25 fix7: dynamic cadence. When the iOS main app is in the
 	// foreground (signalled by its 500ms status-RPC heartbeat), probe
 	// every 3s so the UI feels live. When backgrounded (no heartbeat
-	// for >5s), drop to 30s for battery — user can't see it anyway.
+	// for >5s), drop to 90s for battery — user can't see it anyway.
+	// 90s keeps radio wakes rare overnight while staying far below any
+	// upstream idle timeout that matters for detection freshness.
 	pingProbeIntervalFG  = 3 * time.Second
-	pingProbeIntervalBG  = 30 * time.Second
+	pingProbeIntervalBG  = 90 * time.Second
 	foregroundStaleAfter = 5 * time.Second
 	// IPA-D28 fix: steady-state back to 3s per operator request — TLS
 	// to upstream is already established at this point, so probes only
