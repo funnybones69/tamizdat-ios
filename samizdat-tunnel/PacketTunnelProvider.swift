@@ -2468,18 +2468,20 @@ misc:
         guard isRunning else { return }
         let turnRequired = SocksstubVKTurnRequired()
         let runnerAlive = SocksstubTURNUpstreamRunning()
-        var watchdogImmediate = false
-        var upshiftTarget: Int?
-
-        memoryPressureState.withLock { state in
+        let (watchdogImmediate, upshiftTarget): (Bool, Int?) = memoryPressureState.withLock { state in
             if !turnRequired {
                 state.headroomStableSince = nil
                 state.runnerDeadSince = nil
                 state.recoveryScheduled = false
                 state.recoveryAttaching = false
                 state.nextRetryAt = nil
-                return
+                return (false, nil)
             }
+            // Local accumulators returned out of the lock: Swift 6 forbids
+            // mutating captured vars inside this concurrently-executing
+            // closure.
+            var watchdogImmediate = false
+            var upshiftTarget: Int?
 
             if availableMemory >= Self.turnUpshiftHeadroomBytes,
                now.timeIntervalSince(max(state.lastNuclearCloseAt, state.lastCriticalEventAt)) >= Self.turnUpshiftStableDuration {
@@ -2523,6 +2525,7 @@ misc:
                 // heartbeat cannot schedule the same upshift.
                 state.recoveryAttaching = true
             }
+            return (watchdogImmediate, upshiftTarget)
         }
 
         if watchdogImmediate {
