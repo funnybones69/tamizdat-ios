@@ -29,6 +29,8 @@ func resetFwdUDPBudgetForTest(t *testing.T) {
 	fwdUDPBudgetDrops.Store(0)
 	fwdUDPSessionBudgetLogAt.Store(0)
 	fwdUDPSessionBudgetDrops.Store(0)
+	fwdUDPSessionReapLogAt.Store(0)
+	fwdUDPSessionsReapedIdle.Store(0)
 	vkturnPendingLogAt.Store(0)
 	vkturnPendingDrops.Store(0)
 	t.Cleanup(func() {
@@ -179,12 +181,12 @@ func TestFwdUDPAdaptiveBudgetShrinksAsTURNWorkerPoolGrows(t *testing.T) {
 		want    int
 	}{
 		{workers: 0, want: 64},
-		{workers: 20, want: 64},
-		{workers: 40, want: 48},
+		{workers: 11, want: 64},
+		{workers: 12, want: 64},
+		{workers: 24, want: 48},
+		{workers: 36, want: 32},
 		{workers: 48, want: 24},
-		{workers: 60, want: 24},
 		{workers: 72, want: 24},
-		{workers: 80, want: 16},
 	}
 	for _, tc := range cases {
 		vkturnExpectedWorkers.Store(tc.workers)
@@ -193,26 +195,26 @@ func TestFwdUDPAdaptiveBudgetShrinksAsTURNWorkerPoolGrows(t *testing.T) {
 		}
 	}
 	vkturnRequired.Store(false)
-	vkturnExpectedWorkers.Store(80)
+	vkturnExpectedWorkers.Store(72)
 	if got := currentFwdUDPGlobalLimit(); got != fwdUDPGlobalMaxEntries {
 		t.Fatalf("H2 with stale expected workers limit=%d, want %d", got, fwdUDPGlobalMaxEntries)
 	}
 
 	vkturnRequired.Store(true)
-	vkturnExpectedWorkers.Store(80)
+	vkturnExpectedWorkers.Store(72)
 	for i := 0; i < currentFwdUDPGlobalLimit(); i++ {
 		if !tryAcquireFwdUDPGlobalSession() {
-			t.Fatalf("80-worker session slot %d rejected before adaptive cap", i)
+			t.Fatalf("six-room session slot %d rejected before adaptive cap", i)
 		}
 		if !tryAcquireFwdUDPGlobalEntry() {
-			t.Fatalf("80-worker target slot %d rejected before adaptive cap", i)
+			t.Fatalf("six-room target slot %d rejected before adaptive cap", i)
 		}
 	}
 	if tryAcquireFwdUDPGlobalSession() {
-		t.Fatal("80-worker session above adaptive cap was accepted")
+		t.Fatal("six-room session above adaptive cap was accepted")
 	}
 	if tryAcquireFwdUDPGlobalEntry() {
-		t.Fatal("80-worker target above adaptive cap was accepted")
+		t.Fatal("six-room target above adaptive cap was accepted")
 	}
 }
 
@@ -265,6 +267,78 @@ func TestFwdUDPGlobalBudgetReleasesOnIdleSweep(t *testing.T) {
 	waitFwdUDPBudgetLen(t, 1)
 	waitAtomicAtLeast(t, &closes, 1)
 	waitFwdUDPBudgetLen(t, 0)
+	closeFwdUDPTestSession(t, client, done)
+}
+
+func TestFwdUDPIdleSessionReaperClosesSessionAndReleasesSlot(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	oldSessionIdle, oldSweep := fwdUDPSessionIdleTimeout, fwdUDPSweepInterval
+	fwdUDPSessionIdleTimeout = 10 * time.Millisecond
+	fwdUDPSweepInterval = 2 * time.Millisecond
+	defer func() {
+		fwdUDPSessionIdleTimeout = oldSessionIdle
+		fwdUDPSweepInterval = oldSweep
+	}()
+
+	client, done := startFwdUDPTestSession(t, 33, func(context.Context, string) (net.PacketConn, error) {
+		t.Fatal("an idle outer session must be reaped before target dial")
+		return nil, errors.New("unexpected dial")
+	})
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("idle FWD_UDP outer session was not reaped")
+	}
+	_ = client.Close()
+	if got := len(fwdUDPGlobalSessionSlots); got != 0 {
+		t.Fatalf("idle-reaped session leaked slot=%d", got)
+	}
+	if got := fwdUDPSessionsReapedIdle.Load(); got != 1 {
+		t.Fatalf("idle-reaped counter=%d, want 1", got)
+	}
+}
+
+func TestFwdUDPFullBudgetReapsIdleSessionBeforeRejectingNewOne(t *testing.T) {
+	resetFwdUDPBudgetForTest(t)
+	oldSessionIdle := fwdUDPSessionIdleTimeout
+	fwdUDPSessionIdleTimeout = 10 * time.Millisecond
+	defer func() { fwdUDPSessionIdleTimeout = oldSessionIdle }()
+
+	idleServer, idleClient := net.Pipe()
+	idleState := newFwdUDPSessionState(idleServer, time.Now().Add(-time.Second))
+	if !tryAcquireFwdUDPGlobalSession(idleState) {
+		t.Fatal("failed to reserve idle session fixture")
+	}
+	defer idleClient.Close()
+	for i := 1; i < fwdUDPGlobalMaxSessions; i++ {
+		if !tryAcquireFwdUDPGlobalSession() {
+			t.Fatalf("raw session fixture %d rejected before full budget", i)
+		}
+	}
+
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		handleFwdUDPWithDial(context.Background(), server, 34, func(context.Context, string) (net.PacketConn, error) {
+			t.Error("newly admitted idle session test must not dial")
+			return nil, errors.New("unexpected dial")
+		})
+		_ = server.Close()
+		close(done)
+	}()
+	reply := make([]byte, 10)
+	if _, err := io.ReadFull(client, reply); err != nil {
+		t.Fatalf("read post-reap admission reply: %v", err)
+	}
+	if reply[1] != socksReplySuccess {
+		t.Fatalf("post-reap admission reply=%v, want success", reply)
+	}
+	if got := fwdUDPSessionsReapedIdle.Load(); got != 1 {
+		t.Fatalf("idle-reaped counter=%d, want 1", got)
+	}
+	if got := fwdUDPSessionBudgetDrops.Load(); got != 0 {
+		t.Fatalf("post-reap admission counted drops=%d, want 0", got)
+	}
 	closeFwdUDPTestSession(t, client, done)
 }
 
@@ -459,10 +533,10 @@ func TestFwdUDPGlobalSessionBudgetRejectsBeforeAllocatingTargetResources(t *test
 func TestFwdUDPAdaptiveFourRoomSessionCapRejectsBeforeDial(t *testing.T) {
 	resetFwdUDPBudgetForTest(t)
 	vkturnRequired.Store(true)
-	vkturnExpectedWorkers.Store(80)
+	vkturnExpectedWorkers.Store(48)
 	limit := currentFwdUDPGlobalLimit()
-	if limit != 16 {
-		t.Fatalf("four-room adaptive limit=%d, want 16", limit)
+	if limit != 24 {
+		t.Fatalf("four-room adaptive limit=%d, want 24", limit)
 	}
 	for i := 0; i < limit; i++ {
 		if !tryAcquireFwdUDPGlobalSession() {

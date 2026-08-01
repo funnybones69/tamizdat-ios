@@ -145,14 +145,14 @@ const (
 	// More sessions cannot obtain a target while all target slots are occupied.
 	fwdUDPGlobalMaxSessions = fwdUDPGlobalMaxEntries
 	// Preserve more app-flow concurrency for smaller TURN pools, but trade part
-	// of it for worker/socket headroom as rooms are added. The first physical
-	// 4x20 soak still reached kernel-critical pressure with the old 32-session
-	// cap. Four rooms therefore use 16 reverse buffers (1 MiB), while three
-	// rooms use 24. The same values bound outer HEV sessions, loopback sockets,
-	// goroutines and sweep tickers.
-	fwdUDPFourRoomLimit  = 16
-	fwdUDPThreeRoomLimit = 24
-	fwdUDPTwoRoomLimit   = 48
+	// of it for worker/socket headroom as rooms are added. Room count is derived
+	// from the uniform 12-worker connection profile, never from the legacy
+	// vkturnWorkersPerRoom constant used by the independent SOCKS-flow budget.
+	// The same values bound reverse buffers, outer HEV sessions, loopback
+	// sockets, goroutines and sweep tickers.
+	fwdUDPFourPlusRoomLimit = 24
+	fwdUDPThreeRoomLimit    = 32
+	fwdUDPTwoRoomLimit      = 48
 
 	// Every accepted SOCKS flow owns a loopback socket and handler goroutine;
 	// CONNECT additionally owns upstream/gVisor state and relay buffers. A prior
@@ -166,8 +166,9 @@ const (
 )
 
 var (
-	fwdUDPIdleTimeout   = 60 * time.Second
-	fwdUDPSweepInterval = 15 * time.Second
+	fwdUDPIdleTimeout        = 60 * time.Second
+	fwdUDPSweepInterval      = 15 * time.Second
+	fwdUDPSessionIdleTimeout = 90 * time.Second
 )
 
 var (
@@ -184,6 +185,9 @@ var (
 	fwdUDPSessionGlobalMu    sync.Mutex
 	fwdUDPSessionBudgetLogAt atomic.Int64
 	fwdUDPSessionBudgetDrops atomic.Uint64
+	fwdUDPSessionReapLogAt   atomic.Int64
+	fwdUDPSessionsReapedIdle atomic.Uint64
+	fwdUDPSessionRegistry    sync.Map // *fwdUDPSessionState -> struct{}
 
 	socksFlowBudgetLogAt atomic.Int64
 	socksFlowBudgetDrops atomic.Uint64
@@ -199,13 +203,17 @@ func currentFwdUDPGlobalLimit() int {
 		return fwdUDPGlobalMaxEntries
 	}
 	expected := vkturnExpectedWorkers.Load()
-	if expected >= 4*vkturnWorkersPerRoom {
-		return fwdUDPFourRoomLimit
+	if expected <= 0 {
+		return fwdUDPGlobalMaxEntries
 	}
-	if expected > 2*vkturnWorkersPerRoom {
+	rooms := expected / 12
+	if rooms >= 4 {
+		return fwdUDPFourPlusRoomLimit
+	}
+	if rooms == 3 {
 		return fwdUDPThreeRoomLimit
 	}
-	if expected > vkturnWorkersPerRoom {
+	if rooms == 2 {
 		return fwdUDPTwoRoomLimit
 	}
 	return fwdUDPGlobalMaxEntries
@@ -269,7 +277,46 @@ func logVKTurnPendingFlow(kind string) {
 	rt.appendLog(fmt.Sprintf("warn: TURN required but netstack not ready; rejected=%s drops=%d", kind, drops))
 }
 
-func tryAcquireFwdUDPGlobalSession() bool {
+type fwdUDPSessionState struct {
+	client       net.Conn
+	mu           sync.Mutex
+	lastActivity int64
+	closing      bool
+	releaseOnce  sync.Once
+}
+
+func newFwdUDPSessionState(client net.Conn, now time.Time) *fwdUDPSessionState {
+	return &fwdUDPSessionState{client: client, lastActivity: now.UnixNano()}
+}
+
+func (s *fwdUDPSessionState) touch(now time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.closing {
+		s.lastActivity = now.UnixNano()
+	}
+	s.mu.Unlock()
+}
+
+func (s *fwdUDPSessionState) closeIfIdle(now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	if s.closing || now.UnixNano()-s.lastActivity <= int64(fwdUDPSessionIdleTimeout) {
+		s.mu.Unlock()
+		return false
+	}
+	s.closing = true
+	s.mu.Unlock()
+	_ = s.client.Close()
+	releaseFwdUDPGlobalSession(s)
+	return true
+}
+
+func tryAcquireFwdUDPGlobalSession(states ...*fwdUDPSessionState) bool {
 	fwdUDPSessionGlobalMu.Lock()
 	defer fwdUDPSessionGlobalMu.Unlock()
 	if len(fwdUDPGlobalSessionSlots) >= currentFwdUDPGlobalLimit() {
@@ -277,19 +324,56 @@ func tryAcquireFwdUDPGlobalSession() bool {
 	}
 	select {
 	case fwdUDPGlobalSessionSlots <- struct{}{}:
+		if len(states) > 0 && states[0] != nil {
+			fwdUDPSessionRegistry.Store(states[0], struct{}{})
+		}
 		return true
 	default:
 		return false
 	}
 }
 
-func releaseFwdUDPGlobalSession() {
-	fwdUDPSessionGlobalMu.Lock()
-	defer fwdUDPSessionGlobalMu.Unlock()
-	select {
-	case <-fwdUDPGlobalSessionSlots:
-	default:
+func releaseFwdUDPGlobalSession(states ...*fwdUDPSessionState) {
+	release := func() {
+		fwdUDPSessionGlobalMu.Lock()
+		defer fwdUDPSessionGlobalMu.Unlock()
+		select {
+		case <-fwdUDPGlobalSessionSlots:
+		default:
+		}
 	}
+	if len(states) == 0 || states[0] == nil {
+		release()
+		return
+	}
+	session := states[0]
+	session.mu.Lock()
+	session.closing = true
+	session.mu.Unlock()
+	session.releaseOnce.Do(func() {
+		fwdUDPSessionRegistry.Delete(session)
+		release()
+	})
+}
+
+func reapIdleFwdUDPSessions(now time.Time) int {
+	reaped := 0
+	fwdUDPSessionRegistry.Range(func(key, _ any) bool {
+		if key.(*fwdUDPSessionState).closeIfIdle(now) {
+			reaped++
+		}
+		return true
+	})
+	if reaped == 0 {
+		return 0
+	}
+	total := fwdUDPSessionsReapedIdle.Add(uint64(reaped))
+	nowNano := now.UnixNano()
+	last := fwdUDPSessionReapLogAt.Load()
+	if nowNano-last >= int64(5*time.Second) && fwdUDPSessionReapLogAt.CompareAndSwap(last, nowNano) {
+		rt.appendLog(fmt.Sprintf("warn: FWD_UDP idle-reaper освободил сессий=%d active=%d max=%d reaped_total=%d", reaped, len(fwdUDPGlobalSessionSlots), currentFwdUDPGlobalLimit(), total))
+	}
+	return reaped
 }
 
 func tryAcquireFwdUDPGlobalEntry() bool {
@@ -1456,7 +1540,15 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 	// Claim the outer-session budget before reporting SOCKS success. Rejected
 	// sessions therefore allocate no upstream target, reverse buffer or ticker,
 	// and hev can retry later after an existing session closes.
-	if !tryAcquireFwdUDPGlobalSession() {
+	sessionState := newFwdUDPSessionState(client, time.Now())
+	admitted := tryAcquireFwdUDPGlobalSession(sessionState)
+	if !admitted {
+		// A full budget is not an automatic rejection: reclaim sessions that have
+		// carried no packet in 90 seconds, then retry admission exactly once.
+		reapIdleFwdUDPSessions(time.Now())
+		admitted = tryAcquireFwdUDPGlobalSession(sessionState)
+	}
+	if !admitted {
 		fwdUDPSessionBudgetDrops.Add(1)
 		logFwdUDPGlobalSessionBudgetExhausted(idx)
 		if err := sendReply(client, socksReplyGeneral); err != nil {
@@ -1464,7 +1556,7 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 		}
 		return
 	}
-	defer releaseFwdUDPGlobalSession()
+	defer releaseFwdUDPGlobalSession(sessionState)
 
 	if err := sendReply(client, socksReplySuccess); err != nil {
 		rt.appendLog(fmt.Sprintf("warn: udp#%d reply write: %v", idx, err))
@@ -1560,7 +1652,9 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 				if err != nil {
 					return
 				}
-				e.lastActive.Store(time.Now().UnixNano())
+				now := time.Now()
+				e.lastActive.Store(now.UnixNano())
+				sessionState.touch(now)
 				// Frame: datlen | hdrlen | atype | addr | port | data
 				// IPA-A5: write framing header and payload via separate
 				// Write calls under writeMu, instead of allocating a
@@ -1600,6 +1694,7 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 			case <-subCtx.Done():
 				return
 			case t := <-sweepTicker.C:
+				reapIdleFwdUDPSessions(t)
 				pcMu.Lock()
 				sweepIdleLocked(t.UnixNano())
 				pcMu.Unlock()
@@ -1641,6 +1736,10 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 				return
 			}
 		}
+		// The complete forward packet is activity even when opening/dialling its
+		// target takes time. Touch before any potentially slow upstream work so a
+		// concurrent sweep cannot reap a session that just delivered a packet.
+		sessionState.touch(time.Now())
 
 		key := pcKey{host: host, port: port}
 		nowNano := time.Now().UnixNano()

@@ -591,7 +591,9 @@ enum VKCredsPreferences {
         set { defaults?.set(normalizeWorkers(newValue), forKey: workersKey) }
     }
 
-    static var allowedWorkers: [Int] { [12, 20] }
+    // Runtime pressure downshifts (8/6) are intentionally not persisted. Old
+    // saved 20-worker values normalize to the uniform 12-worker connect profile.
+    static var allowedWorkers: [Int] { [12] }
     static func normalizeWorkers(_ raw: Int) -> Int {
         allowedWorkers.contains(raw) ? raw : workersPerRoom
     }

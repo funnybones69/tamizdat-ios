@@ -142,29 +142,25 @@ func VKTurnRequired() bool { return vkturnRequired.Load() }
 
 const vkturnIOSDeviceMaxRooms = 6
 
-// VKTurnWorkersPerRoomForRooms is the memory-budget-derived adaptive iOS
-// profile. At the upper ceiling, 6x12=72 workers fits the 4 MiB aggregate
-// socket and 512 KiB worker-queue budgets at their per-worker floors.
+// VKTurnWorkersPerRoomForRooms is the uniform iOS connection profile. Every
+// accepted room gets 12 workers, independent of the configured room count.
+// Besides making room bundles and status denominators predictable, 12 leaves
+// eight spare allocations under VK's hard quota of 20 per credential
+// generation; the former 20-worker profile left no room for reallocation.
 func VKTurnWorkersPerRoomForRooms(rooms int) int {
-	switch {
-	case rooms <= 0:
-		return 0
-	case rooms <= 3:
-		return 20
-	case rooms <= vkturnIOSDeviceMaxRooms:
+	if rooms >= 1 && rooms <= vkturnIOSDeviceMaxRooms {
 		return 12
-	default:
-		return 0
 	}
+	return 0
 }
 
 // VKTurnMaxRooms exposes the iOS-only room limit to Swift so Settings, App
 // Group storage and the gomobile data-plane gate cannot drift. The generic
 // wgturn protocol remains dynamic; this stricter ceiling is a Network Extension
-// resource gate. The adaptive profile uses 20 workers per room for up to three
-// rooms and 12 workers per room for four through six rooms. Its 72-worker
-// ceiling remains in the 24-session FWD_UDP budget bucket already soak-proven
-// at 3x20. Raising the ceiling above six still requires physical-device soak.
+// resource gate. The uniform profile uses 12 workers per room for all one to
+// six-room configurations. Its 72-worker ceiling remains within the aggregate
+// socket/queue budgets. Raising the ceiling above six still requires a
+// physical-device soak.
 func VKTurnMaxRooms() int {
 	budgeted := wgturnclient.MaxBudgetedRooms(VKTurnWorkersPerRoomForRooms(vkturnIOSDeviceMaxRooms))
 	if budgeted < vkturnIOSDeviceMaxRooms {
@@ -198,7 +194,7 @@ func StartVKTurnUpstream(credsJSON string, peerAddr string, wgPassword string, d
 	return startVKTurnRunner(peerAddr, wgPassword, deviceID, listenPort, workers, 0, nil, nil, creds, len(credsJSON))
 }
 
-// StartVKTurnMultiRoomUpstream starts one adaptive worker pool per room.
+// StartVKTurnMultiRoomUpstream starts one uniform worker pool per room.
 func StartVKTurnMultiRoomUpstream(bundleJSON string, peerAddr string, wgPassword string, deviceID string, listenPort int, workersPerRoom int) string {
 	hashes, credsByHash, err := parseVKTurnRoomCredsJSON(bundleJSON)
 	if err != nil {
