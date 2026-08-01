@@ -134,9 +134,14 @@ type flowState struct {
 var flowRegistry sync.Map // idx (uint64) → *flowState
 
 const (
-	fwdUDPReverseBufferSize  = 64 * 1024
-	fwdUDPGlobalBufferBudget = 4 * 1024 * 1024
-	fwdUDPGlobalMaxEntries   = fwdUDPGlobalBufferBudget / fwdUDPReverseBufferSize
+	// Build 351 (flow-buffer diet): both 348 and 350 heap dumps show the
+	// jetsam pressure coming from FLOW-scaled buffers (TCP relay pool +
+	// UDP reverse buffers), not from the worker baseline. Halve both.
+	// Game datagrams are <=1.5 KiB and the per-worker VK path caps at
+	// ~64 kbit/s, so 32 KiB still covers ~20 MTU-sized packets of burst.
+	fwdUDPReverseBufferSize  = 32 * 1024
+	fwdUDPGlobalBufferBudget = 2 * 1024 * 1024
+	fwdUDPGlobalMaxEntries   = 64
 	// Every outer FWD_UDP session owns a loopback TCP socket, a handler
 	// goroutine and a sweep ticker even before it obtains a target entry. A real
 	// iPhone pressure profile reached 171 live flows while the 64-target budget
@@ -1836,7 +1841,10 @@ func handleFwdUDPWithDial(ctx context.Context, client net.Conn, idx uint64, dial
 // during GC pressure, so we never permanently retain memory.
 var relayBufPool = sync.Pool{
 	New: func() any {
-		buf := make([]byte, 16*1024)
+		// Build 351: 16 -> 8 KiB. At ~97 live buffers (90-flow burst)
+		// this line drops ~0.75 MB; loopback copy throughput is
+		// unaffected at VK's ~64 kbit/s per-worker paths.
+		buf := make([]byte, 8*1024)
 		return &buf
 	},
 }

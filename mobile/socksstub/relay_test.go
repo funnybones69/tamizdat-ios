@@ -7,10 +7,10 @@ import (
 	"time"
 )
 
-func TestRelayUsesSixteenKiBBuffersAndClosesBothDirections(t *testing.T) {
+func TestRelayUsesEightKiBBuffersAndClosesBothDirections(t *testing.T) {
 	buf := getRelayBuf()
-	if got := len(*buf); got != 16*1024 {
-		t.Fatalf("relay buffer len=%d, want %d", got, 16*1024)
+	if got := len(*buf); got != 8*1024 {
+		t.Fatalf("relay buffer len=%d, want %d", got, 8*1024)
 	}
 	putRelayBuf(buf)
 
