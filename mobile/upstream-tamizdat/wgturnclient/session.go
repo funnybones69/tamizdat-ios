@@ -379,12 +379,12 @@ func ternaryEventLevel(warn bool) string {
 	return "error"
 }
 
-func enqueueSessionReturn(ctx context.Context, d *Dispatcher, stats *Stats, roomID int, packet []byte, bondV2 bool) bool {
+func enqueueSessionReturn(ctx context.Context, d *Dispatcher, stats *Stats, roomID, workerID int, packet []byte, bondV2 bool) bool {
 	// Raw transport attribution belongs to the DTLS read boundary. Count before
 	// a possibly blocked enqueue so shutdown cannot erase an already received,
 	// wire-valid DATA frame from aggregate/per-room telemetry.
 	if bondV2 {
-		recordBondRoomDown(stats, roomID, packet)
+		recordBondRoomDown(stats, roomID, workerID, packet)
 	}
 	select {
 	case d.ReturnCh <- packet:
@@ -518,6 +518,8 @@ func RunSession(
 	}
 	log.Printf("[СЕССИЯ #%d] TURN %s (scheme=%s transport=%s proto=%s)", sessionID, turnAddr, endpoint.Scheme, endpoint.Transport, proto)
 	emitEvent(onEvent, "info", "turn endpoint worker=%d scheme=%s transport=%s proto=%s preferUDP=%t addr=%s", sessionID, endpoint.Scheme, endpoint.Transport, proto, useUDP, turnAddr)
+	stats.registerWorkerEndpoint(sessionID, turnAddr)
+	defer stats.unregisterWorkerEndpoint(sessionID)
 
 	// TURN Client (pion/turn/v5)
 	tc, err := turn.NewClient(&turn.ClientConfig{
@@ -860,7 +862,7 @@ func RunSession(
 
 			pkt := make([]byte, n)
 			copy(pkt, b[:n])
-			if !enqueueSessionReturn(sessCtx, d, stats, roomID, pkt, bondV2) {
+			if !enqueueSessionReturn(sessCtx, d, stats, roomID, sessionID, pkt, bondV2) {
 				return
 			}
 		}

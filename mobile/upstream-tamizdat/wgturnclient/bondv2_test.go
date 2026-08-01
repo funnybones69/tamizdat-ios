@@ -580,8 +580,8 @@ func TestDispatcherFinalizeAccountsQueuedDownlinkAndReorderTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recordBondRoomDown(stats, 1, data)
-	recordBondRoomDown(stats, 1, unknown)
+	recordBondRoomDown(stats, 1, 7, data)
+	recordBondRoomDown(stats, 1, 7, unknown)
 	d.ReturnCh <- data
 	d.ReturnCh <- unknown
 

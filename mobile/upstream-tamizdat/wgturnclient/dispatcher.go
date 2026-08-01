@@ -326,6 +326,7 @@ func (d *Dispatcher) dispatchBond(payload []byte) {
 	case w.SendCh <- frame:
 		atomic.AddInt64(&d.stats.BondFramesUp, 1)
 		atomic.AddInt64(&d.stats.BondBytesUp, int64(len(payload)))
+		d.stats.recordWorkerUp(w.ID, len(payload))
 		if w.RoomID >= 0 && w.RoomID < len(d.stats.BondRoomPackets) {
 			atomic.AddInt64(&d.stats.BondRoomPackets[w.RoomID], 1)
 			atomic.AddInt64(&d.stats.BondRoomBytes[w.RoomID], int64(len(payload)))

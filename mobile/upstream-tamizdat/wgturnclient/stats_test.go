@@ -23,13 +23,13 @@ func TestSessionReturnCountsValidBondDataBeforeCancelledEnqueue(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if enqueueSessionReturn(ctx, d, stats, 2, data, true) {
+	if enqueueSessionReturn(ctx, d, stats, 2, 3, data, true) {
 		t.Fatal("cancelled enqueue unexpectedly succeeded")
 	}
-	if enqueueSessionReturn(ctx, d, stats, 2, invalid, true) {
+	if enqueueSessionReturn(ctx, d, stats, 2, 3, invalid, true) {
 		t.Fatal("cancelled invalid enqueue unexpectedly succeeded")
 	}
-	if enqueueSessionReturn(ctx, d, stats, 2, data, false) {
+	if enqueueSessionReturn(ctx, d, stats, 2, 3, data, false) {
 		t.Fatal("cancelled legacy enqueue unexpectedly succeeded")
 	}
 	snapshot := stats.Snapshot()
@@ -61,11 +61,11 @@ func TestStatsSnapshotIncludesPerRoomDirectionsAndFinalCallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	recordBondRoomDown(stats, 1, dataFrame)
-	recordBondRoomDown(stats, 1, controlFrame)
-	recordBondRoomDown(stats, 1, unknownFlagsFrame)
-	recordBondRoomDown(stats, 1, []byte("invalid"))
-	recordBondRoomDown(stats, len(stats.BondRoomDownPackets), dataFrame)
+	recordBondRoomDown(stats, 1, 3, dataFrame)
+	recordBondRoomDown(stats, 1, 3, controlFrame)
+	recordBondRoomDown(stats, 1, 3, unknownFlagsFrame)
+	recordBondRoomDown(stats, 1, 3, []byte("invalid"))
+	recordBondRoomDown(stats, len(stats.BondRoomDownPackets), 3, dataFrame)
 
 	snapshot := stats.Snapshot()
 	if snapshot.ActiveConnections != 7 || snapshot.BondFramesUp != 11 || snapshot.BondFramesDown != 14 || snapshot.BondBytesDown != int64(len("room-one")) {

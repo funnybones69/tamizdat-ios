@@ -1,7 +1,11 @@
 package wgturnclient
 
 import (
+	"fmt"
 	"log"
+	"sort"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -10,6 +14,9 @@ const (
 	defaultStatsRoomCount = MaxRooms
 	quotaStormMinErrors   = 8
 	quotaStormMinAgeSecs  = 15
+	// maxTelemetryWorkers caps the per-worker telemetry arrays (worker IDs are
+	// 1-based; runner clamps total workers to 6 rooms × 20).
+	maxTelemetryWorkers = 128
 )
 
 type Stats struct {
@@ -40,6 +47,14 @@ type Stats struct {
 	BondRoomCredentialErrors []int64
 	BondRoomSessionErrors    []int64
 	BondRoomQuotaErrors      []int64
+
+	// Per-worker telemetry (diag 345): cumulative bytes by 1-based worker ID
+	// and the TURN endpoint address each worker dialed. Lets a field log show
+	// which allocations/servers starve instead of one aggregate pot.
+	BondWorkerBytesUp   []int64
+	BondWorkerBytesDown []int64
+	workerEndpoints     [maxTelemetryWorkers]string
+	workerEndpointsMu   sync.RWMutex
 }
 
 // StatsSnapshot is an atomic view used by physical A/B telemetry.
@@ -71,6 +86,11 @@ type StatsSnapshot struct {
 	RoomCredentialErrors []int64 `json:"room_credential_errors"`
 	RoomSessionErrors    []int64 `json:"room_session_errors"`
 	RoomQuotaErrors      []int64 `json:"room_quota_errors"`
+	// WorkerUpBytes[j] / WorkerDownBytes[j] belong to worker ID j+1 (IDs are
+	// 1-based; the unused index-0 slot is trimmed from the snapshot).
+	WorkerUpBytes     []int64          `json:"worker_up_bytes,omitempty"`
+	WorkerDownBytes   []int64          `json:"worker_down_bytes,omitempty"`
+	EndpointDownBytes map[string]int64 `json:"endpoint_down_bytes,omitempty"`
 }
 
 // NewStats accepts an optional configured room count. The variadic form keeps
@@ -93,6 +113,8 @@ func NewStats(roomCounts ...int) *Stats {
 		BondRoomCredentialErrors: make([]int64, rooms),
 		BondRoomSessionErrors:    make([]int64, rooms),
 		BondRoomQuotaErrors:      make([]int64, rooms),
+		BondWorkerBytesUp:        make([]int64, maxTelemetryWorkers),
+		BondWorkerBytesDown:      make([]int64, maxTelemetryWorkers),
 	}
 }
 
@@ -142,7 +164,105 @@ func (s *Stats) snapshotAtUnix(nowUnix int64) StatsSnapshot {
 		out.RoomSessionErrors[i] = atomic.LoadInt64(&s.BondRoomSessionErrors[i])
 		out.RoomQuotaErrors[i] = atomic.LoadInt64(&s.BondRoomQuotaErrors[i])
 	}
+	out.WorkerUpBytes, out.WorkerDownBytes = s.workerBytesSnapshot()
+	out.EndpointDownBytes = s.endpointDownSnapshot()
 	return out
+}
+
+// workerBytesSnapshot returns per-worker cumulative byte counters trimmed to
+// the highest worker ID that ever carried traffic. Element j = worker ID j+1.
+func (s *Stats) workerBytesSnapshot() (up, down []int64) {
+	maxWorker := 0
+	for i := 1; i < maxTelemetryWorkers; i++ {
+		if atomic.LoadInt64(&s.BondWorkerBytesUp[i]) != 0 || atomic.LoadInt64(&s.BondWorkerBytesDown[i]) != 0 {
+			maxWorker = i
+		}
+	}
+	if maxWorker == 0 {
+		return nil, nil
+	}
+	up = make([]int64, maxWorker)
+	down = make([]int64, maxWorker)
+	for i := 1; i <= maxWorker; i++ {
+		up[i-1] = atomic.LoadInt64(&s.BondWorkerBytesUp[i])
+		down[i-1] = atomic.LoadInt64(&s.BondWorkerBytesDown[i])
+	}
+	return up, down
+}
+
+// endpointDownSnapshot folds per-worker down bytes into per-TURN-server
+// totals using the endpoint each worker dialed. A sick TURN server shows up
+// here as an address whose aggregate lags the pool.
+func (s *Stats) endpointDownSnapshot() map[string]int64 {
+	s.workerEndpointsMu.RLock()
+	defer s.workerEndpointsMu.RUnlock()
+	var out map[string]int64
+	for i := 1; i < maxTelemetryWorkers; i++ {
+		ep := s.workerEndpoints[i]
+		if ep == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]int64)
+		}
+		out[ep] += atomic.LoadInt64(&s.BondWorkerBytesDown[i])
+	}
+	return out
+}
+
+func (s *Stats) recordWorkerUp(workerID, n int) {
+	if s == nil || workerID <= 0 || workerID >= maxTelemetryWorkers {
+		return
+	}
+	atomic.AddInt64(&s.BondWorkerBytesUp[workerID], int64(n))
+}
+
+func (s *Stats) recordWorkerDown(workerID, n int) {
+	if s == nil || workerID <= 0 || workerID >= maxTelemetryWorkers {
+		return
+	}
+	atomic.AddInt64(&s.BondWorkerBytesDown[workerID], int64(n))
+}
+
+func (s *Stats) registerWorkerEndpoint(workerID int, addr string) {
+	if s == nil || workerID <= 0 || workerID >= maxTelemetryWorkers {
+		return
+	}
+	s.workerEndpointsMu.Lock()
+	s.workerEndpoints[workerID] = addr
+	s.workerEndpointsMu.Unlock()
+}
+
+func (s *Stats) unregisterWorkerEndpoint(workerID int) {
+	if s == nil || workerID <= 0 || workerID >= maxTelemetryWorkers {
+		return
+	}
+	s.workerEndpointsMu.Lock()
+	s.workerEndpoints[workerID] = ""
+	s.workerEndpointsMu.Unlock()
+}
+
+// formatEndpointBytes renders the endpoint map with sorted keys so successive
+// telemetry lines are diff-stable (Go map iteration order is random).
+func formatEndpointBytes(m map[string]int64) string {
+	if len(m) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, k := range keys {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%s:%d", k, m[k])
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 func quotaStormActive(activeWorkers int32, quotaErrStreak, lastAllocOKUnix, runnerStartedUnix, nowUnix int64) bool {
@@ -170,7 +290,7 @@ func (s *Stats) recordAllocateOK(now time.Time) {
 	atomic.StoreInt64(&s.quotaErrStreak, 0)
 }
 
-func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {
+func recordBondRoomDown(stats *Stats, roomID, workerID int, packet []byte) {
 	if stats == nil || roomID < 0 || roomID >= len(stats.BondRoomDownPackets) {
 		return
 	}
@@ -185,6 +305,7 @@ func recordBondRoomDown(stats *Stats, roomID int, packet []byte) {
 	atomic.AddInt64(&stats.BondBytesDown, int64(len(frame.Payload)))
 	atomic.AddInt64(&stats.BondRoomDownPackets[roomID], 1)
 	atomic.AddInt64(&stats.BondRoomDownBytes[roomID], int64(len(frame.Payload)))
+	stats.recordWorkerDown(workerID, len(frame.Payload))
 }
 
 func (s *Stats) RunLoop(shutdown <-chan struct{}) {
@@ -200,10 +321,11 @@ func (s *Stats) RunLoopWithCallback(shutdown <-chan struct{}, onSnapshot func(St
 		totalMB := float64(snapshot.TotalBytesUp+snapshot.TotalBytesDown) / (1024.0 * 1024.0)
 		log.Printf("[СТАТИСТИКА] Активных: %d | Трафик: %.2f МБ | Переаллокаций TURN: %d", snapshot.ActiveConnections, totalMB, snapshot.TURNReallocations)
 		if snapshot.BondFramesUp+snapshot.BondFramesDown > 0 {
-			log.Printf("[BOND] frames up=%d down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps=%d late=%d room_up_packets=%v room_up_bytes=%v room_down_packets=%v room_down_bytes=%v room_drops=%v",
+			log.Printf("[BOND] frames up=%d down=%d bytes_up=%d bytes_down=%d queue_drops=%d shaper_drops=%d reorder_gaps=%d late=%d room_up_packets=%v room_up_bytes=%v room_down_packets=%v room_down_bytes=%v room_drops=%v worker_up=%v worker_down=%v ep_down=%s",
 				snapshot.BondFramesUp, snapshot.BondFramesDown, snapshot.BondBytesUp, snapshot.BondBytesDown,
 				snapshot.BondQueueDrops, snapshot.BondShaperDrops, snapshot.BondReorderGaps, snapshot.BondReorderLate,
-				snapshot.RoomUpPackets, snapshot.RoomUpBytes, snapshot.RoomDownPackets, snapshot.RoomDownBytes, snapshot.RoomDrops)
+				snapshot.RoomUpPackets, snapshot.RoomUpBytes, snapshot.RoomDownPackets, snapshot.RoomDownBytes, snapshot.RoomDrops,
+				snapshot.WorkerUpBytes, snapshot.WorkerDownBytes, formatEndpointBytes(snapshot.EndpointDownBytes))
 		}
 		if onSnapshot != nil {
 			onSnapshot(snapshot)

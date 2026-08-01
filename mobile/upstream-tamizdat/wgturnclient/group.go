@@ -416,11 +416,11 @@ func (r *Runner) workerGroup(
 		var notFoundErrorWorkers sync.Map
 		var quotaBackoffOnce sync.Once
 
-		// Сигнализируем следующей группе, что мы успешно запустились (креды получены + 2 сек форы)
+		// Сигнализируем следующей группе, что мы успешно запустились (креды получены + короткая фора)
 		go func() {
 			commonSignalOnce.Do(func() {
 				if signalReady != nil {
-					time.Sleep(2000 * time.Millisecond) // Запас времени для рукопожатий (3*500ms + 500ms)
+					time.Sleep(750 * time.Millisecond) // Фора для рукопожатий; разгон бонда ~9с вместо 22с (diag 345)
 					close(signalReady)
 					log.Printf("[ГРУППА #%d] Успешный старт! Передача эстафеты следующей группе...", groupID)
 				}
@@ -431,8 +431,9 @@ func (r *Runner) workerGroup(
 			doneCh := make(chan struct{})
 			doneChs[i] = doneCh
 
-			// Stagger: 500мс между воркерами
-			workerDelay := time.Duration(i) * 500 * time.Millisecond
+			// Stagger: 200мс между воркерами (diag 345; было 500мс — разгон 72 воркеров
+			// занимал ~22с, спидтест мерил недогретый бонд)
+			workerDelay := time.Duration(i) * 200 * time.Millisecond
 
 			go func(wid int, delay time.Duration, doneCh chan struct{}) {
 				defer close(doneCh)
