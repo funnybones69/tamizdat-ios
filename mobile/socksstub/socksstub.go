@@ -150,9 +150,14 @@ const (
 	// SOCKS-flow budget.
 	// The same values bound reverse buffers, outer HEV sessions, loopback
 	// sockets, goroutines and sweep tickers.
-	fwdUDPFourPlusRoomLimit = 24
-	fwdUDPThreeRoomLimit    = 32
-	fwdUDPTwoRoomLimit      = 48
+	// Build 348: 24 was far too small for real use — UDP-only apps (Roblox)
+	// churned 260 rejected sessions against QUIC/shorts background noise in
+	// three minutes. 64 = the global buffer budget itself; idle reaper frees
+	// slots after 60 s, and the 64 KiB reverse buffer is lazy per live
+	// session, so realistic steady state stays ~1-2.5 MiB.
+	fwdUDPFourPlusRoomLimit = 64
+	fwdUDPThreeRoomLimit    = 64
+	fwdUDPTwoRoomLimit      = 64
 
 	// Every accepted SOCKS flow owns a loopback socket and handler goroutine;
 	// CONNECT additionally owns upstream/gVisor state and relay buffers. A prior
