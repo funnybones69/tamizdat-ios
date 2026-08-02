@@ -589,8 +589,20 @@ func Start(addrSpec string) error {
 	// 22 MB still leaves ample room above the observed 8.3 MB live heap,
 	// while deliberately reserving more of the jetsam budget for non-Go
 	// footprint (HEV/lwIP, gVisor, Swift and kernel socket buffers).
+	// IPA-R2: GOGC 100 → 50. The 2026-08-02 overnight heap-kernel-critical
+	// (heap-kernel-critical-1785632109) showed sync.Pool chains ballooning to
+	// 1.37 GB alloc_space and WG StdNetBind buffers 1.09 GB while the Swift
+	// heartbeat was suspended. GOGC=100 let the heap double before GC; 50
+	// halves the sawtooth amplitude at modest CPU cost.
+	//
+	// IPA-R2: independent scavenger goroutine. The exported FreeOSMemory()
+	// only runs when Swift calls it on its 2 s heartbeat — but when iOS
+	// suspends/throttles the extension, Swift stops calling and freed pages
+	// stay in RSS until jetsam. This goroutine runs inside the Go runtime
+	// (survives Swift suspension) and returns pages every 15 s.
 	debug.SetMemoryLimit(22 * 1024 * 1024)
-	debug.SetGCPercent(100)
+	debug.SetGCPercent(50)
+	go scavengerLoop()
 
 	network := "tcp"
 	addr := addrSpec
@@ -1101,6 +1113,22 @@ func parseSamizdatURL(blob string) (*samizdatConfig, error) {
 // keeps the visible process RSS as low as the live-set permits.
 func FreeOSMemory() {
 	debug.FreeOSMemory()
+}
+
+// scavengerLoop is the in-runtime counterpart of the Swift-driven
+// FreeOSMemory() heartbeat. Swift stops calling us the moment iOS
+// suspends/throttles the extension (background fetch, screen off, low
+// power) — exactly the windows where the overnight jetsam traces show
+// sync.Pool chains and WG bind buffers ballooning into the tens of MB.
+// This loop keeps returning pages every 15 s regardless of Swift state.
+// 15 s is a compromise: frequent enough to flatten RSS spikes between
+// GC cycles, rare enough that a single madvise pass costs ~nothing.
+func scavengerLoop() {
+	t := time.NewTicker(15 * time.Second)
+	defer t.Stop()
+	for range t.C {
+		debug.FreeOSMemory()
+	}
 }
 
 // SetPoolVariant selects the tamizdat connection-pool strategy on the
