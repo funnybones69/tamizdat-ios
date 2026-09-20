@@ -116,6 +116,9 @@ targets:
       # handler + 5-step VK API client) and is intentionally NOT
       # compiled into the extension.
       - path: samizdat-ios/TURNCredsStore.swift
+      # VKS room-transport settings — read by the extension at startTunnel
+      # to raise the ladder in-process (next to the socksstub SOCKS5 bridge).
+      - path: samizdat-ios/VKSPreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework
         embed: true

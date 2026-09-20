@@ -40,6 +40,19 @@ struct SettingsView: View {
     @State private var vkRoomsDraft: String = VKCredsPreferences.roomHashes.joined(separator: "\n")
     @State private var vkCallHashFeedback: String = ""
 
+    // VKS room transports (whitelist carrier ladder). Drafts only — they
+    // persist via VKSPreferences on Save; the extension applies them on
+    // the next connect.
+    @State private var vksEnabledDraft: Bool = VKSPreferences.enabled
+    @State private var vksTelemostDraft: String = VKSPreferences.telemostRoom
+    @State private var vksWbstreamDraft: String = VKSPreferences.wbstreamRoom
+    @State private var vksJazzDraft: String = VKSPreferences.jazzRoom
+    @State private var vksMtsDraft: String = VKSPreferences.mtsRoom
+    @State private var vksKeyDraft: String = VKSPreferences.keyHex
+    @State private var vksShortIDDraft: String = VKSPreferences.shortIDHex
+    @State private var vksPortDraft: String = String(VKSPreferences.listenPort)
+    @State private var vksFeedback: String = ""
+
     // Whitelist-detection ICMP echo target lists.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
     @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
@@ -102,6 +115,12 @@ struct SettingsView: View {
                         SectionLabel(text: "VK TURN")
                             .padding(.top, 22)
                         vkTurnCard
+                            .padding(.horizontal, 16)
+
+                        // ── VKS rooms ────────────────────────────
+                        SectionLabel(text: "VKS rooms")
+                            .padding(.top, 22)
+                        vksRoomsCard
                             .padding(.horizontal, 16)
 
                         // ── Ping probe ───────────────────────────
@@ -351,6 +370,109 @@ struct SettingsView: View {
             default:
                 break
             }
+        }
+    }
+
+    // VKS rooms card: four provider slots + the shared olcRTC wire key,
+    // shortid and loopback port. The ladder itself runs in the
+    // PacketTunnel extension; saving only persists the values — they are
+    // applied on the next VPN connect.
+    private var vksRoomsCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "network",
+                             bg: theme.blueDim, fg: theme.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("VKS rooms")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("Provider rooms carried as WebRTC tunnels")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                    Toggle("", isOn: $vksEnabledDraft)
+                        .labelsHidden()
+                        .tint(theme.mint)
+                }
+
+                vksField("Telemost", "https://telemost.yandex.ru/j/…", $vksTelemostDraft)
+                vksField("WB Stream", "room id", $vksWbstreamDraft)
+                vksField("Jazz", "roomId:password", $vksJazzDraft)
+                vksField("MTS", "https://my.mts-link.ru/j/…", $vksMtsDraft)
+                vksField("olcRTC key", "64 hex", $vksKeyDraft)
+                vksField("shortid", "hex из users", $vksShortIDDraft)
+                vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
+
+                Text("Лестница: telemost → wbstream → jazz → mts. Комнаты создаёт сервер (owner), клиент входит гостем. TCP-потоки идут через комнаты, пока upstream поднят.")
+                    .font(.geistMono(.regular, size: 10))
+                    .foregroundStyle(theme.textDim)
+
+                if !vksFeedback.isEmpty {
+                    Text(vksFeedback)
+                        .font(.geistMono(.regular, size: 11))
+                        .foregroundStyle(theme.textDim)
+                }
+
+                Button(action: saveVKSSettings) {
+                    Text("Save")
+                        .font(.geist(.semibold, size: 13))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(theme.mint)
+                        .foregroundStyle(theme.mintInk)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private func vksField(_ label: String, _ placeholder: String, _ text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.geist(.medium, size: 12))
+                .foregroundStyle(theme.textMuted)
+            TextField(placeholder, text: text)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .font(.geistMono(.regular, size: 12.5))
+                .foregroundStyle(theme.text)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+                .background(theme.chip)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+        }
+    }
+
+    private func saveVKSSettings() {
+        VKSPreferences.enabled = vksEnabledDraft
+        VKSPreferences.telemostRoom = vksTelemostDraft
+        VKSPreferences.wbstreamRoom = vksWbstreamDraft
+        VKSPreferences.jazzRoom = vksJazzDraft
+        VKSPreferences.mtsRoom = vksMtsDraft
+        VKSPreferences.keyHex = vksKeyDraft
+        VKSPreferences.shortIDHex = vksShortIDDraft
+        if let port = Int(vksPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)), port > 0 {
+            VKSPreferences.listenPort = port
+        }
+
+        // Re-sync the drafts with the normalized persisted values.
+        vksTelemostDraft = VKSPreferences.telemostRoom
+        vksWbstreamDraft = VKSPreferences.wbstreamRoom
+        vksJazzDraft = VKSPreferences.jazzRoom
+        vksMtsDraft = VKSPreferences.mtsRoom
+        vksKeyDraft = VKSPreferences.keyHex
+        vksShortIDDraft = VKSPreferences.shortIDHex
+        vksPortDraft = String(VKSPreferences.listenPort)
+
+        if !VKSPreferences.enabled {
+            vksFeedback = "Сохранено: VKS выключен"
+        } else if !VKSPreferences.isConfigured {
+            vksFeedback = "Сохранено, но лестница пуста: нужны комната + key + shortid"
+        } else {
+            vksFeedback = "Сохранено: \(VKSPreferences.providerCount) провайдер(а); применится при следующем connect"
         }
     }
 

@@ -287,6 +287,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             log("info: [vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
             ExtLog.info("[vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
         }
+
+        // VKS room transports: the ladder runs in THIS process — the same
+        // Go runtime as the socksstub SOCKS5 bridge — so `dialUpstream`
+        // can chain TCP flows through its loopback listener. The app
+        // writes the settings into the App Group; changes apply on the
+        // next connect.
+        if VKSPreferences.enabled && VKSPreferences.isConfigured {
+            let vksStatus = SocksstubStartVKSUpstream(
+                VKSPreferences.ladderSpec,
+                VKSPreferences.keyHex,
+                VKSPreferences.shortIDHex,
+                VKSPreferences.listenPort
+            )
+            log("info: [vks] upstream start requested: \(vksStatus)")
+            ExtLog.info("[vks] upstream start requested: \(vksStatus)")
+        } else {
+            _ = SocksstubStopVKSUpstream()
+            log("info: [vks] disabled or not configured — VKS chain inactive")
+            ExtLog.info("[vks] disabled or not configured — VKS chain inactive")
+        }
         return true
     }
 
@@ -562,6 +582,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // gated until that drain completes.
         Self.turnTunnelGenerationLock.withLock { $0 += 1 }
         SocksstubStopVKTurnUpstreamAsync()
+        _ = SocksstubStopVKSUpstream()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
