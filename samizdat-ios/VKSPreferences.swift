@@ -27,6 +27,10 @@ enum VKSPreferences {
     private static let keyHexKey = "tamizdat.vks.keyHex"
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
     private static let portKey = "tamizdat.vks.listenPort"
+    private static let telemostEnabledKey = "tamizdat.vks.telemostEnabled"
+    private static let wbstreamEnabledKey = "tamizdat.vks.wbstreamEnabled"
+    private static let jazzEnabledKey = "tamizdat.vks.jazzEnabled"
+    private static let mtsEnabledKey = "tamizdat.vks.mtsEnabled"
 
     static let defaultListenPort = 11080
 
@@ -48,6 +52,41 @@ enum VKSPreferences {
             return defaults?.bool(forKey: enabledKey) ?? false
         }
         set { defaults?.set(newValue, forKey: enabledKey) }
+    }
+
+    /// Per-provider switches: a disabled provider is left out of the
+    /// ladder even when its room is filled, so a single provider can be
+    /// exercised in isolation.
+    static var telemostEnabled: Bool {
+        get {
+            guard let d = defaults, d.object(forKey: telemostEnabledKey) != nil else { return true }
+            return d.bool(forKey: telemostEnabledKey)
+        }
+        set { defaults?.set(newValue, forKey: telemostEnabledKey) }
+    }
+
+    static var wbstreamEnabled: Bool {
+        get {
+            guard let d = defaults, d.object(forKey: wbstreamEnabledKey) != nil else { return true }
+            return d.bool(forKey: wbstreamEnabledKey)
+        }
+        set { defaults?.set(newValue, forKey: wbstreamEnabledKey) }
+    }
+
+    static var jazzEnabled: Bool {
+        get {
+            guard let d = defaults, d.object(forKey: jazzEnabledKey) != nil else { return true }
+            return d.bool(forKey: jazzEnabledKey)
+        }
+        set { defaults?.set(newValue, forKey: jazzEnabledKey) }
+    }
+
+    static var mtsEnabled: Bool {
+        get {
+            guard let d = defaults, d.object(forKey: mtsEnabledKey) != nil else { return true }
+            return d.bool(forKey: mtsEnabledKey)
+        }
+        set { defaults?.set(newValue, forKey: mtsEnabledKey) }
     }
 
     static var telemostRoom: String {
@@ -88,18 +127,25 @@ enum VKSPreferences {
         set { defaults?.set(newValue, forKey: portKey) }
     }
 
-    /// Assembled `provider:room,…` ladder spec in failover order.
+    /// Assembled `provider:room,` ladder spec in failover order. A
+    /// provider is included only when its switch is on and its room is
+    /// filled.
     static var ladderSpec: String {
         var parts: [String] = []
-        if !telemostRoom.isEmpty { parts.append("telemost:\(telemostRoom)") }
-        if !wbstreamRoom.isEmpty { parts.append("wbstream:\(wbstreamRoom)") }
-        if !jazzRoom.isEmpty { parts.append("jazz:\(jazzRoom)") }
-        if !mtsRoom.isEmpty { parts.append("mts:\(mtsRoom)") }
+        if telemostEnabled && !telemostRoom.isEmpty { parts.append("telemost:\(telemostRoom)") }
+        if wbstreamEnabled && !wbstreamRoom.isEmpty { parts.append("wbstream:\(wbstreamRoom)") }
+        if jazzEnabled && !jazzRoom.isEmpty { parts.append("jazz:\(jazzRoom)") }
+        if mtsEnabled && !mtsRoom.isEmpty { parts.append("mts:\(mtsRoom)") }
         return parts.joined(separator: ",")
     }
 
     static var providerCount: Int {
-        [telemostRoom, wbstreamRoom, jazzRoom, mtsRoom].filter { !$0.isEmpty }.count
+        var count = 0
+        if telemostEnabled && !telemostRoom.isEmpty { count += 1 }
+        if wbstreamEnabled && !wbstreamRoom.isEmpty { count += 1 }
+        if jazzEnabled && !jazzRoom.isEmpty { count += 1 }
+        if mtsEnabled && !mtsRoom.isEmpty { count += 1 }
+        return count
     }
 
     static var isConfigured: Bool {
@@ -114,6 +160,10 @@ enum VKSPreferences {
     /// Restore all VKS settings to their defaults.
     static func reset() {
         enabled = false
+        telemostEnabled = true
+        wbstreamEnabled = true
+        jazzEnabled = true
+        mtsEnabled = true
         telemostRoom = ""
         wbstreamRoom = ""
         jazzRoom = ""

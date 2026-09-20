@@ -1044,18 +1044,21 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	// through it instead of the legacy samizdat-H2 upstream. The wg
 	// device's Endpoint is 127.0.0.1:<wgturn relay port>, so packets
 	// → wg → DTLS+TURN → VK relay → RU server → outbound chain → EU.
-	if n := VKTurnNetstack(); n != nil {
-		return n.DialContext(ctx, "tcp", dest)
-	}
-	// VKS room-tunnel upstream (operator started the ladder): chain the
-	// flow through the local SOCKS5 listener it serves. The olc client is
-	// stream-only, so this path is TCP; UDP keeps the precedence below.
+	// VKS room-tunnel upstream (master switch on -> the ladder runs in this
+	// process): chain the flow through the local SOCKS5 listener it serves.
+	// Checked BEFORE the VK TURN netstack so the VKS master switch
+	// intercepts TCP flows from VK TURN; TURN stays the reserve below. The
+	// olc client is stream-only, so this path is TCP (UDP keeps its own
+	// precedence in dialUpstreamUDP).
 	if addr := vksUpstreamAddr(); addr != "" {
 		if c, err := dialViaSocks5(ctx, addr, dest); err == nil {
 			return c, nil
 		} else {
 			rt.appendLog(fmt.Sprintf("warn: vks chain dial %s -> %s failed: %v", dest, addr, err))
 		}
+	}
+	if n := VKTurnNetstack(); n != nil {
+		return n.DialContext(ctx, "tcp", dest)
 	}
 	rt.mu.Lock()
 	client := rt.samizdatClient

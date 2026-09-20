@@ -51,6 +51,10 @@ struct SettingsView: View {
     @State private var vksKeyDraft: String = VKSPreferences.keyHex
     @State private var vksShortIDDraft: String = VKSPreferences.shortIDHex
     @State private var vksPortDraft: String = String(VKSPreferences.listenPort)
+    @State private var vksTelemostOnDraft: Bool = VKSPreferences.telemostEnabled
+    @State private var vksWbstreamOnDraft: Bool = VKSPreferences.wbstreamEnabled
+    @State private var vksJazzOnDraft: Bool = VKSPreferences.jazzEnabled
+    @State private var vksMtsOnDraft: Bool = VKSPreferences.mtsEnabled
     @State private var vksFeedback: String = ""
 
     // Whitelist-detection ICMP echo target lists.
@@ -387,7 +391,7 @@ struct SettingsView: View {
                         Text("VKS rooms")
                             .font(.geist(.medium, size: 16))
                             .foregroundStyle(theme.text)
-                        Text("Provider rooms carried as WebRTC tunnels")
+                        Text("Master switch; per-provider toggles below")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textDim)
                     }
@@ -397,15 +401,15 @@ struct SettingsView: View {
                         .tint(theme.mint)
                 }
 
-                vksField("Telemost", "https://telemost.yandex.ru/j/…", $vksTelemostDraft)
-                vksField("WB Stream", "room id", $vksWbstreamDraft)
-                vksField("Jazz", "roomId:password", $vksJazzDraft)
-                vksField("MTS", "https://my.mts-link.ru/j/…", $vksMtsDraft)
+                vksProviderRow("Telemost", "https://telemost.yandex.ru/j/…", on: $vksTelemostOnDraft, text: $vksTelemostDraft)
+                vksProviderRow("WB Stream", "room id", on: $vksWbstreamOnDraft, text: $vksWbstreamDraft)
+                vksProviderRow("Jazz", "roomId:password", on: $vksJazzOnDraft, text: $vksJazzDraft)
+                vksProviderRow("MTS", "https://my.mts-link.ru/j/…", on: $vksMtsOnDraft, text: $vksMtsDraft)
                 vksField("olcRTC key", "64 hex", $vksKeyDraft)
                 vksField("shortid", "hex из users", $vksShortIDDraft)
                 vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
 
-                Text("Лестница: telemost → wbstream → jazz → mts. Комнаты создаёт сервер (owner), клиент входит гостем. Изоляции пар на iOS нет — выделяй комнату на устройство. При активном VK TURN он приоритетнее, лестница не стартует.")
+                Text("Мастер-тумблер (сверху): VKS активен — в whitelist-режиме перехватывает у VK TURN (тот остаётся резервом). Ниже у каждого провайдера свой тумблер — можно оставить включённым один и смотреть, как он работает. Комнаты создаёт сервер (owner), клиент входит гостем; изоляции пар нет — выделяй комнату на устройство.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
 
@@ -446,8 +450,36 @@ struct SettingsView: View {
         }
     }
 
+    private func vksProviderRow(_ title: String, _ placeholder: String, on: Binding<Bool>, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title)
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                Spacer()
+                Toggle("", isOn: on)
+                    .labelsHidden()
+                    .tint(theme.mint)
+            }
+            TextField(placeholder, text: text)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .font(.geistMono(.regular, size: 12.5))
+                .foregroundStyle(theme.text)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 7)
+                .background(theme.chip)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .opacity(on.wrappedValue ? 1.0 : 0.45)
+        }
+    }
+
     private func saveVKSSettings() {
         VKSPreferences.enabled = vksEnabledDraft
+        VKSPreferences.telemostEnabled = vksTelemostOnDraft
+        VKSPreferences.wbstreamEnabled = vksWbstreamOnDraft
+        VKSPreferences.jazzEnabled = vksJazzOnDraft
+        VKSPreferences.mtsEnabled = vksMtsOnDraft
         VKSPreferences.telemostRoom = vksTelemostDraft
         VKSPreferences.wbstreamRoom = vksWbstreamDraft
         VKSPreferences.jazzRoom = vksJazzDraft
@@ -463,6 +495,10 @@ struct SettingsView: View {
         }
 
         // Re-sync the drafts with the normalized persisted values.
+        vksTelemostOnDraft = VKSPreferences.telemostEnabled
+        vksWbstreamOnDraft = VKSPreferences.wbstreamEnabled
+        vksJazzOnDraft = VKSPreferences.jazzEnabled
+        vksMtsOnDraft = VKSPreferences.mtsEnabled
         vksTelemostDraft = VKSPreferences.telemostRoom
         vksWbstreamDraft = VKSPreferences.wbstreamRoom
         vksJazzDraft = VKSPreferences.jazzRoom
