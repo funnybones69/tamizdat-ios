@@ -34,8 +34,19 @@ enum VKSPreferences {
         UserDefaults(suiteName: appGroupID)
     }
 
+    // -- TEST-BUILD DEFAULTS (2026-09-20) --------------------------------
+    // Baked-in values so the on-device VKS test needs zero manual input:
+    // the card shows them pre-filled and the ladder starts on connect.
+    // Remove once server-side provisioning of rooms/key lands.
+    static let testDefaultWbstreamRoom = "stab_gw"
+    static let testDefaultKeyHex = "REDACTED-VKS-KEY"
+    static let testDefaultShortIDHex = "REDACTED-SHORTID"
+
     static var enabled: Bool {
-        get { defaults?.bool(forKey: enabledKey) ?? false }
+        get {
+            if defaults?.object(forKey: enabledKey) == nil { return true }
+            return defaults?.bool(forKey: enabledKey) ?? false
+        }
         set { defaults?.set(newValue, forKey: enabledKey) }
     }
 
@@ -45,7 +56,7 @@ enum VKSPreferences {
     }
 
     static var wbstreamRoom: String {
-        get { defaults?.string(forKey: wbstreamKey) ?? "" }
+        get { defaults?.string(forKey: wbstreamKey) ?? testDefaultWbstreamRoom }
         set { defaults?.set(trim(newValue), forKey: wbstreamKey) }
     }
 
@@ -60,12 +71,12 @@ enum VKSPreferences {
     }
 
     static var keyHex: String {
-        get { defaults?.string(forKey: keyHexKey) ?? "" }
+        get { defaults?.string(forKey: keyHexKey) ?? testDefaultKeyHex }
         set { defaults?.set(trim(newValue).lowercased(), forKey: keyHexKey) }
     }
 
     static var shortIDHex: String {
-        get { defaults?.string(forKey: shortIDKey) ?? "" }
+        get { defaults?.string(forKey: shortIDKey) ?? testDefaultShortIDHex }
         set { defaults?.set(trim(newValue).lowercased(), forKey: shortIDKey) }
     }
 
