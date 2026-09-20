@@ -34,6 +34,10 @@ targets:
         codeSign: true
       - framework: Frameworks/SamizdatClient.xcframework
         embed: true
+      # gomobile frameworks reference the cgo DNS-resolver trampolines
+      # (_res_9_ninit/_res_9_nsearch/_res_9_nclose). The Go framework is
+      # static, so the host target must link libresolv (golang/go#58416).
+      - sdk: libresolv.tbd
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anarki.samizdat-test
@@ -119,6 +123,9 @@ targets:
       - framework: Frameworks/SamizdatClient.xcframework
         embed: true
         codeSign: true
+      # See the main-target note above: libresolv is required by the Go
+      # cgo DNS-resolver trampolines inside the static gomobile framework.
+      - sdk: libresolv.tbd
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.anarki.samizdat-test.tunnel
