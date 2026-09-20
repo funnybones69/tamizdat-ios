@@ -472,7 +472,7 @@ struct SettingsView: View {
         vksPortDraft = String(VKSPreferences.listenPort)
 
         if !VKSPreferences.enabled {
-            vksFeedback = "Сохранено: VKS выключен (текущая ле��тница доживёт до переподключения)"
+            vksFeedback = "Сохранено: VKS выключен (текущая лестница доживёт до переподключения)"
         } else if !VKSPreferences.isConfigured {
             vksFeedback = "Сохранено, но лестница не собрана: нужна комната + валидный key (64 hex) + shortid"
         } else {
