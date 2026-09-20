@@ -72,6 +72,15 @@ type Server struct {
 	deviceID      string
 	sessionID     string
 
+	// UDP relay state (see udp.go). udpPendingFlows counts flows being
+	// dialled so the cap holds while a dial is in flight.
+	unsafeAllowPrivateUDPTargets bool
+	udpDisabled                  bool
+	maxUDPFlows                  int
+	udpMu                        sync.Mutex
+	udpFlows                     map[serverUDPKey]*serverUDPFlow
+	udpPendingFlows              int
+
 	dnsServer      string
 	resolver       *net.Resolver
 	socksProxyAddr string
@@ -111,6 +120,12 @@ type Config struct {
 	OnSessionClose   SessionCloseFunc
 	OnTraffic        TrafficFunc
 	OnHealth         HealthFunc
+	// UDPDisabled turns the SOCKS5 UDP relay off; UDPMaxFlows caps concurrent
+	// flows (0 means the default). UnsafeAllowPrivateUDPTargets lets flows
+	// reach loopback, private and link-local targets; tests only.
+	UDPDisabled                  bool
+	UDPMaxFlows                  int
+	UnsafeAllowPrivateUDPTargets bool
 	// DialHook, when set (tamizdat integration), overrides target dialing so
 	// the host server can route via its outbound registry with per-user
 	// policy. Receives the session ID returned by AuthHook.
@@ -149,7 +164,10 @@ func Run(ctx context.Context, cfg Config) error {
 		dialHook: cfg.DialHook,
 		liveness: cfg.Liveness, health: runtime.NewHealthTracker(cfg.OnHealth),
 		peerSessions: make(map[string]*peerSession), peerStats: make(map[string]peerStat),
-		done: make(chan struct{}),
+		udpDisabled: cfg.UDPDisabled, maxUDPFlows: normalizeMaxUDPFlows(cfg.UDPMaxFlows),
+		unsafeAllowPrivateUDPTargets: cfg.UnsafeAllowPrivateUDPTargets,
+		udpFlows:                     make(map[serverUDPKey]*serverUDPFlow),
+		done:                         make(chan struct{}),
 	}
 	defer func() {
 		s.shutdown()

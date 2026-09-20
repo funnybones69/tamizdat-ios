@@ -52,6 +52,14 @@ import (
 
 const (
 	defaultMaxPayloadSize = 60 * 1024
+
+	// publishBurstBytes is what the writer's token bucket holds when the
+	// engine's service polices how fast a participant may publish (see
+	// engine.PublishRateLimited): two full samples, so both a peer pump and
+	// the writer loop can pass one in the same tick, and at the ceilings we
+	// meet a tenth of a second of traffic, far too short to look sustained.
+	// The rate itself is the service's, not this transport's.
+	publishBurstBytes     = 2 * defaultMaxPayloadSize
 	defaultConnectTimeout = 60 * time.Second
 	rtpBufSize            = 65536
 	// outboundQueueSize bounds KCP packets waiting for the paced writer. Sized
@@ -106,9 +114,11 @@ type streamTransport struct {
 	// reaches the track and to assert that writeSampleLocked serializes
 	// concurrent callers. It must consume data before returning, matching
 	// TrackLocalStaticSample.WriteSample. Always invoked under writeMu.
-	sampleWriter func([]byte) bool
-	onData       func([]byte)
-	onPeerData   func(peerID string, data []byte)
+	sampleWriter   func([]byte) bool
+	onData         func([]byte)
+	onPeerData     func(peerID string, data []byte)
+	onDatagram     func([]byte)
+	onPeerDatagram func(peerID string, data []byte)
 	// serverMode records which side of the link this is. The multi-peer
 	// (server) side keeps one session per remote epoch; the single-peer
 	// (client) side latches onto exactly one. Routing decisions read this
@@ -119,6 +129,9 @@ type streamTransport struct {
 	// Both are plain KCP planes with independent epochs and queues.
 	data    *kcpPlane
 	control *kcpPlane
+	// datagram is the lossy lane: whole frames the writer sends as they are,
+	// bypassing KCP, after control and before bulk data (see datagram.go).
+	datagram chan []byte
 
 	// onControlData / onPeerControlData are swapped in by the upper layer at
 	// any time and read on every received control frame, so they are atomic
@@ -159,6 +172,15 @@ type streamTransport struct {
 	// shaper applies the optional traffic policy to the bulk data path only;
 	// the control plane must stay unpaced.
 	shaper *transport.Shaper
+
+	// limiter holds the whole track under the rate the engine's service
+	// tolerates from one publisher, and is nil when it polices none. Every
+	// write charges it; the bulk writers ask it first.
+	limiter *common.PublishLimiter
+	// sendWindow is the KCP send window every plane of this transport runs
+	// with: a round trip of the ceiling when there is one, the relay's own
+	// appetite when there is not.
+	sendWindow int
 
 	// peers holds one session per remote epoch in server mode. Each session
 	// owns an isolated bulk KCP plus, once the peer starts handshaking, its
@@ -216,18 +238,27 @@ func newStreamTransport(
 	cfg transport.Config,
 	opts Options,
 ) *streamTransport {
+	// The ceiling comes from the engine, so a service that polices
+	// publishers paces this transport and one that does not leaves it
+	// alone.
+	limiter := common.NewPublishLimiter(common.PublishRateLimit(stream), publishBurstBytes)
 	tr := &streamTransport{
 		Lifecycle:        common.NewLifecycle(stream),
 		stream:           stream,
 		track:            track,
 		onData:           cfg.OnData,
 		onPeerData:       cfg.OnPeerData,
+		onDatagram:       cfg.OnDatagram,
+		onPeerDatagram:   cfg.OnPeerDatagram,
 		serverMode:       cfg.OnPeerData != nil,
+		datagram:         make(chan []byte, datagramQueueSize),
 		closeCh:          make(chan struct{}),
 		writerDone:       make(chan struct{}),
 		frameInterval:    time.Second / time.Duration(opts.FPS),
 		batchSize:        opts.BatchSize,
 		bindingToken:     channelBindingToken(cfg),
+		limiter:          limiter,
+		sendWindow:       kcpSendWindow(limiter != nil),
 		localEpoch:       randomEpoch(),
 		peerRestartGrace: defaultPeerRestartGrace,
 	}
@@ -238,6 +269,8 @@ func newStreamTransport(
 		}
 	})
 	tr.control = newKCPPlane(controlOutboundQueueSize, tr.deliverControlData)
+	// Both planes run with this transport's window.
+	tr.data.sndWnd, tr.control.sndWnd = tr.sendWindow, tr.sendWindow
 
 	tr.shaper = transport.NewShaper(cfg.Traffic, tr.Features())
 
@@ -374,6 +407,7 @@ func (p *streamTransport) Close() error {
 		p.data.close()
 		p.control.close()
 		p.peers.closeAll()
+		p.drainDatagramQueue()
 
 		if p.writerUp.Load() {
 			<-p.writerDone
@@ -456,5 +490,5 @@ func (p *streamTransport) CanSend() bool {
 
 // Features describes the current vp8channel transport semantics.
 func (p *streamTransport) Features() transport.Features {
-	return p.shaper.Features(transport.Features{MaxPayloadSize: defaultMaxPayloadSize})
+	return p.shaper.Features(transport.Features{MaxPayloadSize: defaultMaxPayloadSize, Datagram: true})
 }

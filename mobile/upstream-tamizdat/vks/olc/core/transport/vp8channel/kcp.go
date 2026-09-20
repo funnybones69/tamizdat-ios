@@ -33,6 +33,17 @@ const (
 	kcpSndWnd = 4096
 	kcpRcvWnd = 4096
 
+	// kcpPacedSndWnd is the send window when the writer publishes under a
+	// ceiling the engine's service polices. The send window is what a
+	// sender can have unacknowledged, so at a fixed publish rate it is also
+	// how long a byte handed to KCP waits behind the bulk already queued:
+	// 4096 segments is 5.7 MB, which an unpoliced SFU drains at whatever
+	// rate it takes but a paced writer turns into seconds of standing queue
+	// in front of every new stream. 512 segments is ~0.7 MB: a round trip
+	// of the ceiling even on WB Stream's 380 ms path, and well under a
+	// second of standing queue.
+	kcpPacedSndWnd = 512
+
 	// Length prefix for our message framing on top of KCP stream mode.
 	// We use stream mode because UDPSession.Write fragments messages > MSS
 	// outside of kcp.Send, which destroys the frg field that message mode
@@ -61,7 +72,21 @@ type kcpRuntime struct {
 	closeOnce sync.Once
 }
 
-func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte) (*kcpRuntime, error) {
+// kcpSendWindow returns the send window in segments: the host's profile,
+// cut to a round trip of the ceiling when the writer publishes under one.
+func kcpSendWindow(paced bool) int {
+	wnd := kcpSndWnd
+	if paced && kcpPacedSndWnd < wnd {
+		wnd = kcpPacedSndWnd
+	}
+	return wnd
+}
+
+// startKCP brings up one KCP session. sndWnd is the send window in segments;
+// 0 takes this host's profile.
+func startKCP(
+	out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrLen]byte, sndWnd int,
+) (*kcpRuntime, error) {
 	c := newKCPConn(out, inboundQueueSize, epochHdr)
 
 	sess, err := kcp.NewConn3(kcpConvID, fakeUDPAddr(), nil, 0, 0, c)
@@ -79,7 +104,10 @@ func startKCP(out chan<- *packetBuffer, onData func([]byte), epochHdr [epochHdrL
 	// the wire. With nc=1 KCP keeps the window full and retransmits the few
 	// losses, letting throughput reach the SFU's real ceiling.
 	sess.SetNoDelay(1, 5, 2, 1)
-	sess.SetWindowSize(kcpSndWnd, kcpRcvWnd)
+	if sndWnd <= 0 {
+		sndWnd = kcpSendWindow(false)
+	}
+	sess.SetWindowSize(sndWnd, kcpRcvWnd)
 	sess.SetMtu(kcpMTU)
 	// Upstream marked SetStreamMode deprecated without providing a replacement;
 	// stream framing is still required for our wire format.
@@ -178,6 +206,9 @@ func (r *kcpRuntime) close() {
 type kcpPlane struct {
 	out    chan *packetBuffer
 	onData func([]byte)
+	// sndWnd is the KCP send window its sessions run with; 0 takes this
+	// host's profile. The transport sets it.
+	sndWnd int
 
 	// lifecycleMu serializes start/restart/close. Without it two concurrent
 	// restarts - a provider reconnect and an upper-layer ResetPeer fire
@@ -228,7 +259,7 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
 			return
 		}
 		var rt *kcpRuntime
-		rt, err = startKCP(p.out, p.onData, hdr)
+		rt, err = startKCP(p.out, p.onData, hdr, p.sndWnd)
 		if err != nil {
 			return
 		}
@@ -260,7 +291,7 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
 		old.close()
 	}
 
-	rt, err := startKCP(p.out, p.onData, hdr)
+	rt, err := startKCP(p.out, p.onData, hdr, p.sndWnd)
 	if err != nil {
 		return
 	}

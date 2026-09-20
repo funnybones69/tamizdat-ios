@@ -45,6 +45,8 @@ type Config struct {
 	Name                string
 	OnData              func([]byte)
 	OnPeerData          func(peerID string, data []byte)
+	OnDatagram          func([]byte)
+	OnPeerDatagram      func(peerID string, data []byte)
 	DNSServer           string
 	Resolver            *net.Resolver
 	ProxyAddr           string
@@ -141,6 +143,8 @@ func register(name string, provider auth.Provider) {
 			Name:                cfg.Name,
 			OnData:              cfg.OnData,
 			OnPeerData:          cfg.OnPeerData,
+			OnDatagram:          cfg.OnDatagram,
+			OnPeerDatagram:      cfg.OnPeerDatagram,
 			DNSServer:           cfg.DNSServer,
 			Resolver:            cfg.Resolver,
 			ProxyAddr:           cfg.ProxyAddr,

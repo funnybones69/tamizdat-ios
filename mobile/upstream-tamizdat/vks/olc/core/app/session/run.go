@@ -87,6 +87,7 @@ func runServer(
 		SOCKSProxyUser: cfg.SOCKSProxyUser, SOCKSProxyPass: cfg.SOCKSProxyPass,
 		TransportOptions: opts, Engine: cfg.Engine, URL: cfg.URL, Token: cfg.Token,
 		ProviderToken: cfg.ProviderToken, Liveness: liveness, Traffic: traffic,
+		UDPDisabled: cfg.UDPDisabled, UDPMaxFlows: cfg.UDPMaxFlows,
 		OnSessionOpen: func(sessionID, deviceID string, claims map[string]any) {
 			logger.Infof("session opened: id=%s device=%s claims=%v", sessionID, deviceID, claims)
 		},
@@ -118,6 +119,7 @@ func runClient(
 		SOCKSPass: cfg.SOCKSPass, TransportOptions: opts, Engine: cfg.Engine,
 		URL: cfg.URL, Token: cfg.Token, ProviderToken: cfg.ProviderToken,
 		Liveness: liveness, Traffic: traffic,
+		UDPDisabled: cfg.UDPDisabled, UDPMaxFlows: cfg.UDPMaxFlows,
 	})
 	if err != nil {
 		return fmt.Errorf("client: %w", err)

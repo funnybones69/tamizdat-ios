@@ -19,7 +19,10 @@ type writerState struct {
 	// retried on the next tick before consuming more frames.
 	pendingControl *packetBuffer
 	pendingData    *packetBuffer
-	batchBuf       []byte
+	// pendingDatagram is a lossy sample that failed WriteSample, or the
+	// first datagram of the next route split off by batchDatagramSampleFrom.
+	pendingDatagram []byte
+	batchBuf        []byte
 }
 
 func (w *writerState) releasePending() {
@@ -52,13 +55,28 @@ func (w *writerState) writeSample(data []byte) bool {
 func (p *streamTransport) writeSampleLocked(data []byte) bool {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	// Every sample this transport publishes passes here, so this is where
+	// the rate the relay sees is counted - control frames and keepalives
+	// included, which are charged but never held back.
+	var written bool
 	if p.sampleWriter != nil {
-		return p.sampleWriter(data)
+		written = p.sampleWriter(data)
+	} else {
+		written = p.track.WriteSample(media.Sample{
+			Data:     data,
+			Duration: p.frameInterval,
+		}) == nil
 	}
-	return p.track.WriteSample(media.Sample{
-		Data:     data,
-		Duration: p.frameInterval,
-	}) == nil
+	if written {
+		p.limiter.Charge(len(data))
+	}
+	return written
+}
+
+// readyToSend reports whether the bucket has room for a bulk frame of this
+// size. The control plane never asks.
+func (p *streamTransport) readyToSend(frame []byte) bool {
+	return p.limiter.Ready(len(frame))
 }
 
 // forceKeepalive emits a clean, fully-decodable VP8 keepalive keyframe at a
@@ -102,6 +120,65 @@ func (w *writerState) drainControl() bool {
 	}
 }
 
+// drainDatagram sends queued lossy datagrams after control frames and before
+// reliable KCP data. Returns false when a sample must be retried next tick.
+func (w *writerState) drainDatagram() bool {
+	if w.pendingDatagram != nil {
+		if !w.writeSample(w.pendingDatagram) {
+			return false
+		}
+		w.pendingDatagram = nil
+	}
+	for {
+		select {
+		case frame := <-w.p.datagram:
+			sample := w.batchDatagramSampleFrom(w.p.datagram, frame)
+			w.idleTicks = 0
+			if !w.writeSample(sample) {
+				w.pendingDatagram = sample
+				return false
+			}
+		default:
+			return true
+		}
+	}
+}
+
+// batchDatagramSampleFrom packs first and the datagrams queued behind it that
+// share its epoch header into one OLUB sample, up to batchSize packets and
+// defaultMaxPayloadSize bytes. A datagram bound elsewhere, or one that no
+// longer fits, waits in pendingDatagram for the next sample.
+func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) []byte {
+	if len(first) <= epochHdrLen || w.p.batchSize <= 1 {
+		return first
+	}
+	sample := make([]byte, 0, defaultMaxPayloadSize)
+	sample = append(sample, first[:epochHdrLen]...)
+	sample = append(sample, datagramBatchMagic[:]...)
+	sample = appendBatchPacket(sample, first[epochHdrLen:])
+	for packets := 1; packets < w.p.batchSize; packets++ {
+		select {
+		case frame := <-src:
+			if !sameEpochHeader(first, frame) {
+				w.pendingDatagram = frame
+				return sample
+			}
+			payload := frame[epochHdrLen:]
+			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+				w.pendingDatagram = frame
+				return sample
+			}
+			sample = appendBatchPacket(sample, payload)
+		default:
+			if packets == 1 {
+				return first
+			}
+			return sample
+		}
+	}
+	return sample
+}
+
 // drainData sends one batched data frame, or a keepalive when idle.
 func (w *writerState) drainData() {
 	frame := w.pendingData
@@ -119,6 +196,14 @@ func (w *writerState) drainData() {
 			hdr := w.p.epochHeader()
 			_ = w.writeSample(hdr[:])
 		}
+		return
+	}
+	// The frame stays queued until the bucket has room for it, which is
+	// what keeps the whole track under the rate the relay tolerates. The
+	// idle counter is left alone: there is data to send, so this is not an
+	// idle tick.
+	if !w.p.readyToSend(frame.data) {
+		w.pendingData = frame
 		return
 	}
 	w.idleTicks = 0
@@ -156,6 +241,10 @@ func (p *streamTransport) writerLoop() {
 			// Priority 1+2: drain all control frames before any bulk data.
 			if !w.drainControl() {
 				continue // a control frame is still failing; retry next tick
+			}
+			// Priority 2: lossy datagrams go before reliable bulk data.
+			if !w.drainDatagram() {
+				continue
 			}
 			// Priority 3: drain a batched data frame (or send keepalive).
 			w.drainData()
@@ -218,6 +307,12 @@ func (p *streamTransport) peerWriterPump(out chan *packetBuffer, done <-chan str
 				}
 			}
 			if frame == nil {
+				continue
+			}
+			// Every peer pump and the writer loop share one bucket,
+			// because the relay meters the publisher, not the writer.
+			if !p.readyToSend(frame.data) {
+				pending = frame
 				continue
 			}
 			if !p.canBatch(frame.data) {

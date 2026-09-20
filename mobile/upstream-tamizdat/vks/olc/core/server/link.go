@@ -20,7 +20,9 @@ func (s *Server) bringUpLink(ctx context.Context, cfg Config, cancel context.Can
 		ChannelID: cfg.ChannelID, DNSServer: s.dnsServer,
 		Options: cfg.TransportOptions, Traffic: cfg.Traffic,
 	}, tunnelcore.LinkRoleConfig{
-		OnData: s.onData, OnPeerData: s.onPeerData, Resolver: s.resolver,
+		OnData: s.onData, OnPeerData: s.onPeerData,
+		OnDatagram: s.onDatagram, OnPeerDatagram: s.onPeerDatagram,
+		Resolver:  s.resolver,
 		ProxyAddr: s.socksProxyAddr, ProxyPort: s.socksProxyPort,
 	})
 	ln, err := transport.New(ctx, cfg.Transport, linkCfg)
@@ -213,6 +215,7 @@ func (s *Server) closePeerRouting(teardown peerRoutingTeardown) {
 	for _, peer := range teardown.peers {
 		s.closePeerSession(peer, "reconnect")
 	}
+	s.closeAllUDPFlows()
 }
 
 func (s *Server) staleReinstall(dead *smux.Session) bool {
@@ -255,6 +258,7 @@ func (s *Server) swapSession(dead *smux.Session, replacement *tunnelcore.Session
 		s.onClose(oldSessionID, "reconnect")
 		s.trackPeerClose(oldSessionID, "reconnect")
 	}
+	s.closeAllUDPFlows()
 	return true
 }
 
@@ -323,6 +327,7 @@ func (s *Server) closeSession() {
 	for _, peer := range peers {
 		s.closePeerSession(peer, "closed")
 	}
+	s.closeAllUDPFlows()
 }
 
 func (s *Server) onData(data []byte) {

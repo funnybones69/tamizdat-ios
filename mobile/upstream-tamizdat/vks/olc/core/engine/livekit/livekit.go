@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,13 +27,16 @@ import (
 
 const (
 	dataPublishTopic = "olcrtc"
-	videoTrackName   = "videochannel"
+	// datagramPublishTopic carries the lossy lane: unreliable data packets the
+	// receiver hands to OnDatagram instead of the byte stream.
+	datagramPublishTopic = "olcrtc.udp"
+	videoTrackName       = "videochannel"
 	// maxReconnects is generous on purpose: the WB Stream SFU churns room
 	// sessions routinely (relay rotations, ICE restarts), and observed live
 	// runs rode through 15-24 reconnects per hour. A 10-attempt limit gave up
 	// mid-churn and closed the tunnel; 30 rides out a bad window while the
 	// client-side ladder still owns final failover.
-	maxReconnects    = 30
+	maxReconnects = 30
 
 	// leaveGrace is how long disconnect() lets the SFU act on our
 	// LEAVE_REQUEST before returning. See sdkRoom.disconnect.
@@ -43,6 +47,31 @@ const (
 	// It covers a full reconnect cycle (connect + republish) with margin.
 	roomReadyTimeout = 60 * time.Second
 	roomReadyPoll    = 50 * time.Millisecond
+
+	// connectTimeout bounds one join in the SDK: the signalling socket,
+	// the JoinResponse and the peer connection reaching connected all run
+	// on this one clock, and the SDK bounds its own resumes and its wait
+	// for the publisher on a publish with it too. Left unset it is 5 s,
+	// which a phone on cellular spends before ICE is done: an iPhone on
+	// MegaFon and Yota LTE failed WB Stream with "could not connect after
+	// timeout" while Wi-Fi worked. The iOS extension waits 35 s for ready;
+	// 25 s leaves 10 of them for provider auth before the join and the
+	// olcRTC hello/welcome after it.
+	connectTimeout = 25 * time.Second
+
+	// publishRateLimit is what a participant of this engine's service may
+	// publish, in bytes a second, before the service acts on it.
+	//
+	// WB Stream removes a participant - its room-manager calling LiveKit's
+	// RemoveParticipant, arriving here as PARTICIPANT_REMOVED - about 40 s
+	// after its published video passes roughly 12 Mbit/s. Measured against
+	// a WB room (2026-09-20, fixed-rate probe): 9.6 and 10.8 Mbit/s ran
+	// 3 min untouched, 12 Mbit/s was removed after 45 s and 24 Mbit/s
+	// after 43 s; a short burst followed by quiet survived, so the service
+	// judges a sustained rate, not a total. The value below leaves the
+	// measured boundary a margin and is still several times what the
+	// tunnel needs.
+	publishRateLimit = 1_200_000
 )
 
 var (
@@ -60,6 +89,7 @@ var (
 
 type roomHandle interface {
 	publishData(data []byte) error
+	publishDatagram(data []byte, peerID string) error
 	publishTrack(track webrtc.TrackLocal) error
 	unpublishLocalTracks()
 	disconnect()
@@ -77,6 +107,20 @@ func (r *sdkRoom) publishData(data []byte) error {
 		lksdk.WithDataPublishReliable(true),
 	); err != nil {
 		return fmt.Errorf("publish data packet: %w", err)
+	}
+	return nil
+}
+
+func (r *sdkRoom) publishDatagram(data []byte, peerID string) error {
+	opts := []lksdk.DataPublishOption{
+		lksdk.WithDataPublishTopic(datagramPublishTopic),
+		lksdk.WithDataPublishReliable(false),
+	}
+	if peerID != "" {
+		opts = append(opts, lksdk.WithDataPublishDestination([]string{peerID}))
+	}
+	if err := r.room.LocalParticipant.PublishDataPacket(lksdk.UserData(data), opts...); err != nil {
+		return fmt.Errorf("publish datagram packet: %w", err)
 	}
 	return nil
 }
@@ -157,21 +201,28 @@ type Session struct {
 	engine.Reconnector
 	engine.VideoTrackState
 
-	url          string
-	token        string
-	name         string
-	refresh      func(ctx context.Context) (engine.Credentials, error)
-	connectRoom  connectRoomFunc
-	connectOpts  []lksdk.ConnectOption
-	room         roomHandle
-	roomMu       sync.RWMutex
-	onData       func([]byte)
-	closeCh      chan struct{}
-	sendQueue    chan []byte
-	closed       atomic.Bool
-	reconnecting atomic.Bool
-	done         chan struct{}
-	queuedBytes  atomic.Int64
+	url         string
+	token       string
+	name        string
+	refresh     func(ctx context.Context) (engine.Credentials, error)
+	connectRoom connectRoomFunc
+	connectOpts []lksdk.ConnectOption
+	room        roomHandle
+	roomMu      sync.RWMutex
+	onData      func([]byte)
+	onDatagram  func([]byte)
+	// onPeerDatagram, when set, receives datagrams with their sender's
+	// identity; a datagram whose sender is unknown falls back to onDatagram.
+	onPeerDatagram func(peerID string, data []byte)
+	closeCh        chan struct{}
+	sendQueue      chan []byte
+	closed         atomic.Bool
+	reconnecting   atomic.Bool
+	done           chan struct{}
+	queuedBytes    atomic.Int64
+	// joinTimeout overrides connectTimeout. Zero means the default; only
+	// tests set it.
+	joinTimeout time.Duration
 	// roomReady overrides roomReadyTimeout. Zero means the default; only
 	// tests set it.
 	roomReady      time.Duration
@@ -216,10 +267,12 @@ func New(_ context.Context, cfg engine.Config) (engine.Session, error) {
 		connectRoom: connectSDKRoom,
 		connectOpts: connectOpts,
 		onData:      cfg.OnData,
+		onDatagram:  cfg.OnDatagram,
 		closeCh:     make(chan struct{}),
 		sendQueue:   make(chan []byte, engine.DefaultSendQueueSize),
 		done:        make(chan struct{}),
 	}
+	s.onPeerDatagram = cfg.OnPeerDatagram
 	s.Configure(engine.ReconnectorConfig{
 		MaxAttempts: maxReconnects,
 		Reconnect:   s.reconnect,
@@ -242,14 +295,10 @@ func (s *Session) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (s *Session) connectSession(_ context.Context) error {
+func (s *Session) connectSession(ctx context.Context) error {
 	roomCB := &lksdk.RoomCallback{
 		ParticipantCallback: lksdk.ParticipantCallback{
-			OnDataReceived: func(data []byte, _ lksdk.DataReceiveParams) {
-				if s.onData != nil {
-					s.onData(data)
-				}
-			},
+			OnDataPacket: s.handleDataPacket,
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, _ *lksdk.RemoteTrackPublication, _ *lksdk.RemoteParticipant) {
 				if track.Kind() != webrtc.RTPCodecTypeVideo {
 					return
@@ -270,13 +319,81 @@ func (s *Session) connectSession(_ context.Context) error {
 		},
 	}
 
-	room, err := s.connectRoom(s.url, s.token, roomCB, s.connectOpts...)
+	// The join budget and the wait through joinRoom: the SDK's own 5 s
+	// default is spent before ICE finishes on slow paths.
+	budget := connectTimeout
+	if s.joinTimeout > 0 {
+		budget = s.joinTimeout
+	}
+	url, token := s.url, s.token
+	opts := append(slices.Clip(s.connectOpts), lksdk.WithConnectTimeout(budget))
+	room, err := s.joinRoom(ctx, func() (roomHandle, error) {
+		return s.connectRoom(url, token, roomCB, opts...)
+	})
 	if err != nil {
 		return fmt.Errorf("connect to room: %w", err)
 	}
 
 	s.setRoom(room)
 	return s.publishPendingTracks()
+}
+
+// joinRoom runs join and waits for it, for ctx or for the session to close.
+//
+// The SDK's join could take ctx, but only its signalling socket would watch
+// it: the wait for the peer connection after that is a bare timer, so a
+// caller that gave up would sit out the rest of connectTimeout. The join is
+// waited on here instead. One that ends after its caller left fails on its
+// own budget or, if it did connect, is disconnected straight away instead of
+// staying in the room.
+func (s *Session) joinRoom(ctx context.Context, join func() (roomHandle, error)) (roomHandle, error) {
+	type joinResult struct {
+		room roomHandle
+		err  error
+	}
+	joined := make(chan joinResult, 1)
+	go func() {
+		room, err := join()
+		joined <- joinResult{room: room, err: err}
+	}()
+	var err error
+	select {
+	case res := <-joined:
+		return res.room, res.err
+	case <-ctx.Done():
+		err = fmt.Errorf("join abandoned: %w", ctx.Err())
+	case <-s.done:
+		err = ErrSessionClosed
+	}
+	go func() {
+		if res := <-joined; res.err == nil {
+			res.room.disconnect()
+		}
+	}()
+	return nil, err
+}
+
+// handleDataPacket routes a received user packet by topic: the datagram topic
+// feeds the lossy lane, everything else is the byte stream. The SDK's
+// OnDataReceived is its deprecated twin and stays unset so nothing is
+// delivered twice.
+func (s *Session) handleDataPacket(packet lksdk.DataPacket, params lksdk.DataReceiveParams) {
+	user, ok := packet.(*lksdk.UserDataPacket)
+	if !ok {
+		return
+	}
+	if user.Topic == datagramPublishTopic {
+		switch {
+		case s.onPeerDatagram != nil && params.SenderIdentity != "":
+			s.onPeerDatagram(params.SenderIdentity, user.Payload)
+		case s.onDatagram != nil:
+			s.onDatagram(user.Payload)
+		}
+		return
+	}
+	if s.onData != nil {
+		s.onData(user.Payload)
+	}
 }
 
 func (s *Session) publishPendingTracks() error {
@@ -371,6 +488,30 @@ func (s *Session) Send(data []byte) error {
 	}
 }
 
+// SendDatagram publishes one unordered, lossy data packet to the room.
+func (s *Session) SendDatagram(data []byte) error {
+	return s.SendDatagramTo("", data)
+}
+
+// SendDatagramTo publishes one unordered, lossy data packet to a participant.
+// Datagrams skip the send queue: a packet that cannot go now is worth nothing
+// later, so an unconnected room refuses it instead of parking it.
+func (s *Session) SendDatagramTo(peerID string, data []byte) error {
+	if s.closed.Load() {
+		return ErrSessionClosed
+	}
+	room := s.currentRoom()
+	if room == nil || room.connectionState() != lksdk.ConnectionStateConnected {
+		return ErrRoomNotConnected
+	}
+	return room.publishDatagram(data, peerID)
+}
+
+// DatagramCanSend reports whether a datagram would be published now.
+func (s *Session) DatagramCanSend() bool {
+	return s.CanSend()
+}
+
 // Close terminates the session.
 func (s *Session) Close() error {
 	s.closed.Store(true)
@@ -451,6 +592,10 @@ func (s *Session) CanSend() bool {
 
 // SubscriberCanSend reports whether the subscriber path is ready to send.
 func (s *Session) SubscriberCanSend() bool { return s.CanSend() }
+
+// PublishRateLimit is the ceiling a transport on this engine keeps its media
+// under; see publishRateLimit.
+func (s *Session) PublishRateLimit() int { return publishRateLimit }
 
 // GetBufferedAmount reports the bytes queued in this engine's outbound
 // channel and nothing else.

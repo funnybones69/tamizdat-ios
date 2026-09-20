@@ -21,6 +21,11 @@ const (
 	ConnectAckHostUnreachable byte = 0x04
 )
 
+// UDPRecordAAD binds a sealed datagram to the UDP relay so a record lifted
+// from the byte stream and replayed as a datagram (or the reverse) fails to
+// open.
+const UDPRecordAAD = "olcrtc/udp/v1"
+
 // SetupKeySet creates shared directional tunnel keys and adds the role to errors.
 func SetupKeySet(keyHex string, role crypto.Role) (*crypto.KeySet, error) {
 	keys, err := runtime.SetupKeySet(keyHex, role)

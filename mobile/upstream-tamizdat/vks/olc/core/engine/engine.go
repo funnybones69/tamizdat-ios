@@ -49,7 +49,11 @@ type Config struct {
 	Extra      map[string]string
 	OnData     func([]byte)
 	OnPeerData func(peerID string, data []byte)
-	DNSServer  string
+	// OnDatagram receives unordered, lossy datagram payloads. Unlike OnData
+	// they never pass through smux and the room may drop them.
+	OnDatagram     func([]byte)
+	OnPeerDatagram func(peerID string, data []byte)
+	DNSServer      string
 	Resolver   *net.Resolver
 	ProxyAddr  string
 	ProxyPort  int
@@ -92,6 +96,19 @@ type PeerSession interface {
 	SendTo(peerID string, data []byte) error
 }
 
+// DatagramSession is implemented by engines that can send unordered, lossy
+// datagrams independently of the reliable byte stream.
+type DatagramSession interface {
+	SendDatagram(data []byte) error
+	DatagramCanSend() bool
+}
+
+// PeerDatagramSession is implemented by engines that can address lossy
+// datagrams to a specific remote endpoint.
+type PeerDatagramSession interface {
+	SendDatagramTo(peerID string, data []byte) error
+}
+
 // PeerReadySession is implemented by engines that can signal when a remote
 // peer has appeared in the shared room. WaitForPeer blocks until the first
 // epoch frame from a remote participant is received, or ctx is cancelled.
@@ -109,6 +126,16 @@ type PeerIdentity interface {
 // PeerResetter is implemented by engines that retain a remote peer binding.
 type PeerResetter interface {
 	ResetPeer()
+}
+
+// PublishRateLimited is implemented by engines whose service polices how fast
+// one participant may publish. A transport that publishes media asks its
+// session for the ceiling and keeps what it writes under it; an engine that
+// does not implement this, or that returns 0, is left unpaced and the relay
+// itself decides what it takes.
+type PublishRateLimited interface {
+	// PublishRateLimit is the ceiling in bytes a second, or 0 for none.
+	PublishRateLimit() int
 }
 
 // VideoTrackCapable is implemented by engines that can exchange video tracks.
