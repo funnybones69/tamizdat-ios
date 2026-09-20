@@ -92,7 +92,7 @@ enum VKSPreferences {
     }
 
     static var isConfigured: Bool {
-        !ladderSpec.isEmpty && !keyHex.isEmpty && !shortIDHex.isEmpty
+        !ladderSpec.isEmpty && keyLooksValid && !shortIDHex.isEmpty
     }
 
     /// 64 hex characters — the olcRTC wire-key shape.

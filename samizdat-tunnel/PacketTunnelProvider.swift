@@ -293,7 +293,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // can chain TCP flows through its loopback listener. The app
         // writes the settings into the App Group; changes apply on the
         // next connect.
-        if VKSPreferences.enabled && VKSPreferences.isConfigured {
+        if VKSPreferences.enabled && VKSPreferences.isConfigured && !policy.usesTURN {
             let vksStatus = SocksstubStartVKSUpstream(
                 VKSPreferences.ladderSpec,
                 VKSPreferences.keyHex,
@@ -304,8 +304,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.info("[vks] upstream start requested: \(vksStatus)")
         } else {
             _ = SocksstubStopVKSUpstream()
-            log("info: [vks] disabled or not configured — VKS chain inactive")
-            ExtLog.info("[vks] disabled or not configured — VKS chain inactive")
+            let vksReason = policy.usesTURN ? "VK TURN has priority" : "disabled or not configured"
+            log("info: [vks] chain inactive (\(vksReason))")
+            ExtLog.info("[vks] chain inactive (\(vksReason))")
         }
         return true
     }

@@ -405,7 +405,7 @@ struct SettingsView: View {
                 vksField("shortid", "hex из users", $vksShortIDDraft)
                 vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
 
-                Text("Лестница: telemost → wbstream → jazz → mts. Комнаты создаёт сервер (owner), клиент входит гостем. TCP-потоки идут через комнаты, пока upstream поднят.")
+                Text("Лестница: telemost → wbstream → jazz → mts. Комнаты создаёт сервер (owner), клиент входит гостем. Изоляции пар на iOS нет — выделяй комнату на устройство. При активном VK TURN он приоритетнее, лестница не стартует.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
 
@@ -454,8 +454,12 @@ struct SettingsView: View {
         VKSPreferences.mtsRoom = vksMtsDraft
         VKSPreferences.keyHex = vksKeyDraft
         VKSPreferences.shortIDHex = vksShortIDDraft
-        if let port = Int(vksPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)), port > 0 {
+        let portText = vksPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        var portNote = ""
+        if let port = Int(portText), (1024...65535).contains(port), port != 9000, port != 18443 {
             VKSPreferences.listenPort = port
+        } else {
+            portNote = " Порт отклонён: нужен 1024–65535, кроме 9000/18443."
         }
 
         // Re-sync the drafts with the normalized persisted values.
@@ -468,12 +472,13 @@ struct SettingsView: View {
         vksPortDraft = String(VKSPreferences.listenPort)
 
         if !VKSPreferences.enabled {
-            vksFeedback = "Сохранено: VKS выключен"
+            vksFeedback = "Сохранено: VKS выключен (текущая ле��тница доживёт до переподключения)"
         } else if !VKSPreferences.isConfigured {
-            vksFeedback = "Сохранено, но лестница пуста: нужны комната + key + shortid"
+            vksFeedback = "Сохранено, но лестница не собрана: нужна комната + валидный key (64 hex) + shortid"
         } else {
             vksFeedback = "Сохранено: \(VKSPreferences.providerCount) провайдер(а); применится при следующем connect"
         }
+        vksFeedback += portNote
     }
 
     private var configurationCard: some View {

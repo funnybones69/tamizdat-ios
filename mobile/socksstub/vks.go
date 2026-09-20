@@ -20,8 +20,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
+	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,19 +43,52 @@ type vksState struct {
 
 var vksUp vksState
 
+// routeStdLogsToSink wires the Go standard logger into the App Group log
+// file (rt.appendLog). The olc client and the ladder log exclusively via
+// the std `log` package, which otherwise goes to stderr - invisible on
+// device. Idempotent: SetOutput simply replaces the writer.
+func routeStdLogsToSink() {
+	log.SetOutput(io.MultiWriter(os.Stderr, logSinkWriter{}))
+}
+
+// logSinkWriter adapts std log writes to the socksstub log sink.
+type logSinkWriter struct{}
+
+func (logSinkWriter) Write(p []byte) (int, error) {
+	for _, line := range strings.Split(strings.TrimRight(string(p), "\n"), "\n") {
+		if line != "" {
+			rt.appendLog(line)
+		}
+	}
+	return len(p), nil
+}
+
 // StartVKSUpstream starts the VKS ladder and its local SOCKS5 listener.
 // specs is a comma-separated provider:room ladder (telemost:…,wbstream:…,
 // jazz:…,mts:…). keyHex is the shared olcRTC wire key; shortIDHex is the
 // tamizdat master_shortid. listenPort is the loopback SOCKS5 port.
 // Returns a JSON status line. Non-blocking: the ladder runs in background.
 func StartVKSUpstream(specs, keyHex, shortIDHex string, listenPort int) string {
+	// Bridge ladder diagnostics (std log) into the App Group log file so
+	// they are visible on device.
+	routeStdLogsToSink()
+
 	vksUp.mu.Lock()
 	defer vksUp.mu.Unlock()
 	if vksUp.running {
+		if specs != vksUp.specs {
+			rt.appendLog("warn: VKS upstream already running with different specs - keeping the current ladder until stop")
+		}
 		return vksStatusJSON("already-running", vksUp.addr, "")
 	}
 	if specs == "" || keyHex == "" || shortIDHex == "" {
 		return vksStatusJSON("error", "", "specs, keyHex and shortIDHex are required")
+	}
+	if listenPort < 1024 || listenPort > 65535 {
+		return vksStatusJSON("error", "", "listenPort must be 1024..65535")
+	}
+	if listenPort == 18443 || listenPort == 9000 {
+		return vksStatusJSON("error", "", "listenPort collides with an in-process listener (18443 socksstub / 9000 VK TURN relay)")
 	}
 	cfgs, err := vks.ParseSpecs(specs)
 	if err != nil {
@@ -167,7 +203,9 @@ func dialViaSocks5(ctx context.Context, proxyAddr, dest string) (net.Conn, error
 			_ = c.Close()
 		}
 	}()
-	_ = c.SetDeadline(time.Now().Add(15 * time.Second))
+	// 5s cap: a flapping or dead ladder must not eat the flow's dial
+	// budget - dialUpstream falls back to samizdat after this.
+	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 	// Greeting: VER=5, NMETHODS=1, NOAUTH.
 	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {
 		return nil, err

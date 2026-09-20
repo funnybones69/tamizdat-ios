@@ -1054,7 +1054,7 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 		if c, err := dialViaSocks5(ctx, addr, dest); err == nil {
 			return c, nil
 		} else {
-			flowLogf("vks chain dial %s -> %s failed: %v", dest, addr, err)
+			rt.appendLog(fmt.Sprintf("warn: vks chain dial %s -> %s failed: %v", dest, addr, err))
 		}
 	}
 	rt.mu.Lock()
