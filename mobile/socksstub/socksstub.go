@@ -1047,6 +1047,16 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	if n := VKTurnNetstack(); n != nil {
 		return n.DialContext(ctx, "tcp", dest)
 	}
+	// VKS room-tunnel upstream (operator started the ladder): chain the
+	// flow through the local SOCKS5 listener it serves. The olc client is
+	// stream-only, so this path is TCP; UDP keeps the precedence below.
+	if addr := vksUpstreamAddr(); addr != "" {
+		if c, err := dialViaSocks5(ctx, addr, dest); err == nil {
+			return c, nil
+		} else {
+			flowLogf("vks chain dial %s -> %s failed: %v", dest, addr, err)
+		}
+	}
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
@@ -1061,6 +1071,8 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 
 // dialUpstreamUDP returns a net.PacketConn bound to a single target,
 // either via the samizdat UDP-over-H2 tunnel or a direct UDP socket.
+// The VKS chain is TCP-only (olc streams), so it does not appear here;
+// UDP flows keep the VK TURN / samizdat / direct precedence.
 func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	// Phase 2G PART C — same precedence as dialUpstream. The netstack
 	// uses gvisor-backed UDP sockets; we wrap into a PacketConn the
