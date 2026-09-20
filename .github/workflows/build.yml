@@ -144,6 +144,8 @@ jobs:
           MARKETING="0.2.${BUILD_NUM}-${GIT_SHA}"
           IPA_ARTIFACT_NAME="${{ steps.ipa_name.outputs.name }}.ipa"
           echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM IPA_ARTIFACT_NAME=$IPA_ARTIFACT_NAME"
+          # DIAG: keep the raw xcodebuild log so link errors survive xcpretty.
+          set +e
           xcodebuild archive \
             -project samizdat-ios.xcodeproj \
             -scheme "$SCHEME" \
@@ -156,7 +158,13 @@ jobs:
             MARKETING_VERSION="$MARKETING" \
             CURRENT_PROJECT_VERSION="$BUILD_NUM" \
             IPA_ARTIFACT_NAME="$IPA_ARTIFACT_NAME" \
-            | xcpretty
+            2>&1 | tee /tmp/xcodebuild-archive.log | xcpretty
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "=== RAW xcodebuild tail (link errors) ==="
+            tail -400 /tmp/xcodebuild-archive.log
+          fi
+          exit "$status"
 
       - name: Export IPA
         run: |
