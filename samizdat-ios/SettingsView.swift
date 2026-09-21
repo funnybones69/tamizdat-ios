@@ -39,6 +39,7 @@ struct SettingsView: View {
     // the verified pool size of 20 workers; peer/password still derive from Main.
     @State private var vkRoomsDraft: String = VKCredsPreferences.roomHashes.joined(separator: "\n")
     @State private var vkCallHashFeedback: String = ""
+    @State private var turnServerDraft: String = VKCredsPreferences.turnServer
 
     // VKS room transports (whitelist carrier ladder). Drafts only — they
     // persist via VKSPreferences on Save; the extension applies them on
@@ -51,6 +52,7 @@ struct SettingsView: View {
     @State private var vksKeyDraft: String = VKSPreferences.keyHex
     @State private var vksShortIDDraft: String = VKSPreferences.shortIDHex
     @State private var vksPortDraft: String = String(VKSPreferences.listenPort)
+    @State private var vksServerDraft: String = VKSPreferences.server
     @State private var vksTelemostOnDraft: Bool = VKSPreferences.telemostEnabled
     @State private var vksWbstreamOnDraft: Bool = VKSPreferences.wbstreamEnabled
     @State private var vksJazzOnDraft: Bool = VKSPreferences.jazzEnabled
@@ -259,10 +261,6 @@ struct SettingsView: View {
                 }
 
                 switch whitelistMode {
-                case .h2Backup:
-                    Text("Используется Backup-URI из Proxies → Endpoint. Настройки VKS и VK TURN при этом не активны.")
-                        .font(.geistMono(.regular, size: 10))
-                        .foregroundStyle(theme.textDim)
                 case .vks:
                     vksCarrierContent
                 case .vkTurn:
@@ -333,10 +331,20 @@ struct SettingsView: View {
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
 
-                Text("Server is derived from Main URI; connection password is that user's shortid. VK TURN is enabled by Whitelist mode = TURN.")
+                Text("Server: host:port для TURN-плеча (пусто = берётся из Main URI). Пароль подключения — shortid пользователя. VK TURN включается при Whitelist mode = TURN.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
                     .padding(.top, 4)
+                TextField("Server (host:port)", text: $turnServerDraft)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .keyboardType(.URL)
+                    .font(.geistMono(.regular, size: 12.5))
+                    .foregroundStyle(theme.text)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
 
                 if !vkCallHashFeedback.isEmpty {
                     Text(vkCallHashFeedback)
@@ -372,6 +380,7 @@ struct SettingsView: View {
 
     private func saveVKTurnSettings() {
         let oldRooms = VKCredsPreferences.roomHashes
+        VKCredsPreferences.turnServer = turnServerDraft
         let derived = syncVKDerivedH2Config()
         let rooms = Self.roomHashes(from: vkRoomsDraft)
         guard rooms.count <= VKCredsPreferences.maxRooms else {
@@ -454,6 +463,7 @@ struct SettingsView: View {
                 vksProviderRow("MTS", "https://my.mts-link.ru/j/…", on: $vksMtsOnDraft, text: $vksMtsDraft)
                 vksField("olcRTC key", "64 hex", $vksKeyDraft)
                 vksField("shortid", "hex из users", $vksShortIDDraft)
+            vksField("Server", "host:port (без дефолта)", $vksServerDraft)
                 vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
 
                 Text("Мастер-тумблер (сверху): VKS активен — в whitelist-режиме перехватывает у VK TURN (тот остаётся резервом). Ниже у каждого провайдера свой тумблер — можно оставить включённым один и смотреть, как он работает. Комнаты создаёт сервер (owner), клиент входит гостем; изоляции пар нет — выделяй комнату на устройство.")
@@ -532,6 +542,7 @@ struct SettingsView: View {
         VKSPreferences.mtsRoom = vksMtsDraft
         VKSPreferences.keyHex = vksKeyDraft
         VKSPreferences.shortIDHex = vksShortIDDraft
+        VKSPreferences.server = vksServerDraft
         let portText = vksPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         var portNote = ""
         if let port = Int(portText), (1024...65535).contains(port), port != 9000, port != 18443 {
@@ -551,6 +562,7 @@ struct SettingsView: View {
         vksMtsDraft = VKSPreferences.mtsRoom
         vksKeyDraft = VKSPreferences.keyHex
         vksShortIDDraft = VKSPreferences.shortIDHex
+        vksServerDraft = VKSPreferences.server
         vksPortDraft = String(VKSPreferences.listenPort)
 
         if !VKSPreferences.enabled {

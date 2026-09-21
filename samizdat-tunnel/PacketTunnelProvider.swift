@@ -340,7 +340,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // the WKWebView refresh writer remains main-app-only.
         let groupID = "group.com.anarki.samizdat-test"
         let defaults = UserDefaults(suiteName: groupID)
-        let peer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        let derivedPeer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
+        let explicitPeer = defaults?.string(forKey: "tamizdat.vkturn.server") ?? ""
+        let peer = explicitPeer.isEmpty ? derivedPeer : explicitPeer
         let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
         let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
         let workers = VKCredsPreferences.workers
@@ -819,7 +821,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private static func whitelistModeRaw() -> String {
         UserDefaults(suiteName: appGroupID)?
-            .string(forKey: "tamizdat.whitelistMode") ?? "h2Backup"
+            .string(forKey: "tamizdat.whitelistMode") ?? "vks"
     }
 
     private static func whitelistTargetConfigured(backup: String?, whitelistModeRaw: String) -> Bool {
@@ -827,7 +829,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // not: peer host + password are derived from the Main URI and TURN
         // session params live in App Group storage. Treating nil backup as "primary"
         // here made manual Restricted+Relay silently run H2/Main.
-        backup != nil || whitelistModeRaw == "vkTurn" || (whitelistModeRaw == "vks" && VKSPreferences.isConfigured)
+        whitelistModeRaw == "vkTurn" || (whitelistModeRaw == "vks" && VKSPreferences.isConfigured)
     }
 
     private static func effectiveEndpoint(mode: EndpointMode, backup: String?, whitelistModeRaw: String) -> EndpointMode {

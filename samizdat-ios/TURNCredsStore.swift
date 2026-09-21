@@ -413,6 +413,7 @@ enum VKCredsPreferences {
     private static let deviceIDKey = "tamizdat.vkDeviceID"
     private static let peerAddrKey = "tamizdat.vkPeerAddr"
     private static let connectPasswordKey = "tamizdat.vkConnectPassword"
+    private static let turnServerKey = "tamizdat.vkturn.server"
     private static let workersKey = "tamizdat.vkWorkers"
 
     private static var defaults: UserDefaults? {
@@ -481,6 +482,13 @@ enum VKCredsPreferences {
     static var peerAddr: String {
         get { defaults?.string(forKey: peerAddrKey) ?? "" }
         set { defaults?.set(newValue, forKey: peerAddrKey) }
+    }
+
+    /// Explicit server for the TURN carrier (host:port). Empty = derive
+    /// from the Main URI (legacy). Deliberately no default.
+    static var turnServer: String {
+        get { defaults?.string(forKey: turnServerKey) ?? "" }
+        set { defaults?.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: turnServerKey) }
     }
 
     static var connectPassword: String {

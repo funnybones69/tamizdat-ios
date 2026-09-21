@@ -3,8 +3,6 @@ import Foundation
 /// When the restricted-profile detector flips the tunnel onto the "whitelist"
 /// endpoint, this enum decides WHAT that endpoint actually is.
 ///
-///   - `.h2Backup` — the long-standing behaviour: dial the secondary
-///                   `tamizdat://...` URI the user pasted in Settings.
 ///   - `.vks`      — VKS room carriers: the tamizdat VKS ladder runs in
 ///                   the extension (provider toggles live in the Whitelist
 ///                   card). The backup URI is unused.
@@ -15,7 +13,6 @@ import Foundation
 /// Stored in App Group UserDefaults so the Network Extension and the
 /// main app see the same value through a shared suite.
 enum WhitelistMode: String, CaseIterable, Identifiable {
-    case h2Backup
     case vks
     case vkTurn
 
@@ -25,7 +22,6 @@ enum WhitelistMode: String, CaseIterable, Identifiable {
     /// strings short — they live inside a segmented control.
     var label: String {
         switch self {
-        case .h2Backup: return "H2"
         case .vks:      return "VKS"
         case .vkTurn:   return "TURN"
         }
@@ -38,13 +34,13 @@ enum WhitelistMode: String, CaseIterable, Identifiable {
         UserDefaults(suiteName: appGroupID)
     }
 
-    /// Current selection. Default is `.h2Backup` so existing installs
-    /// keep their old behaviour after upgrade until the user opts in.
+    /// Current selection. Default is `.vks` (H2 no longer works under
+    /// the whitelist, so the carrier picker only offers VKS / TURN).
     static var current: WhitelistMode {
         get {
             guard let raw = defaults?.string(forKey: storeKey),
                   let mode = WhitelistMode(rawValue: raw) else {
-                return .h2Backup
+                return .vks
             }
             return mode
         }

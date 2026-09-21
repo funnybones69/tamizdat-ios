@@ -27,6 +27,7 @@ enum VKSPreferences {
     private static let keyHexKey = "tamizdat.vks.keyHex"
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
     private static let portKey = "tamizdat.vks.listenPort"
+    private static let serverKey = "tamizdat.vks.server"
     private static let telemostEnabledKey = "tamizdat.vks.telemostEnabled"
     private static let wbstreamEnabledKey = "tamizdat.vks.wbstreamEnabled"
     private static let jazzEnabledKey = "tamizdat.vks.jazzEnabled"
@@ -117,6 +118,13 @@ enum VKSPreferences {
     static var shortIDHex: String {
         get { defaults?.string(forKey: shortIDKey) ?? testDefaultShortIDHex }
         set { defaults?.set(trim(newValue).lowercased(), forKey: shortIDKey) }
+    }
+
+    /// Explicit server for the VKS carrier (host:port). Empty = no value
+    /// (deliberately no default).
+    static var server: String {
+        get { defaults?.string(forKey: serverKey) ?? "" }
+        set { defaults?.set(trim(newValue), forKey: serverKey) }
     }
 
     static var listenPort: Int {
