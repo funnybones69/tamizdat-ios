@@ -2,6 +2,7 @@ package wbstream
 
 import (
 	"context"
+	"strings"
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/auth"
 	"github.com/funnybones69/tamizdat/vks/olc/core/logger"
@@ -21,6 +22,24 @@ func (Provider) Engine() string { return "livekit" }
 
 // DefaultServiceURL returns the WB Stream service URL.
 func (Provider) DefaultServiceURL() string { return defaultAPIURL }
+
+// roomIDFromSpec accepts a bare room id ("standup_daily_mk") or a full
+// room link ("https://stream.wb.ru/room/standup_daily_mk") and returns the
+// bare id: the last path segment with scheme, query and fragment stripped.
+func roomIDFromSpec(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if i := strings.Index(raw, "://"); i >= 0 {
+		raw = raw[i+3:]
+	}
+	if i := strings.IndexAny(raw, "?#"); i >= 0 {
+		raw = raw[:i]
+	}
+	raw = strings.Trim(raw, "/")
+	if i := strings.LastIndex(raw, "/"); i >= 0 {
+		raw = raw[i+1:]
+	}
+	return raw
+}
 
 // Issue runs the WB Stream auth flow and returns LiveKit credentials.
 //
@@ -53,7 +72,7 @@ func (p Provider) Issue(ctx context.Context, cfg auth.Config) (auth.Credentials,
 			"reuse it via auth.token to keep this identity", len(accessToken))
 	}
 
-	roomID := cfg.RoomURL
+	roomID := roomIDFromSpec(cfg.RoomURL)
 	if err := p.joinRoom(ctx, client, accessToken, roomID); err != nil {
 		return auth.Credentials{}, err
 	}

@@ -458,7 +458,7 @@ struct SettingsView: View {
                 }
 
                 vksProviderRow("Telemost", "https://telemost.yandex.ru/j/…", on: $vksTelemostOnDraft, text: $vksTelemostDraft)
-                vksProviderRow("WB Stream", "room id", on: $vksWbstreamOnDraft, text: $vksWbstreamDraft)
+                vksProviderRow("WB Stream", "stream.wb.ru/room/… или id", on: $vksWbstreamOnDraft, text: $vksWbstreamDraft)
                 vksProviderRow("Jazz", "roomId:password", on: $vksJazzOnDraft, text: $vksJazzDraft)
                 vksProviderRow("MTS", "https://my.mts-link.ru/j/…", on: $vksMtsOnDraft, text: $vksMtsDraft)
                 vksField("olcRTC key", "64 hex", $vksKeyDraft)
