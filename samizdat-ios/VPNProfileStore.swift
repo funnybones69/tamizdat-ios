@@ -127,13 +127,17 @@ final class VPNProfileStore {
         }
     }
 
-    /// Triggers extension to rebuild the samizdat client. Used by the
-    /// IPA-X V1/V2/V3 picker so flipping the variant immediately
-    /// reflects in the live transport (the new client picks up
-    /// PoolVariantPreferences.current when it constructs the
-    /// ClientConfig).
-    func refreshSamizdatClient() async {
-        _ = try? await sendProviderMessage("refreshSamizdatClient")
+    /// Pushes the freshly saved ACTIVE H2 profile into the running extension
+    /// so a Proxies-screen activation/edit takes effect without a tunnel
+    /// reconnect. Mirrors startTunnel's preparation: resolves the server
+    /// IPv4 first (the app-side DNS path is cleaner) so the extension can
+    /// refresh its excludedRoutes /32, then sends the raw blob. No-op while
+    /// disconnected — the next connect reads ConfigStore anyway.
+    func applyActiveConfigBlob(_ configBlob: String) async {
+        let trimmed = configBlob.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let serverIP = await resolvedIPv4Address(from: trimmed)
+        _ = try? await sendProviderMessage("setConfigBlob\n\(serverIP ?? "-")\n\(trimmed)")
     }
 
     /// IPA-D21: poke the extension to re-read PingURLPreferences.url

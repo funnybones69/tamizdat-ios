@@ -103,6 +103,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var combinedConfigBlob: String = ""
     private var primaryBlob: String = ""
     private var backupBlob: String?
+    /// Server IPv4 mirrored from providerConfiguration at startTunnel and
+    /// refreshed by the app's setConfigBlob push (Proxies live-apply).
+    /// Drives the excludedRoutes /32 so the tunnel never loops on its own
+    /// upstream server.
+    private var currentServerIP: String?
 
     private enum EffectiveUpstream: String {
         case h2
@@ -168,6 +173,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let serverIP = proto.providerConfiguration?["serverIP"] as? String
+        currentServerIP = serverIP
 
         // IPA-P: split the combined blob (which carries an optional
         // &backup=base64url(...) query param) into per-endpoint URLs.
@@ -304,8 +310,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 VKSPreferences.shortIDHex,
                 VKSPreferences.listenPort
             )
-            log("info: [vks] upstream start requested: \(vksStatus)")
-            ExtLog.info("[vks] upstream start requested: \(vksStatus)")
+            let vksServerLabel = VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server
+            log("info: [vks] upstream start requested: \(vksStatus) server=\(vksServerLabel)")
+            ExtLog.info("[vks] upstream start requested: \(vksStatus) server=\(vksServerLabel)")
         } else {
             _ = SocksstubStopVKSUpstream()
             let vksReason = policy.usesVKS ? "disabled or not configured" : "whitelist carrier is not VKS"
@@ -788,7 +795,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     VKSPreferences.shortIDHex,
                     VKSPreferences.listenPort
                 )
-                self.appendExtLog("info: [vks] rewire start requested: \(vksStatus)")
+                self.appendExtLog("info: [vks] rewire start requested: \(vksStatus) server=\(VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server)")
             } else {
                 _ = SocksstubStopVKSUpstream()
                 self.appendExtLog("info: [vks] rewire - carrier is not VKS or disabled; ladder stopped")
@@ -940,6 +947,38 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func handleAppMessage(_ messageData: Data,
                                    completionHandler: ((Data?) -> Void)?) {
         let cmd = String(data: messageData, encoding: .utf8) ?? "ping"
+        // Live-apply of the ACTIVE H2 profile from the Proxies screen.
+        // Wire format: "setConfigBlob\n<serverIPv4|->\n<rawBlob>". The app
+        // resolves the server IP (its DNS path is cleaner) and sends the
+        // raw blob — same shape startTunnel receives via providerConfiguration.
+        if cmd.hasPrefix("setConfigBlob\n") {
+            let rest = String(cmd.dropFirst("setConfigBlob\n".count))
+            let parts = rest.components(separatedBy: "\n")
+            let ipRaw = parts.first ?? ""
+            let blob = parts.dropFirst().joined(separator: "\n")
+            let newIP: String? = (ipRaw.isEmpty || ipRaw == "-") ? nil : ipRaw
+            let split = SamizdatURLCodec.split(blob)
+            combinedConfigBlob = blob
+            primaryBlob = split.primary
+            backupBlob = split.backup
+            appendExtLog("info: app pushed new active config (primary=\(split.primary.count) chars, serverIP=\(newIP ?? "nil"))")
+            // Refresh the /32 exclusion only when an IP was actually resolved;
+            // a failed resolve keeps the old exclusion (harmless: the old
+            // server is no longer dialed).
+            if let newIP, newIP != currentServerIP {
+                currentServerIP = newIP
+                setTunnelNetworkSettings(makeNetworkSettings(serverIP: newIP)) { [weak self] error in
+                    if let error {
+                        self?.appendExtLog("warn: setConfigBlob network settings: \(error.localizedDescription)")
+                    } else {
+                        self?.appendExtLog("info: setConfigBlob network settings re-applied for \(newIP)")
+                    }
+                }
+            }
+            rewireUpstream()
+            completionHandler?("configApplied".data(using: .utf8))
+            return
+        }
         switch cmd {
         case "ping":
             completionHandler?("pong".data(using: .utf8))
@@ -953,15 +992,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             startWhitelistDetectorIfNeeded()
             rewireUpstream()
             completionHandler?("switched:\(mode.rawValue)".data(using: .utf8))
-        case "refreshSamizdatClient":
-            // IPA-D22: pool-variant UI deleted. Path retained for
-            // future cases where the app wants to force a samizdat
-            // client rebuild; pool variant is now hardcoded V1 in the
-            // setInProcessSocks bootstrap.
-            appendExtLog("info: app requested samizdat refresh")
-            SocksstubSetPoolVariant("v1")
-            rewireUpstream()
-            completionHandler?("refreshed".data(using: .utf8))
         case "refreshPingURL":
             // IPA-D21: SettingsView's ping-probe URL field changed in the
             // main app. Re-read from App Group UserDefaults and push into

@@ -235,8 +235,8 @@ struct EndpointsView: View {
     }
 
     /// Swaps a saved profile into the active slot; the previous active
-    /// stays available as a saved profile. Live-applies into the running
-    /// tunnel via the refreshSamizdatClient RPC.
+    /// stays available as a saved profile. Live-applied into the running
+    /// tunnel by persistImmediately's setConfigBlob push.
     private func activateProfile(_ url: String) {
         let current = primaryURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if !current.isEmpty {
@@ -247,7 +247,6 @@ struct EndpointsView: View {
         profiles = ProfileStore.all()
         pasteError = nil
         persistImmediately()
-        Task { await VPNProfileStore.shared.refreshSamizdatClient() }
     }
 
     private func deleteProfile(_ url: String) {
@@ -275,6 +274,11 @@ struct EndpointsView: View {
         let combined = SamizdatURLCodec.compose(primary: p, backup: nil)
         ConfigStore.shared.save(combined)
         VKCredsPreferences.applyDerivedH2PeerConfig(SamizdatURLCodec.h2PeerConfig(from: combined))
+        // Live-apply into the running tunnel (no-op while disconnected —
+        // the next connect reads ConfigStore anyway). The derived TURN peer
+        // above is already in the App Group, so the extension's rewire
+        // re-attaches TURN with the new peer.
+        Task { await VPNProfileStore.shared.applyActiveConfigBlob(combined) }
     }
 
     // MARK: – Profiles section
