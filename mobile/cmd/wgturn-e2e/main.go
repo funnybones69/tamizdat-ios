@@ -32,6 +32,7 @@ func main() {
 		password  = flag.String("password", "", "wgturn password (= user shortid)")
 		workers   = flag.Int("workers", 20, "TURN worker sessions (each = own allocation)")
 		parallel  = flag.Int("parallel", 8, "parallel download connections")
+		readMbps  = flag.Float64("readmbps", 0, "per-connection read cap in Mbit/s (0 = unlimited) - slows server bursts")
 		target    = flag.String("target", "proof.ovh.net:80", "HTTP host:port to download from")
 		path      = flag.String("path", "/files/100Mb.dat", "HTTP path")
 		dur       = flag.Duration("dur", 30*time.Second, "measurement window")
@@ -80,7 +81,7 @@ func main() {
 		go func(idx int) {
 			defer wg.Done()
 			for time.Now().Before(stopAt) {
-				downloadOnce(ctx, tunNet, *target, *path, &gotBytes, stopAt)
+				downloadOnce(ctx, tunNet, *target, *path, &gotBytes, stopAt, *readMbps)
 			}
 		}(i)
 	}
@@ -92,7 +93,7 @@ func main() {
 // downloadOnce opens one TCP connection through the tunnel netstack, issues
 // a raw HTTP/1.1 GET and streams the body until the deadline, logging the
 // per-connection lifecycle (dial time, first byte, total bytes, end cause).
-func downloadOnce(ctx context.Context, tunNet *netstack.Net, target, path string, counter *atomic.Int64, stopAt time.Time) {
+func downloadOnce(ctx context.Context, tunNet *netstack.Net, target, path string, counter *atomic.Int64, stopAt time.Time, readMbps float64) {
 	t0 := time.Now()
 	dctx, dcancel := context.WithDeadline(ctx, stopAt)
 	defer dcancel()
@@ -131,6 +132,7 @@ func downloadOnce(ctx context.Context, tunNet *netstack.Net, target, path string
 	buf := make([]byte, 32768)
 	var body int64
 	var bodyBuf []byte
+	readStart := time.Now()
 	for {
 		n, err := br.Read(buf)
 		if n > 0 {
@@ -142,6 +144,14 @@ func downloadOnce(ctx context.Context, tunNet *netstack.Net, target, path string
 				bodyBuf = append(bodyBuf, buf[:min(n, 200-len(bodyBuf))]...)
 			}
 			counter.Add(int64(n))
+			if readMbps > 0 {
+				// Pace reads: keep the server's send rate under the relay
+				// policer ceiling so nothing bursts into drops.
+				wantElapsed := time.Duration(float64(body*8) / (readMbps * 1e6) * float64(time.Second))
+				if lag := wantElapsed - time.Since(readStart); lag > 0 {
+					time.Sleep(lag)
+				}
+			}
 		}
 		if err != nil {
 			if body < 200 {
