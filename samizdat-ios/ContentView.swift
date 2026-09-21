@@ -67,6 +67,10 @@ struct ContentView: View {
         if WhitelistMode.current == .vkTurn {
             return true
         }
+        // VKS carrier needs no backup URI: the ladder IS the whitelist target.
+        if WhitelistMode.current == .vks {
+            return VKSPreferences.isConfigured
+        }
         return SamizdatURLCodec.split(blob).backup != nil
     }
 

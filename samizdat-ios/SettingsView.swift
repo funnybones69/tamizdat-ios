@@ -115,16 +115,10 @@ struct SettingsView: View {
                         configurationCard
                             .padding(.horizontal, 16)
 
-                        // ── VK TURN ──────────────────────────────
-                        SectionLabel(text: "VK TURN")
+                        // ── Whitelist carrier ────────────────────
+                        SectionLabel(text: "Whitelist carrier")
                             .padding(.top, 22)
-                        vkTurnCard
-                            .padding(.horizontal, 16)
-
-                        // ── VKS rooms ────────────────────────────
-                        SectionLabel(text: "VKS rooms")
-                            .padding(.top, 22)
-                        vksRoomsCard
+                        whitelistCarrierCard
                             .padding(.horizontal, 16)
 
                         // ── Ping probe ───────────────────────────
@@ -224,6 +218,60 @@ struct SettingsView: View {
         }
     }
 
+    /// Unified whitelist block: picks the carrier used when the detector
+    /// flips to the whitelist endpoint — VKS rooms, legacy H2 backup, or
+    /// VK TURN (in that order; TURN last). The carrier-specific settings
+    /// show inline below the picker.
+    private var whitelistCarrierCard: some View {
+        CardContainer(padding: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 12) {
+                    IconCard(systemName: "shield.lefthalf.filled",
+                             bg: theme.amberDim, fg: theme.amber)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Whitelist carrier")
+                            .font(.geist(.medium, size: 16))
+                            .foregroundStyle(theme.text)
+                        Text("What carries traffic under the whitelist")
+                            .font(.geistMono(.regular, size: 11))
+                            .foregroundStyle(theme.textDim)
+                    }
+                    Spacer()
+                }
+
+                Text("Whitelist mode")
+                    .font(.geist(.medium, size: 12))
+                    .foregroundStyle(theme.textMuted)
+                Picker("", selection: $whitelistMode) {
+                    ForEach(WhitelistMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: whitelistMode) { _, newValue in
+                    WhitelistMode.current = newValue
+                    // Re-evaluate the currently effective endpoint immediately.
+                    // Without this RPC, H2↔VKS↔TURN only changed persisted prefs
+                    // and the live extension kept the old upstream until reconnect.
+                    Task {
+                        _ = await VPNProfileStore.shared.switchEndpoint(to: EndpointModeStore.current)
+                    }
+                }
+
+                switch whitelistMode {
+                case .h2Backup:
+                    Text("Используется Backup-URI из Proxies → Endpoint. Настройки VKS и VK TURN при этом не активны.")
+                        .font(.geistMono(.regular, size: 10))
+                        .foregroundStyle(theme.textDim)
+                case .vks:
+                    vksCarrierContent
+                case .vkTurn:
+                    vkTurnCarrierContent
+                }
+            }
+        }
+    }
+
     // VK TURN card: lets the operator paste a VK call-invite hash. The
     // hash is required by VKSession paramsClient / TURNSession paramsRefresher to begin
     // the 5-step VK API flow; if it is empty, refresh silently no-ops.
@@ -235,9 +283,10 @@ struct SettingsView: View {
     // Donor caveat (amurcanov/network adapter-turn-vk-android README): when leaving
     // the call, choose "just leave" — not "end for everyone" — otherwise
     // the hash dies and refresh starts failing with VKSession paramsError.deadHash.
-    private var vkTurnCard: some View {
-        CardContainer(padding: 16) {
-            VStack(alignment: .leading, spacing: 12) {
+    /// VK TURN carrier sub-config — shown inside the Whitelist card when
+    /// Whitelist mode = TURN.
+    private var vkTurnCarrierContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 12) {
                     IconCard(systemName: "phone.connection",
                              bg: theme.mintDim, fg: theme.mint)
@@ -305,7 +354,6 @@ struct SettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-            }
         }
     }
 
@@ -377,13 +425,12 @@ struct SettingsView: View {
         }
     }
 
-    // VKS rooms card: four provider slots + the shared olcRTC wire key,
-    // shortid and loopback port. The ladder itself runs in the
-    // PacketTunnel extension; saving only persists the values — they are
-    // applied on the next VPN connect.
-    private var vksRoomsCard: some View {
-        CardContainer(padding: 16) {
-            VStack(alignment: .leading, spacing: 12) {
+    /// VKS carrier sub-config — shown inside the Whitelist card when
+    /// Whitelist mode = VKS: master toggle + one toggle per provider.
+    /// The ladder itself runs in the PacketTunnel extension; saving only
+    /// persists the values — they are applied on the next VPN connect.
+    private var vksCarrierContent: some View {
+        VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 12) {
                     IconCard(systemName: "network",
                              bg: theme.blueDim, fg: theme.blue)
@@ -429,7 +476,6 @@ struct SettingsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-            }
         }
     }
 
@@ -605,29 +651,6 @@ struct SettingsView: View {
                             .foregroundStyle(theme.textDim)
                     }
                     Spacer()
-                }
-
-                // Phase 2G: pick how the "whitelist" endpoint actually
-                // works. H2 = legacy backup URI. TURN = VK TURN relay.
-                // Switching this does NOT clear the existing backup URI,
-                // so the operator can flip back without re-pasting.
-                Text("Whitelist mode")
-                    .font(.geist(.medium, size: 12))
-                    .foregroundStyle(theme.textMuted)
-                Picker("", selection: $whitelistMode) {
-                    ForEach(WhitelistMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: whitelistMode) { _, newValue in
-                    WhitelistMode.current = newValue
-                    // Re-evaluate the currently effective endpoint immediately.
-                    // Without this RPC, H2↔TURN only changed persisted prefs and
-                    // the live extension kept the old upstream until reconnect.
-                    Task {
-                        _ = await VPNProfileStore.shared.switchEndpoint(to: EndpointModeStore.current)
-                    }
                 }
 
                 Text("Normally blocked ping target")

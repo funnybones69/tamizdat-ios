@@ -5,6 +5,9 @@ import Foundation
 ///
 ///   - `.h2Backup` — the long-standing behaviour: dial the secondary
 ///                   `tamizdat://...` URI the user pasted in Settings.
+///   - `.vks`      — VKS room carriers: the tamizdat VKS ladder runs in
+///                   the extension (provider toggles live in the Whitelist
+///                   card). The backup URI is unused.
 ///   - `.vkTurn`   — new (Phase 2G): route the same traffic through
 ///                   VK TURN instead. The backup URI is unused (but
 ///                   NOT deleted — the operator may flip back).
@@ -13,6 +16,7 @@ import Foundation
 /// main app see the same value through a shared suite.
 enum WhitelistMode: String, CaseIterable, Identifiable {
     case h2Backup
+    case vks
     case vkTurn
 
     var id: String { rawValue }
@@ -22,6 +26,7 @@ enum WhitelistMode: String, CaseIterable, Identifiable {
     var label: String {
         switch self {
         case .h2Backup: return "H2"
+        case .vks:      return "VKS"
         case .vkTurn:   return "TURN"
         }
     }

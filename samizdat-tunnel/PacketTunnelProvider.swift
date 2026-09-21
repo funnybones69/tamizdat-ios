@@ -106,6 +106,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private enum EffectiveUpstream: String {
         case h2
+        case vks
         case turn
     }
 
@@ -116,6 +117,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let upstream: EffectiveUpstream
 
         var usesTURN: Bool { upstream == .turn }
+        var usesVKS: Bool { upstream == .vks }
     }
 
     private let rewireQueue = DispatchQueue(label: "com.anarki.samizdat-test.rewire", qos: .userInitiated)
@@ -290,10 +292,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         // VKS room transports: the ladder runs in THIS process — the same
         // Go runtime as the socksstub SOCKS5 bridge — so `dialUpstream`
-        // can chain TCP flows through its loopback listener. The app
+        // can chain TCP flows through its loopback listener. The ladder
+        // starts ONLY under the whitelist endpoint with WhitelistMode=VKS
+        // (VKS is whitelist-only; the main mode rides plain H2). The app
         // writes the settings into the App Group; changes apply on the
-        // next connect.
-        if VKSPreferences.enabled && VKSPreferences.isConfigured {
+        // next connect (or on an endpoint-switch rewire).
+        if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured {
             let vksStatus = SocksstubStartVKSUpstream(
                 VKSPreferences.ladderSpec,
                 VKSPreferences.keyHex,
@@ -304,7 +308,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.info("[vks] upstream start requested: \(vksStatus)")
         } else {
             _ = SocksstubStopVKSUpstream()
-            let vksReason = "disabled or not configured"
+            let vksReason = policy.usesVKS ? "disabled or not configured" : "whitelist carrier is not VKS"
             log("info: [vks] chain inactive (\(vksReason))")
             ExtLog.info("[vks] chain inactive (\(vksReason))")
         }
@@ -773,6 +777,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if policy.usesTURN {
                 Self.attachVKTurnUpstream()
             }
+            // Mirror for VKS: the ladder follows the whitelist policy on
+            // rewires (mode/endpoint flips), not only at startTunnel.
+            if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured {
+                let vksStatus = SocksstubStartVKSUpstream(
+                    VKSPreferences.ladderSpec,
+                    VKSPreferences.keyHex,
+                    VKSPreferences.shortIDHex,
+                    VKSPreferences.listenPort
+                )
+                self.appendExtLog("info: [vks] rewire start requested: \(vksStatus)")
+            } else {
+                _ = SocksstubStopVKSUpstream()
+                self.appendExtLog("info: [vks] rewire - carrier is not VKS or disabled; ladder stopped")
+            }
 
             self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
 
@@ -809,7 +827,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // not: peer host + password are derived from the Main URI and TURN
         // session params live in App Group storage. Treating nil backup as "primary"
         // here made manual Restricted+Relay silently run H2/Main.
-        backup != nil || whitelistModeRaw == "vkTurn"
+        backup != nil || whitelistModeRaw == "vkTurn" || (whitelistModeRaw == "vks" && VKSPreferences.isConfigured)
     }
 
     private static func effectiveEndpoint(mode: EndpointMode, backup: String?, whitelistModeRaw: String) -> EndpointMode {
@@ -828,7 +846,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static func upstreamPolicy(mode: EndpointMode, backup: String?) -> UpstreamPolicy {
         let whitelist = whitelistModeRaw()
         let effective = effectiveEndpoint(mode: mode, backup: backup, whitelistModeRaw: whitelist)
-        let upstream: EffectiveUpstream = (effective == .backup && whitelist == "vkTurn") ? .turn : .h2
+        let upstream: EffectiveUpstream
+        if effective == .backup, whitelist == "vkTurn" {
+            upstream = .turn
+        } else if effective == .backup, whitelist == "vks" {
+            upstream = .vks
+        } else {
+            upstream = .h2
+        }
         return UpstreamPolicy(endpointMode: mode, effectiveEndpoint: effective, whitelistModeRaw: whitelist, upstream: upstream)
     }
 
