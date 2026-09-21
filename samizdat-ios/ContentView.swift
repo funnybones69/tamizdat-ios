@@ -60,18 +60,14 @@ struct ContentView: View {
     @State private var pendingSwitchClearTask: Task<Void, Never>?
 
     private static func checkBackupConfigured() -> Bool {
-        guard let blob = ConfigStore.shared.load() else { return false }
-        // In H2 mode the Whitelist endpoint is the saved backup URI. In
-        // VK TURN mode it is derived from the Main URI, so absence of a
-        // backup URI must not force the UI/state back to Main.
-        if WhitelistMode.current == .vkTurn {
+        guard ConfigStore.shared.load() != nil else { return false }
+        // The whitelist carrier is VKS or TURN; H2-under-whitelist is gone.
+        switch WhitelistMode.current {
+        case .vkTurn:
             return true
-        }
-        // VKS carrier needs no backup URI: the ladder IS the whitelist target.
-        if WhitelistMode.current == .vks {
+        case .vks:
             return VKSPreferences.isConfigured
         }
-        return SamizdatURLCodec.split(blob).backup != nil
     }
 
     // MARK: – Derived state
