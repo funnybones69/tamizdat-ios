@@ -28,6 +28,8 @@ enum VKSPreferences {
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
     private static let wakeDNSKey = "tamizdat.vks.wakeDNS"
     private static let wakeZoneKey = "tamizdat.vks.wakeZone"
+    private static let portKey = "tamizdat.vks.listenPort"
+    private static let serverKey = "tamizdat.vks.server"
     private static let telemostEnabledKey = "tamizdat.vks.telemostEnabled"
     private static let wbstreamEnabledKey = "tamizdat.vks.wbstreamEnabled"
     private static let jazzEnabledKey = "tamizdat.vks.jazzEnabled"
