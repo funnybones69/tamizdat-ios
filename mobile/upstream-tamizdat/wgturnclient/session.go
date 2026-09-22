@@ -543,7 +543,9 @@ func RunSession(
 	// inner TCP. A token bucket just under the ceiling keeps delivery clean.
 	var uplinkLimiter *rate.Limiter
 	if mbps := uplinkPacingMbps(); mbps > 0 {
-		uplinkLimiter = rate.NewLimiter(rate.Limit(mbps*1e6/8), 48*1024)
+		// Small burst = truly smooth pacing (a large burst flushes a backlog
+		// instantly and trips the relay policer).
+		uplinkLimiter = rate.NewLimiter(rate.Limit(mbps*1e6/8), 4*1024)
 	}
 	go func() {
 		defer proxyWg.Done()
