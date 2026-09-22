@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +18,7 @@ import (
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/pion/logging"
 	"github.com/pion/turn/v5"
+	"golang.org/x/time/rate"
 )
 
 const (
@@ -63,6 +66,21 @@ func memoryProfileForWorkers(workers int) sessionMemoryProfile {
 // Ported from cacggghp/vk-turn-proxy (GPL-3.0), commit e8a9696
 // (client/main.go:66, 1404-1409).
 var handshakeSem = make(chan struct{}, handshakeSemCap)
+
+// uplinkPacingMbps reads WGTURN_UPLINK_MBPS: per-worker client→server pacing
+// in Mbit/s. 0/unset disables. The relay policer drops bursts above ~2.1
+// Mbit/s per allocation, so pace just under (e.g. 1.9) for clean delivery.
+func uplinkPacingMbps() float64 {
+	v := strings.TrimSpace(os.Getenv("WGTURN_UPLINK_MBPS"))
+	if v == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 {
+		return 0
+	}
+	return f
+}
 
 type dtlsHandshaker interface {
 	HandshakeContext(context.Context) error
@@ -520,7 +538,13 @@ func RunSession(
 	})
 	defer stopDTLS()
 
-	// Writer: dispatcher → DTLS
+	// Writer: dispatcher → DTLS. Optional per-worker uplink pacing: the relay
+	// policer drops bursts above ~2.1 Mbit/s per allocation, which collapses
+	// inner TCP. A token bucket just under the ceiling keeps delivery clean.
+	var uplinkLimiter *rate.Limiter
+	if mbps := uplinkPacingMbps(); mbps > 0 {
+		uplinkLimiter = rate.NewLimiter(rate.Limit(mbps*1e6/8), 48*1024)
+	}
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
@@ -547,6 +571,11 @@ func RunSession(
 				if now.Sub(lastWriteDeadline) > 5*time.Second {
 					_ = dtlsConn.SetWriteDeadline(now.Add(10 * time.Second))
 					lastWriteDeadline = now
+				}
+				if uplinkLimiter != nil {
+					if err := uplinkLimiter.WaitN(sessCtx, len(pkt)); err != nil {
+						return
+					}
 				}
 				if _, writeErr := dtlsConn.Write(pkt); writeErr != nil {
 					log.Printf("[ВОРКЕР #%d] Ошибка Writer (Payload): %v", sessionID, writeErr)
