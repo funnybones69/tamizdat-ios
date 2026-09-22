@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport"
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport/seichannel"
@@ -32,6 +33,10 @@ type Config struct {
 	// RoomURL is the provider room identifier (Telemost room URL, WB room id,
 	// Jazz room link, Jitsi host/room, MTS room link).
 	RoomURL string
+	// ChannelID, when set, derives this pair's frame-binding token, letting
+	// several pairs share one SFU room without accepting each other's
+	// frames. Empty derives the token from RoomURL.
+	ChannelID string
 	// ProviderToken is an optional account token for providers whose room
 	// creation or publish rights need an account (WB Stream). Empty = guest.
 	ProviderToken string
@@ -46,6 +51,11 @@ type Config struct {
 	Name string
 	// DNSServer optionally overrides DNS resolution for provider endpoints.
 	DNSServer string
+	// IdleTimeout, when > 0, makes RunServer leave the room once it has had
+	// zero authenticated peers for this whole span. Used by the on-demand
+	// watcher so the server does not sit in a room 24/7: the room lives only
+	// while a client is in it, plus one join-grace window.
+	IdleTimeout time.Duration
 }
 
 // transportName picks the in-room carrier. vp8channel (video-frame muling) is

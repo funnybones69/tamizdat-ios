@@ -146,6 +146,41 @@ func openControlStreamTimeout(
 	claims map[string]any,
 	timeout time.Duration,
 ) (*smux.Stream, string, string, error) {
+	// The MTS odin SFU tears the datachannel down every ~27s on BOTH peers
+	// in phase, so a hello sent at channel-open lands exactly when the
+	// server is reinstalling its session and is lost every time. Retrying
+	// the handshake on a fresh stream a few seconds later lands inside the
+	// server's live window. Providers without the teardown cycle succeed
+	// on attempt 1 and never notice.
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return nil, "", "", fmt.Errorf("handshake client: %w", ctx.Err())
+			case <-time.After(5 * time.Second):
+			}
+		}
+		stream, sessionID, peerID, err := tryHandshake(ctx, session, deviceID, claims, timeout)
+		if err == nil {
+			return stream, sessionID, peerID, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, "", "", fmt.Errorf("handshake client: %w", ctx.Err())
+		}
+		logger.Infof("client: handshake attempt %d failed: %v - retrying on a new stream", attempt, err)
+	}
+	return nil, "", "", fmt.Errorf("handshake client (3 attempts): %w", lastErr)
+}
+
+func tryHandshake(
+	ctx context.Context,
+	session *smux.Session,
+	deviceID string,
+	claims map[string]any,
+	timeout time.Duration,
+) (*smux.Stream, string, string, error) {
 	stream, err := session.OpenStream()
 	if err != nil {
 		return nil, "", "", fmt.Errorf("open control stream: %w", err)
@@ -164,9 +199,6 @@ func openControlStreamTimeout(
 	_ = stream.SetDeadline(time.Time{})
 	if err != nil {
 		_ = stream.Close()
-		if ctx.Err() != nil {
-			return nil, "", "", fmt.Errorf("handshake client: %w", ctx.Err())
-		}
 		return nil, "", "", fmt.Errorf("handshake client: %w", err)
 	}
 	return stream, sessionID, peerID, nil

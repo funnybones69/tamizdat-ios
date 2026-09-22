@@ -308,6 +308,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 VKSPreferences.ladderSpec,
                 VKSPreferences.keyHex,
                 VKSPreferences.shortIDHex,
+                VKSPreferences.wakeDNS,
+                VKSPreferences.wakeZone,
                 VKSPreferences.listenPort
             )
             let vksServerLabel = VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server
@@ -793,6 +795,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     VKSPreferences.ladderSpec,
                     VKSPreferences.keyHex,
                     VKSPreferences.shortIDHex,
+                    VKSPreferences.wakeDNS,
+                    VKSPreferences.wakeZone,
                     VKSPreferences.listenPort
                 )
                 self.appendExtLog("info: [vks] rewire start requested: \(vksStatus) server=\(VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server)")

@@ -26,6 +26,22 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 			if ctx.Err() != nil {
 				return nil
 			}
+			// On-demand: emit the wake beacon so the server joins this room
+			// just in time, then give it a short head start to enter before
+			// the client knocks (a guest cannot create the room alone).
+			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
+				rk := RoomWakeKey(cfg.KeyHex, cfg.Provider, cfg.RoomURL)
+				if err := SendWake(ctx, cfg.WakeDNSServer, cfg.WakeZone, rk); err != nil {
+					log.Printf("vks ladder: wake beacon for %s failed: %v", cfg.Provider, err)
+				} else {
+					log.Printf("vks ladder: wake beacon sent for %s (room %s)", cfg.Provider, cfg.RoomURL)
+				}
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(3 * time.Second):
+				}
+			}
 			log.Printf("vks ladder: cycle=%d profile=%d/%d provider=%s room=%s", cycle, i+1, len(specs), cfg.Provider, cfg.RoomURL)
 			err := RunClient(ctx, cfg, func() {
 				log.Printf("vks ladder: profile %s up (socks %s)", cfg.Provider, cfg.ListenAddr)

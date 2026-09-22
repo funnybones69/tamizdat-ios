@@ -67,8 +67,12 @@ func (logSinkWriter) Write(p []byte) (int, error) {
 // specs is a comma-separated provider:room ladder (telemost:…,wbstream:…,
 // jazz:…,mts:…). keyHex is the shared olcRTC wire key; shortIDHex is the
 // tamizdat master_shortid. listenPort is the loopback SOCKS5 port.
-// Returns a JSON status line. Non-blocking: the ladder runs in background.
-func StartVKSUpstream(specs, keyHex, shortIDHex string, listenPort int) string {
+// wakeDNS (e.g. "77.88.8.8:53") and wakeZone (e.g. "wake.example.com"),
+// when both non-empty, make the client emit the on-demand wake beacon
+// (a DNS query for <roomKey>.<nonce>.<zone>) before each connect, so an
+// on-demand server joins the room just in time. Returns a JSON status
+// line. Non-blocking: the ladder runs in background.
+func StartVKSUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
 	// Bridge ladder diagnostics (std log) into the App Group log file so
 	// they are visible on device.
 	routeStdLogsToSink()
@@ -98,7 +102,13 @@ func StartVKSUpstream(specs, keyHex, shortIDHex string, listenPort int) string {
 	ladder := make([]vks.ClientConfig, len(cfgs))
 	for i := range cfgs {
 		cfgs[i].KeyHex = keyHex
-		ladder[i] = vks.ClientConfig{Config: cfgs[i], ShortIDHex: shortIDHex, ListenAddr: addr}
+		ladder[i] = vks.ClientConfig{
+			Config:        cfgs[i],
+			ShortIDHex:    shortIDHex,
+			ListenAddr:    addr,
+			WakeDNSServer: wakeDNS,
+			WakeZone:      wakeZone,
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	vksUp.cancel = cancel

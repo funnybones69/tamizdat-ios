@@ -26,8 +26,8 @@ enum VKSPreferences {
     private static let mtsKey = "tamizdat.vks.mtsRoom"
     private static let keyHexKey = "tamizdat.vks.keyHex"
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
-    private static let portKey = "tamizdat.vks.listenPort"
-    private static let serverKey = "tamizdat.vks.server"
+    private static let wakeDNSKey = "tamizdat.vks.wakeDNS"
+    private static let wakeZoneKey = "tamizdat.vks.wakeZone"
     private static let telemostEnabledKey = "tamizdat.vks.telemostEnabled"
     private static let wbstreamEnabledKey = "tamizdat.vks.wbstreamEnabled"
     private static let jazzEnabledKey = "tamizdat.vks.jazzEnabled"
@@ -46,6 +46,9 @@ enum VKSPreferences {
     static let testDefaultWbstreamRoom = "stab_gw"
     static let testDefaultKeyHex = "REDACTED-VKS-KEY"
     static let testDefaultShortIDHex = "REDACTED-SHORTID"
+    // On-demand wake beacon: Yandex DNS (whitelisted) → wake.example.com NS (ru2).
+    static let testDefaultWakeDNS = "77.88.8.8:53"
+    static let testDefaultWakeZone = "wake.example.com"
 
     static var enabled: Bool {
         get {
@@ -135,6 +138,20 @@ enum VKSPreferences {
         set { defaults?.set(newValue, forKey: portKey) }
     }
 
+    /// On-demand wake beacon: the DNS server to send the wake query
+    /// through (a whitelisted resolver, e.g. "77.88.8.8:53"). Empty
+    /// disables the beacon (the server must then already be in the room).
+    static var wakeDNS: String {
+        get { defaults?.string(forKey: wakeDNSKey) ?? testDefaultWakeDNS }
+        set { defaults?.set(trim(newValue), forKey: wakeDNSKey) }
+    }
+
+    /// On-demand wake beacon: the zone the server's NS is authoritative
+    /// for (e.g. "wake.example.com").
+    static var wakeZone: String {
+        get { defaults?.string(forKey: wakeZoneKey) ?? testDefaultWakeZone }
+        set { defaults?.set(trim(newValue), forKey: wakeZoneKey) }
+    }
     /// Assembled `provider:room,` ladder spec in failover order. A
     /// provider is included only when its switch is on and its room is
     /// filled.

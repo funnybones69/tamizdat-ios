@@ -306,16 +306,17 @@ func (c *DataChannel) StreamIdentifier() uint16 {
 }
 
 func (c *DataChannel) handleDCEP(data []byte) error {
-	// odin SFU legacy DCEP OPEN: 6-byte type-1 frame (01 00*5) on the
-	// client's stream. It is the SFU opening the channel toward us, not a
-	// keepalive. Reply with a 6-byte ACK over DCEP PPI (NOT WriteDataChannel,
-	// which would use a data PPI) and open the channel locally.
+	// odin SFU legacy DCEP: 6-byte type-1 frame (01 00*5) on the client's
+	// stream — the SFU opening the channel AND re-sending it as a keepalive
+	// ping every ~27s. Reply with the ECHO of the same frame (not an ACK:
+	// an ACKed SFU re-pings and resets the stream, verified live — the
+	// re-ping cycle matches our session teardown exactly).
 	if len(data) == 6 && data[0] == 0x01 {
-		ack := []byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x00}
-		if _, werr := c.stream.WriteSCTP(ack, sctp.PayloadTypeWebRTCDCEP); werr != nil {
-			log.Printf("[dcep] odin ACK write failed: %v", werr)
+		echo := []byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00}
+		if _, werr := c.stream.WriteSCTP(echo, sctp.PayloadTypeWebRTCDCEP); werr != nil {
+			log.Printf("[dcep] odin echo write failed: %v", werr)
 		} else {
-			log.Printf("[dcep] odin OPEN received; ACK sent (6B); opening channel")
+			log.Printf("[dcep] odin OPEN received; echo sent (6B); opening channel")
 		}
 		if err := c.commitReliabilityParams(); err != nil {
 			log.Printf("[dcep] odin commit reliability: %v", err)

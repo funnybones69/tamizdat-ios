@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	olcserver "github.com/funnybones69/tamizdat/vks/olc/core/server"
 	"github.com/funnybones69/tamizdat/vks/olc/core/app/session"
 	"github.com/funnybones69/tamizdat/vks/olc/core/control"
+	olcserver "github.com/funnybones69/tamizdat/vks/olc/core/server"
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport"
 )
 
@@ -32,15 +32,26 @@ type Server struct {
 	cfg   Config
 	hooks ServerHooks
 
-	mu      sync.Mutex
-	rooms   map[string]string // olc sessionID -> userID
+	mu       sync.Mutex
+	rooms    map[string]string // olc sessionID -> userID
 	roomSess map[string]string // olc sessionID -> tamizdat sessionID
 }
 
 // RunServer joins the room and serves until ctx is cancelled. Blocking.
+// When cfg.IdleTimeout > 0 the server leaves the room (RunServer returns)
+// once the room has had zero authenticated peers for that whole span —
+// this is the on-demand building block: a room lives only while a client
+// uses it, plus one join-grace window for the client that asked for it.
 func RunServer(ctx context.Context, cfg Config, hooks ServerHooks) error {
 	session.RegisterDefaults()
 	s := &Server{cfg: cfg, hooks: hooks, rooms: map[string]string{}, roomSess: map[string]string{}}
+
+	if cfg.IdleTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		go s.watchIdle(ctx, cancel, cfg.IdleTimeout)
+	}
 
 	authHook := func(deviceID string, claims map[string]any) (string, error) {
 		raw, _ := claims["shortid"].(string)
@@ -98,6 +109,7 @@ func RunServer(ctx context.Context, cfg Config, hooks ServerHooks) error {
 		Transport:        cfg.transportName(),
 		Provider:         cfg.Provider,
 		RoomURL:          cfg.RoomURL,
+		ChannelID:        cfg.ChannelID,
 		KeyHex:           cfg.KeyHex,
 		DNSServer:        cfg.DNSServer,
 		ProviderToken:    cfg.ProviderToken,
@@ -115,6 +127,32 @@ func (s *Server) PeerCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.rooms)
+}
+
+// watchIdle cancels the room once it has sat empty (no authenticated peers)
+// for the whole idle timeout. The server joins a room only because a client
+// asked for it; when no client shows up within the timeout (join grace) or
+// the last client leaves and the room stays empty, the room is released so
+// the server does not sit in it 24/7.
+func (s *Server) watchIdle(ctx context.Context, cancel context.CancelFunc, idle time.Duration) {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	emptySince := time.Now()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if s.PeerCount() == 0 {
+				if time.Since(emptySince) >= idle {
+					cancel()
+					return
+				}
+			} else {
+				emptySince = time.Now()
+			}
+		}
+	}
 }
 
 var _ = transport.Features{}
