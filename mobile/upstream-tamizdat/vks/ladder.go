@@ -3,9 +3,10 @@ package vks
 import (
 	"context"
 	"log"
+	"math/rand"
+	"strings"
 	"time"
 )
-
 // RunLadder runs the VKS client over an ordered list of room specs, failing
 // over to the next when the active room link dies. This is the fallback
 // ladder across providers (telemost → wbstream → jazz → …). All specs share
@@ -22,19 +23,30 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 		retryDelay = 2 * time.Second
 	}
 	for cycle := 1; ; cycle++ {
-		for i, cfg := range specs {
+		// Random provider order per cycle: the user's flow — the client
+		// picks a random enabled provider, beacons it, and the server
+		// answers with an assigned room (TXT). Failover walks the rest.
+		order := shuffledSpecs(specs)
+		for i, cfg := range order {
 			if ctx.Err() != nil {
 				return nil
 			}
-			// On-demand: emit the wake beacon so the server joins this room
-			// just in time, then give it a short head start to enter before
-			// the client knocks (a guest cannot create the room alone).
+			// On-demand: ask the server for a room on this provider. The
+			// server creates a fresh one (WB/Jazz) or assigns an armed one,
+			// answering in-band with the room spec; the client connects to
+			// the ASSIGNED room instead of its statically configured one.
 			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-				rk := RoomWakeKey(cfg.KeyHex, cfg.Provider, cfg.RoomURL)
-				if err := SendWake(ctx, cfg.WakeDNSServer, cfg.WakeZone, rk); err != nil {
-					log.Printf("vks ladder: wake beacon for %s failed: %v", cfg.Provider, err)
+				spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider)
+				if err != nil {
+					log.Printf("vks ladder: provider beacon for %s failed: %v", cfg.Provider, err)
+					// Fall back to the static room beacon.
+					rk := RoomWakeKey(cfg.KeyHex, cfg.Provider, cfg.RoomURL)
+					_ = SendWake(ctx, cfg.WakeDNSServer, cfg.WakeZone, rk)
 				} else {
-					log.Printf("vks ladder: wake beacon sent for %s (room %s)", cfg.Provider, cfg.RoomURL)
+					log.Printf("vks ladder: server assigned room %q (provider %s)", spec, cfg.Provider)
+					if p, r, ok := splitProviderRoom(spec); ok {
+						cfg.Provider, cfg.RoomURL = p, r
+					}
 				}
 				select {
 				case <-ctx.Done():
@@ -42,7 +54,7 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 				case <-time.After(3 * time.Second):
 				}
 			}
-			log.Printf("vks ladder: cycle=%d profile=%d/%d provider=%s room=%s", cycle, i+1, len(specs), cfg.Provider, cfg.RoomURL)
+			log.Printf("vks ladder: cycle=%d profile=%d/%d provider=%s room=%s", cycle, i+1, len(order), cfg.Provider, cfg.RoomURL)
 			err := RunClient(ctx, cfg, func() {
 				log.Printf("vks ladder: profile %s up (socks %s)", cfg.Provider, cfg.ListenAddr)
 			})
@@ -60,6 +72,24 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 			return nil
 		}
 	}
+}
+
+// shuffledSpecs returns the specs in a random order (a copy).
+func shuffledSpecs(specs []ClientConfig) []ClientConfig {
+	out := make([]ClientConfig, len(specs))
+	copy(out, specs)
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out
+}
+
+// splitProviderRoom splits an assigned-room spec "provider:roomURL" into
+// its parts. Returns ok=false on malformed specs.
+func splitProviderRoom(spec string) (string, string, bool) {
+	i := strings.Index(spec, ":")
+	if i <= 0 || i+1 >= len(spec) {
+		return "", "", false
+	}
+	return spec[:i], spec[i+1:], true
 }
 
 // ParseSpecs splits a comma-separated provider:room list into configs.

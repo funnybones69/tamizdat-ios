@@ -84,14 +84,41 @@ func handleBeaconQuery(pc net.PacketConn, src net.Addr, msg []byte, zone string,
 	if suffix := "." + zone; strings.HasSuffix(lower, suffix) {
 		left := strings.TrimSuffix(lower, suffix)
 		if left != "" {
-			roomKey := left
+			selector := left
 			if i := strings.Index(left, "."); i > 0 {
-				roomKey = left[:i] // "<roomKey>.<nonce>"
+				selector = left[:i] // "<selector>.<nonce>"
 			}
-			if roomKey != "" && !strings.Contains(roomKey, ".") {
-				log.Printf("vks beacon dns: wake query name=%q roomKey=%q from %s", name, roomKey, src)
+			if selector != "" && !strings.Contains(selector, ".") {
+				// First: a specific room wake (existing behavior).
+				woken := false
 				if watch != nil {
-					watch.Wake(roomKey)
+					watch.mu.Lock()
+					_, knownRoom := watch.rooms[selector]
+					watch.mu.Unlock()
+					if knownRoom {
+						log.Printf("vks beacon dns: wake query name=%q roomKey=%q from %s", name, selector, src)
+						watch.Wake(selector)
+						woken = true
+					}
+				}
+				// Second: a PROVIDER beacon — create/assign a room and
+				// answer with its spec in a TXT record.
+				if !woken && watch != nil {
+					provider := watch.matchProviderKey(selector)
+					if provider != "" {
+						log.Printf("vks beacon dns: provider beacon name=%q provider=%q from %s", name, provider, src)
+						ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+						cfg, err := watch.AssignRoom(ctx, provider)
+						cancel()
+						if err != nil {
+							log.Printf("vks beacon dns: assign %s failed: %v", provider, err)
+						} else {
+							spec := cfg.Provider + ":" + cfg.RoomURL
+							log.Printf("vks beacon dns: assigned %s -> TXT %q", provider, spec)
+							respondTXT(pc, src, msg, qend, spec)
+							return
+						}
+					}
 				}
 			}
 		}
@@ -188,4 +215,117 @@ func buildAQuery(name string) []byte {
 	}
 	msg = append(msg, 0x00, 0x00, 0x01, 0x00, 0x01) // root, QTYPE A, QCLASS IN
 	return msg
+}
+
+// respondTXT answers a DNS query with a TXT record carrying spec (the
+// beacon-assignment room answer). One character-string, TTL 0.
+func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec string) {
+	data := []byte(spec)
+	if len(data) > 200 {
+		data = data[:200] // DNS-safe cap
+	}
+	resp := make([]byte, 0, len(msg)+32+len(data))
+	resp = append(resp, msg[0], msg[1])         // ID
+	resp = append(resp, 0x84, 0x00)             // QR=1, AA=1, RCODE=0
+	resp = append(resp, msg[4], msg[5])         // QDCOUNT
+	resp = append(resp, 0x00, 0x01)             // ANCOUNT=1 (TXT)
+	resp = append(resp, 0x00, 0x00, 0x00, 0x00) // NSCOUNT, ARCOUNT
+	resp = append(resp, msg[12:qend+4]...)      // question
+	// name pointer, TYPE TXT (16), CLASS IN, TTL 0, RDLENGTH, RDATA
+	resp = append(resp, 0xC0, 0x0C, 0x00, 0x10, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00)
+	rdlen := 1 + len(data)
+	resp = append(resp, byte(rdlen>>8), byte(rdlen))
+	resp = append(resp, byte(len(data)))
+	resp = append(resp, data...)
+	_, _ = pc.WriteTo(resp, src)
+}
+
+// SendWakeProvider asks the server to CREATE/ASSIGN a room on the given
+// provider and returns the assigned room spec ("provider:roomURL") from the
+// DNS TXT answer. This is the beacon-assignment flow: the client beacons a
+// provider key (HMAC of the shared key), the server creates a fresh room
+// (WB/Jazz) or assigns an armed one (Telemost/MTS) and answers in-band.
+func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider string) (string, error) {
+	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
+	providerKey := ProviderWakeKey(keyHex, provider)
+	nonce := make([]byte, 4)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", fmt.Errorf("wake nonce: %w", err)
+	}
+	name := strings.ToLower(providerKey) + "." + hex.EncodeToString(nonce) + "." + zone + "."
+	query := buildTXTQuery(name)
+	d := net.Dialer{Timeout: 5 * time.Second}
+	c, err := d.DialContext(ctx, "udp", dnsServer)
+	if err != nil {
+		return "", fmt.Errorf("wake dial %s: %w", dnsServer, err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(12 * time.Second))
+	if _, err := c.Write(query); err != nil {
+		return "", fmt.Errorf("wake write: %w", err)
+	}
+	buf := make([]byte, 512)
+	n, err := c.Read(buf)
+	if err != nil {
+		return "", fmt.Errorf("wake read: %w", err)
+	}
+	return parseTXTAnswer(buf[:n])
+}
+
+// buildTXTQuery builds a minimal DNS TXT (type 16) query for name.
+func buildTXTQuery(name string) []byte {
+	msg := []byte{0xAB, 0xCD, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	for _, label := range strings.Split(strings.TrimSuffix(name, "."), ".") {
+		if label == "" {
+			continue
+		}
+		msg = append(msg, byte(len(label)))
+		msg = append(msg, label...)
+	}
+	msg = append(msg, 0x00, 0x00, 0x10, 0x00, 0x01) // root, QTYPE TXT, QCLASS IN
+	return msg
+}
+
+// parseTXTAnswer extracts the TXT character-string from a DNS response.
+func parseTXTAnswer(msg []byte) (string, error) {
+	if len(msg) < 12 {
+		return "", fmt.Errorf("short response")
+	}
+	ancount := int(msg[6])<<8 | int(msg[7])
+	if ancount < 1 {
+		return "", fmt.Errorf("no answer")
+	}
+	// skip the question
+	_, qend, ok := decodeQName(msg, 12)
+	if !ok || qend+4 > len(msg) {
+		return "", fmt.Errorf("bad question")
+	}
+	off := qend + 4
+	// first answer: name (possibly a pointer), then TYPE/CLASS/TTL/RDLENGTH/RDATA
+	if off < len(msg) && msg[off]&0xC0 == 0xC0 {
+		off += 2 // compression pointer
+	} else {
+		_, off, ok = decodeQName(msg, off)
+		if !ok {
+			return "", fmt.Errorf("bad answer name")
+		}
+	}
+	if off+10 > len(msg) {
+		return "", fmt.Errorf("truncated answer")
+	}
+	qtype := int(msg[off])<<8 | int(msg[off+1])
+	if qtype != 16 {
+		return "", fmt.Errorf("not TXT (type %d)", qtype)
+	}
+	rdlen := int(msg[off+8])<<8 | int(msg[off+9])
+	off += 10
+	if off+rdlen > len(msg) || rdlen < 1 {
+		return "", fmt.Errorf("bad RDATA")
+	}
+	strLen := int(msg[off])
+	if strLen+1 > rdlen {
+		return "", fmt.Errorf("bad TXT string")
+	}
+	return string(msg[off+1 : off+1+strLen]), nil
 }

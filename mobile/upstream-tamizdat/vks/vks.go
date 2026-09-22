@@ -56,6 +56,10 @@ type Config struct {
 	// watcher so the server does not sit in a room 24/7: the room lives only
 	// while a client is in it, plus one join-grace window.
 	IdleTimeout time.Duration
+	// CleanupHook, when set, runs after the on-demand watcher releases the
+	// room (idle teardown) — the MTS lifecycle deletes its meeting here.
+	// Runtime-only: never serialized.
+	CleanupHook func()
 }
 
 // transportName picks the in-room carrier. vp8channel (video-frame muling) is
