@@ -127,22 +127,23 @@ func (d *Dispatcher) readLoop() {
 func (d *Dispatcher) writeLoop() {
 	defer d.wg.Done()
 
+	// The server spreads downlink across all worker sessions (each a TURN
+	// allocation with its own latency), so WG packets arrive out of order.
+	// The reorderer resequences by the WG transport counter — without it the
+	// inner TCP collapses on dup-ACKs and the per-allocation bandwidth can't
+	// aggregate.
+	re := newWGReorderer(d.localConn, &d.clientAddr, d.stats)
+	gapTick := time.NewTicker(10 * time.Millisecond)
+	defer gapTick.Stop()
+
 	for {
 		select {
 		case <-d.ctx.Done():
 			return
 		case pkt := <-d.ReturnCh:
-			addrPtr := d.clientAddr.Load()
-			if addrPtr == nil {
-				continue
-			}
-			addr := *addrPtr
-			if _, err := d.localConn.WriteTo(pkt, addr); err != nil {
-				if d.ctx.Err() != nil {
-					return
-				}
-			}
-			atomic.AddInt64(&d.stats.TotalBytesDown, int64(len(pkt)))
+			re.handle(pkt)
+		case <-gapTick.C:
+			re.flushGapIfStale()
 		}
 	}
 }
