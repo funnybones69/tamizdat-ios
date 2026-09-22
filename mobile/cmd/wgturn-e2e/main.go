@@ -30,6 +30,8 @@ func main() {
 		credsFile = flag.String("credsfile", "", "JSON file with pre-fetched TURN creds")
 		peer      = flag.String("peer", "203.0.113.10:443", "wgturn server host:port")
 		password  = flag.String("password", "", "wgturn password (= user shortid)")
+		deviceID  = flag.String("deviceid", "e2e-device", "wgturn device identity (distinct per parallel client)")
+		listenPort = flag.Int("listenport", 19000, "local WG endpoint port (distinct per parallel client)")
 		workers   = flag.Int("workers", 20, "TURN worker sessions (each = own allocation)")
 		parallel  = flag.Int("parallel", 8, "parallel download connections")
 		readMbps  = flag.Float64("readmbps", 0, "per-connection read cap in Mbit/s (0 = unlimited) - slows server bursts")
@@ -54,7 +56,7 @@ func main() {
 
 	// 2. Start the production upstream.
 	log.Printf("starting vkturn upstream: peer=%s workers=%d", *peer, *workers)
-	if s := socksstub.StartVKTurnUpstream(string(credsJSON), *peer, *password, "e2e-device", 19000, *workers); s != "" {
+	if s := socksstub.StartVKTurnUpstream(string(credsJSON), *peer, *password, *deviceID, *listenPort, *workers); s != "" {
 		log.Fatalf("StartVKTurnUpstream: %s", s)
 	}
 
