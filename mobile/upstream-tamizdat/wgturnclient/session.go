@@ -82,6 +82,23 @@ func uplinkPacingMbps() float64 {
 	return f
 }
 
+// wakeupInterval reads WGTURN_WAKEUP_MS (milliseconds between per-worker
+// WAKEUP frames). Default 10s. Faster WAKEUPs make every worker's session the
+// WG peer's current endpoint in turn, so the server sprays downlink across
+// all sessions — combined with the reorder buffer this lets one flow
+// aggregate multiple allocations. Too fast wastes a little relay budget.
+func wakeupInterval() time.Duration {
+	v := strings.TrimSpace(os.Getenv("WGTURN_WAKEUP_MS"))
+	if v == "" {
+		return 10 * time.Second
+	}
+	ms, err := strconv.Atoi(v)
+	if err != nil || ms < 20 {
+		return 10 * time.Second
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 type dtlsHandshaker interface {
 	HandshakeContext(context.Context) error
 }
@@ -550,7 +567,7 @@ func RunSession(
 	go func() {
 		defer proxyWg.Done()
 		defer sessCancel()
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(wakeupInterval())
 		defer ticker.Stop()
 		var lastWriteDeadline time.Time
 		for {
