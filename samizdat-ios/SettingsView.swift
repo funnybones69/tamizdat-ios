@@ -45,10 +45,6 @@ struct SettingsView: View {
     // persist via VKSPreferences on Save; the extension applies them on
     // the next connect.
     @State private var vksEnabledDraft: Bool = VKSPreferences.enabled
-    @State private var vksTelemostDraft: String = VKSPreferences.telemostRoom
-    @State private var vksWbstreamDraft: String = VKSPreferences.wbstreamRoom
-    @State private var vksJazzDraft: String = VKSPreferences.jazzRoom
-    @State private var vksMtsDraft: String = VKSPreferences.mtsRoom
     @State private var vksKeyDraft: String = VKSPreferences.keyHex
     @State private var vksShortIDDraft: String = VKSPreferences.shortIDHex
     @State private var vksPortDraft: String = String(VKSPreferences.listenPort)
@@ -457,16 +453,16 @@ struct SettingsView: View {
                         .tint(theme.mint)
                 }
 
-                vksProviderRow("Telemost", "https://telemost.yandex.ru/j/…", on: $vksTelemostOnDraft, text: $vksTelemostDraft)
-                vksProviderRow("WB Stream", "stream.wb.ru/room/… или id", on: $vksWbstreamOnDraft, text: $vksWbstreamDraft)
-                vksProviderRow("Jazz", "roomId:password", on: $vksJazzOnDraft, text: $vksJazzDraft)
-                vksProviderRow("MTS", "https://my.mts-link.ru/j/…", on: $vksMtsOnDraft, text: $vksMtsDraft)
+                vksProviderRow("Telemost", on: $vksTelemostOnDraft)
+                vksProviderRow("WB Stream", on: $vksWbstreamOnDraft)
+                vksProviderRow("Jazz", on: $vksJazzOnDraft)
+                vksProviderRow("MTS", on: $vksMtsOnDraft)
                 vksField("olcRTC key", "64 hex", $vksKeyDraft)
                 vksField("shortid", "hex из users", $vksShortIDDraft)
             vksField("Server", "host:port (без дефолта)", $vksServerDraft)
                 vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
 
-                Text("Мастер-тумблер (сверху): VKS активен — в whitelist-режиме перехватывает у VK TURN (тот остаётся резервом). Ниже у каждого провайдера свой тумблер — можно оставить включённым один и смотреть, как он работает. Комнаты создаёт сервер (owner), клиент входит гостем; изоляции пар нет — выделяй комнату на устройство.")
+                Text("Мастер-тумблер (сверху): VKS активен — в whitelist-режиме перехватывает у VK TURN (тот остаётся резервом). У каждого провайдера свой тумблер — клиент хранит ТОЛЬКО провайдеров: при подключении шлёт бикон, сервер создаёт/назначает комнату и отвечает TXT. Рандомный выбор из активных + failover.")
                     .font(.geistMono(.regular, size: 10))
                     .foregroundStyle(theme.textDim)
 
@@ -506,27 +502,18 @@ struct SettingsView: View {
         }
     }
 
-    private func vksProviderRow(_ title: String, _ placeholder: String, on: Binding<Bool>, text: Binding<String>) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text(title)
-                    .font(.geist(.medium, size: 12))
-                    .foregroundStyle(theme.textMuted)
-                Spacer()
-                Toggle("", isOn: on)
-                    .labelsHidden()
-                    .tint(theme.mint)
-            }
-            TextField(placeholder, text: text)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-                .font(.geistMono(.regular, size: 12.5))
-                .foregroundStyle(theme.text)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 7)
-                .background(theme.chip)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-                .opacity(on.wrappedValue ? 1.0 : 0.45)
+    /// Provider row: just a switch. The client stores only the provider —
+    /// the room is created/assigned by the server via the beacon (TXT
+    /// answer), so there is nothing to type here.
+    private func vksProviderRow(_ title: String, on: Binding<Bool>) -> some View {
+        HStack {
+            Text(title)
+                .font(.geist(.medium, size: 12))
+                .foregroundStyle(theme.textMuted)
+            Spacer()
+            Toggle("", isOn: on)
+                .labelsHidden()
+                .tint(theme.mint)
         }
     }
 
@@ -536,10 +523,6 @@ struct SettingsView: View {
         VKSPreferences.wbstreamEnabled = vksWbstreamOnDraft
         VKSPreferences.jazzEnabled = vksJazzOnDraft
         VKSPreferences.mtsEnabled = vksMtsOnDraft
-        VKSPreferences.telemostRoom = vksTelemostDraft
-        VKSPreferences.wbstreamRoom = vksWbstreamDraft
-        VKSPreferences.jazzRoom = vksJazzDraft
-        VKSPreferences.mtsRoom = vksMtsDraft
         VKSPreferences.keyHex = vksKeyDraft
         VKSPreferences.shortIDHex = vksShortIDDraft
         VKSPreferences.server = vksServerDraft
@@ -556,10 +539,6 @@ struct SettingsView: View {
         vksWbstreamOnDraft = VKSPreferences.wbstreamEnabled
         vksJazzOnDraft = VKSPreferences.jazzEnabled
         vksMtsOnDraft = VKSPreferences.mtsEnabled
-        vksTelemostDraft = VKSPreferences.telemostRoom
-        vksWbstreamDraft = VKSPreferences.wbstreamRoom
-        vksJazzDraft = VKSPreferences.jazzRoom
-        vksMtsDraft = VKSPreferences.mtsRoom
         vksKeyDraft = VKSPreferences.keyHex
         vksShortIDDraft = VKSPreferences.shortIDHex
         vksServerDraft = VKSPreferences.server

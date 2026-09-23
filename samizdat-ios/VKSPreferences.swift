@@ -154,24 +154,27 @@ enum VKSPreferences {
         get { defaults?.string(forKey: wakeZoneKey) ?? testDefaultWakeZone }
         set { defaults?.set(trim(newValue), forKey: wakeZoneKey) }
     }
-    /// Assembled `provider:room,` ladder spec in failover order. A
-    /// provider is included only when its switch is on and its room is
-    /// filled.
+    /// Assembled `provider:room,` ladder spec in failover order. A provider
+    /// is included when its switch is on. Beacon-assignment: the client
+    /// stores only the provider — the server creates/assigns the room via
+    /// the TXT answer; an explicit room is an optional override/fallback
+    /// (used when the provider beacon fails). An empty room emits a "stub"
+    /// placeholder the server's assignment replaces.
     static var ladderSpec: String {
         var parts: [String] = []
-        if telemostEnabled && !telemostRoom.isEmpty { parts.append("telemost:\(telemostRoom)") }
-        if wbstreamEnabled && !wbstreamRoom.isEmpty { parts.append("wbstream:\(wbstreamRoom)") }
-        if jazzEnabled && !jazzRoom.isEmpty { parts.append("jazz:\(jazzRoom)") }
-        if mtsEnabled && !mtsRoom.isEmpty { parts.append("mts:\(mtsRoom)") }
+        if telemostEnabled { parts.append("telemost:\(telemostRoom.isEmpty ? "stub" : telemostRoom)") }
+        if wbstreamEnabled { parts.append("wbstream:\(wbstreamRoom.isEmpty ? "stub" : wbstreamRoom)") }
+        if jazzEnabled { parts.append("jazz:\(jazzRoom.isEmpty ? "stub" : jazzRoom)") }
+        if mtsEnabled { parts.append("mts:\(mtsRoom.isEmpty ? "stub" : mtsRoom)") }
         return parts.joined(separator: ",")
     }
 
     static var providerCount: Int {
         var count = 0
-        if telemostEnabled && !telemostRoom.isEmpty { count += 1 }
-        if wbstreamEnabled && !wbstreamRoom.isEmpty { count += 1 }
-        if jazzEnabled && !jazzRoom.isEmpty { count += 1 }
-        if mtsEnabled && !mtsRoom.isEmpty { count += 1 }
+        if telemostEnabled { count += 1 }
+        if wbstreamEnabled { count += 1 }
+        if jazzEnabled { count += 1 }
+        if mtsEnabled { count += 1 }
         return count
     }
 
