@@ -17,6 +17,7 @@ package socksstub
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"github.com/funnybones69/tamizdat/vks"
+	samizdat "github.com/funnybones69/tamizdat"
 )
 
 type vksState struct {
@@ -197,6 +199,74 @@ func vksStatusJSON(status, addr, errMsg string) string {
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
+}
+
+// StartVKSNativeUpstream runs the NATIVE VKS tunnel: a samizdat Client whose
+// session (utls + masq + shortid session-ID auth — the SAME stack as h2) runs
+// over the VKS room datachannel instead of TCP. Single key (shortid), no
+// olcRTC epoch/keyHex/smux. dialUpstream forwards via the Client's
+// DialContext when this is set. The server config (pubkey, SNI) comes from
+// the active proxy profile's blob; the room config from the VKS settings.
+func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
+	blob := rt.samizdatBlob
+	if blob == "" {
+		return vksStatusJSON("error", "", "no active proxy profile (server config) for the native VKS path")
+	}
+	cfg, err := parseSamizdatURL(blob)
+	if err != nil {
+		return vksStatusJSON("error", "", err.Error())
+	}
+	pubKey, err := hex.DecodeString(cfg.PubkeyHex)
+	if err != nil || len(pubKey) != 32 {
+		return vksStatusJSON("error", "", "pubkey: 64 hex required")
+	}
+	cfgs, err := vks.ParseSpecs(specs)
+	if err != nil || len(cfgs) == 0 {
+		return vksStatusJSON("error", "", "need a room spec")
+	}
+	vksCfg := vks.ClientConfig{Config: cfgs[0], ShortIDHex: shortIDHex, WakeDNSServer: wakeDNS, WakeZone: wakeZone}
+	vksCfg.KeyHex = keyHex
+	sidBytes, err := hex.DecodeString(shortIDHex)
+	if err != nil || len(sidBytes) != 8 {
+		return vksStatusJSON("error", "", "shortid: 16 hex required")
+	}
+	var shortID [8]byte
+	copy(shortID[:], sidBytes)
+	client, err := samizdat.NewClient(samizdat.ClientConfig{
+		ServerAddr:    "vks-dc:443", // placeholder — the Dialer ignores it
+		ServerName:    cfg.SNI,
+		PublicKey:     pubKey,
+		ShortID:       shortID,
+		MinTransports: 1,
+		MaxTransports: 1, // single session over the shared broadcast lane
+		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return vks.NativeDial(ctx, vksCfg)
+		},
+	})
+	if err != nil {
+		return vksStatusJSON("error", "", err.Error())
+	}
+	rt.mu.Lock()
+	old := rt.vksNativeClient
+	rt.vksNativeClient = client
+	rt.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	rt.appendLog("info: [vks-native] upstream up (TLS+masq over the room datachannel, shortid-only)")
+	return vksStatusJSON("started", "", "")
+}
+
+// StopVKSNativeUpstream tears down the native VKS tunnel.
+func StopVKSNativeUpstream() string {
+	rt.mu.Lock()
+	old := rt.vksNativeClient
+	rt.vksNativeClient = nil
+	rt.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	return vksStatusJSON("stopped", "", "")
 }
 
 // dialViaSocks5 opens a SOCKS5 CONNECT through proxyAddr to dest. Used to

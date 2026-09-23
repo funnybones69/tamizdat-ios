@@ -304,7 +304,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // writes the settings into the App Group; changes apply on the
         // next connect (or on an endpoint-switch rewire).
         if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured {
-            let vksStatus = SocksstubStartVKSUpstream(
+            // NATIVE VKS transport: the tamizdat session (utls+masq+shortid,
+            // the SAME stack as h2) runs over the room datachannel — no
+            // olcRTC epoch/keyHex/smux, single key (shortid). The socksstub
+            // forwards via the Client's DialContext.
+            let vksStatus = SocksstubStartVKSNativeUpstream(
                 VKSPreferences.ladderSpec,
                 VKSPreferences.keyHex,
                 VKSPreferences.shortIDHex,
@@ -313,10 +317,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 VKSPreferences.listenPort
             )
             let vksServerLabel = VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server
-            log("info: [vks] upstream start requested: \(vksStatus) server=\(vksServerLabel)")
-            ExtLog.info("[vks] upstream start requested: \(vksStatus) server=\(vksServerLabel)")
+            log("info: [vks] NATIVE upstream start requested: \(vksStatus) server=\(vksServerLabel)")
+            ExtLog.info("[vks] NATIVE upstream start requested: \(vksStatus) server=\(vksServerLabel)")
         } else {
             _ = SocksstubStopVKSUpstream()
+            _ = SocksstubStopVKSNativeUpstream()
             let vksReason = policy.usesVKS ? "disabled or not configured" : "whitelist carrier is not VKS"
             log("info: [vks] chain inactive (\(vksReason))")
             ExtLog.info("[vks] chain inactive (\(vksReason))")

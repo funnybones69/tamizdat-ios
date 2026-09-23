@@ -101,6 +101,11 @@ type runtimeState struct {
 	logsMax        int
 	samizdatBlob   string         // empty → direct dial mode
 	samizdatClient upstreamClient // nil unless SetSamizdatConfig succeeded
+	// vksNativeClient is the NATIVE VKS tunnel's client (TLS+masq over the
+	// room datachannel, shortid-only — no olcRTC). Set by
+	// StartVKSNativeUpstream; dialUpstream prefers it over the olc VKS
+	// SOCKS5 listener when set.
+	vksNativeClient upstreamClient
 	connsActive    atomic.Int64
 	connsTotal     atomic.Uint64
 	// IPA-X: poolVariant ("", "v1", "v2", "v3") drives ClientConfig.PoolVariant
@@ -1038,9 +1043,15 @@ func sendReply(client net.Conn, code byte) error {
 // Tier 1 (port whitelist) + Tier 2 (cadence) carry the realtime
 // classifier without us.
 func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
-	// Phase 2G PART C — when a VK TURN userspace WireGuard netstack
-	// is alive (operator set EndpointTurnMode=.vk and StartVKTurnUpstream
-	// completed GETCONF + WireGuard attach), every TCP flow rides
+	// NATIVE VKS path first: the native tunnel (TLS+masq over the room
+	// datachannel, shortid-only — no olcRTC) serves flows directly via the
+	// Client's DialContext. Preferred over the olc VKS SOCKS5 listener.
+	rt.mu.Lock()
+	nclient := rt.vksNativeClient
+	rt.mu.Unlock()
+	if nclient != nil {
+		return nclient.DialContext(ctx, "tcp", dest)
+	}
 	// through it instead of the legacy samizdat-H2 upstream. The wg
 	// device's Endpoint is 127.0.0.1:<wgturn relay port>, so packets
 	// → wg → DTLS+TURN → VK relay → RU server → outbound chain → EU.
