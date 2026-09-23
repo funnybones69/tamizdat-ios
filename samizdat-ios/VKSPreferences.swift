@@ -130,9 +130,16 @@ enum VKSPreferences {
             if let stored = defaults?.string(forKey: shortIDKey), !trim(stored).isEmpty {
                 return trim(stored).lowercased()
             }
-            if let blob = ConfigStore.shared.load(),
-               let peer = SamizdatURLCodec.h2PeerConfig(from: blob) {
-                return trim(peer.shortID).lowercased()
+            // Unset: fall back to the identity the app mirrors into the App
+            // Group (derived from the Main profile URI — the same one the H2
+            // tunnel authenticates with). Never a placeholder: the server
+            // shortid-proofs provider beacons and rejects unknown shortids.
+            // This file is compiled into the extension target too, where
+            // ConfigStore is unavailable — the App Group mirror is the shared
+            // source both targets can read.
+            let mirrored = trim(VKCredsPreferences.connectPassword)
+            if !mirrored.isEmpty {
+                return mirrored.lowercased()
             }
             return testDefaultShortIDHex
         }
