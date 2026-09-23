@@ -103,9 +103,14 @@ type runtimeState struct {
 	samizdatClient upstreamClient // nil unless SetSamizdatConfig succeeded
 	// vksNativeClient is the NATIVE VKS tunnel's client (TLS+masq over the
 	// room datachannel, shortid-only — no olcRTC). Set by
-	// StartVKSNativeUpstream; dialUpstream prefers it over the olc VKS
+	// StartVKSNativeUpstream; dialUpstream tries it before the olc VKS
 	// SOCKS5 listener when set.
 	vksNativeClient upstreamClient
+	// vksNativeFailUntil (unix nanos) latches the native VKS path off for a
+	// short window after a dial failure, so a dead room does not make every
+	// flow pay the ~12s beacon timeout before falling back to the chain
+	// below (mirrors the olc ladder's warn-and-fall-through).
+	vksNativeFailUntil atomic.Int64
 	connsActive    atomic.Int64
 	connsTotal     atomic.Uint64
 	// IPA-X: poolVariant ("", "v1", "v2", "v3") drives ClientConfig.PoolVariant
@@ -1038,6 +1043,10 @@ func sendReply(client net.Conn, code byte) error {
 	return err
 }
 
+// vksNativeFailLatch is how long the native VKS path is skipped after a dial
+// failure, so a dead room does not make every flow pay the beacon timeout.
+const vksNativeFailLatch = 30 * time.Second
+
 // dialUpstream is the swap-point: stage 1 = direct, stage 2 = samizdat.
 // IPA-A1: app-hint Tier 3 removed (PacketBridge gone). Server's
 // Tier 1 (port whitelist) + Tier 2 (cadence) carry the realtime
@@ -1045,12 +1054,22 @@ func sendReply(client net.Conn, code byte) error {
 func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	// NATIVE VKS path first: the native tunnel (TLS+masq over the room
 	// datachannel, shortid-only — no olcRTC) serves flows directly via the
-	// Client's DialContext. Preferred over the olc VKS SOCKS5 listener.
+	// Client's DialContext. Tried before the olc VKS SOCKS5 listener, but —
+	// like that listener — it must DEGRADE: a room that cannot be reached
+	// (beacon timeout / ConferenceNotFound) falls through to the rest of the
+	// chain instead of failing the flow, and latches itself off briefly so
+	// the next flows do not each pay the beacon timeout.
 	rt.mu.Lock()
 	nclient := rt.vksNativeClient
 	rt.mu.Unlock()
-	if nclient != nil {
-		return nclient.DialContext(ctx, "tcp", dest)
+	if nclient != nil && time.Now().UnixNano() >= rt.vksNativeFailUntil.Load() {
+		if c, err := nclient.DialContext(ctx, "tcp", dest); err == nil {
+			rt.vksNativeFailUntil.Store(0)
+			return c, nil
+		} else {
+			rt.vksNativeFailUntil.Store(time.Now().Add(vksNativeFailLatch).UnixNano())
+			rt.appendLog(fmt.Sprintf("warn: vks-native dial %s failed: %v — fallback for %s", dest, err, vksNativeFailLatch))
+		}
 	}
 	// through it instead of the legacy samizdat-H2 upstream. The wg
 	// device's Endpoint is 127.0.0.1:<wgturn relay port>, so packets
