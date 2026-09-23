@@ -111,6 +111,12 @@ type runtimeState struct {
 	// flow pay the ~12s beacon timeout before falling back to the chain
 	// below (mirrors the olc ladder's warn-and-fall-through).
 	vksNativeFailUntil atomic.Int64
+	// upstreamMode is the carrier the operator selected: "main" (samizdat
+	// H2), "vks" (whitelist room transport) or "turn" (VK TURN). dialUpstream
+	// switches on it and NEVER falls back to H2 or a direct dial while a
+	// whitelist carrier is selected — H2 is a Main-mode path only, and a
+	// silent fallback would defeat the carrier and mask a broken one.
+	upstreamMode string
 	connsActive    atomic.Int64
 	connsTotal     atomic.Uint64
 	// IPA-X: poolVariant ("", "v1", "v2", "v3") drives ClientConfig.PoolVariant
@@ -783,6 +789,39 @@ func SetPoolVariant(variant string) {
 	rt.appendLog(fmt.Sprintf("info: pool variant = %s (next client build will use this)", v))
 }
 
+// SetUpstreamMode records which carrier the flows must use:
+//
+//	"main" — the samizdat H2 tunnel (Main endpoint only)
+//	"vks"  — the whitelist room transport (VKS)
+//	"turn" — VK TURN
+//
+// dialUpstream switches on it and does NOT fall back to H2 or a direct dial
+// while a whitelist carrier is selected: H2 belongs to Main mode, and a silent
+// fallback would defeat the carrier and hide a broken one. Exported for
+// gomobile bind (SocksstubSetUpstreamMode on the Swift side).
+func SetUpstreamMode(mode string) {
+	m := strings.ToLower(strings.TrimSpace(mode))
+	switch m {
+	case "vks", "turn", "main":
+	default:
+		m = "main"
+	}
+	rt.mu.Lock()
+	rt.upstreamMode = m
+	rt.mu.Unlock()
+	rt.appendLog("info: upstream mode = " + m)
+}
+
+// CurrentUpstreamMode returns the carrier chosen by SetUpstreamMode.
+func CurrentUpstreamMode() string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.upstreamMode == "" {
+		return "main"
+	}
+	return rt.upstreamMode
+}
+
 // currentPoolVariant returns the stored value or "v1" if unset.
 func currentPoolVariant() string {
 	v, _ := rt.poolVariant.Load().(string)
@@ -1052,13 +1091,21 @@ const vksNativeFailLatch = 30 * time.Second
 // Tier 1 (port whitelist) + Tier 2 (cadence) carry the realtime
 // classifier without us.
 func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
-	// NATIVE VKS path first: the native tunnel (TLS+masq over the room
-	// datachannel, shortid-only — no olcRTC) serves flows directly via the
-	// Client's DialContext. Tried before the olc VKS SOCKS5 listener, but —
-	// like that listener — it must DEGRADE: a room that cannot be reached
-	// (beacon timeout / ConferenceNotFound) falls through to the rest of the
-	// chain instead of failing the flow, and latches itself off briefly so
-	// the next flows do not each pay the beacon timeout.
+	switch CurrentUpstreamMode() {
+	case "vks":
+		return dialWhitelistVKS(ctx, dest)
+	case "turn":
+		return dialWhitelistTURN(ctx, dest)
+	default:
+		return dialMainH2(ctx, dest)
+	}
+}
+
+// dialWhitelistVKS rides the room transport only — the native client first,
+// then the olc SOCKS ladder. It NEVER falls back to H2 or a direct dial:
+// H2 belongs to Main mode, and a silent fallback would defeat the whitelist
+// carrier and hide a broken one.
+func dialWhitelistVKS(ctx context.Context, dest string) (net.Conn, error) {
 	rt.mu.Lock()
 	nclient := rt.vksNativeClient
 	rt.mu.Unlock()
@@ -1068,18 +1115,9 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 			return c, nil
 		} else {
 			rt.vksNativeFailUntil.Store(time.Now().Add(vksNativeFailLatch).UnixNano())
-			rt.appendLog(fmt.Sprintf("warn: vks-native dial %s failed: %v — fallback for %s", dest, err, vksNativeFailLatch))
+			rt.appendLog(fmt.Sprintf("warn: vks-native dial %s failed: %v", dest, err))
 		}
 	}
-	// through it instead of the legacy samizdat-H2 upstream. The wg
-	// device's Endpoint is 127.0.0.1:<wgturn relay port>, so packets
-	// → wg → DTLS+TURN → VK relay → RU server → outbound chain → EU.
-	// VKS room-tunnel upstream (master switch on -> the ladder runs in this
-	// process): chain the flow through the local SOCKS5 listener it serves.
-	// Checked BEFORE the VK TURN netstack so the VKS master switch
-	// intercepts TCP flows from VK TURN; TURN stays the reserve below. The
-	// olc client is stream-only, so this path is TCP (UDP keeps its own
-	// precedence in dialUpstreamUDP).
 	if addr := vksUpstreamAddr(); addr != "" {
 		if c, err := dialViaSocks5(ctx, addr, dest); err == nil {
 			return c, nil
@@ -1087,53 +1125,94 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 			rt.appendLog(fmt.Sprintf("warn: vks chain dial %s -> %s failed: %v", dest, addr, err))
 		}
 	}
+	return nil, errors.New("vks carrier unavailable — H2 fallback refused (whitelist mode)")
+}
+
+// dialWhitelistTURN rides VK TURN only, with no H2 fallback.
+func dialWhitelistTURN(ctx context.Context, dest string) (net.Conn, error) {
 	if n := VKTurnNetstack(); n != nil {
 		return n.DialContext(ctx, "tcp", dest)
 	}
+	return nil, errors.New("vk turn carrier unavailable — H2 fallback refused (whitelist mode)")
+}
+
+// dialMainH2 is the Main-endpoint path: the samizdat H2 tunnel, else direct.
+func dialMainH2(ctx context.Context, dest string) (net.Conn, error) {
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
 	if client == nil {
-		// Direct dial — POC stage 1 / fallback when no config set.
+		// Direct dial — POC stage 1 / no config set.
 		var d net.Dialer
 		return d.DialContext(ctx, "tcp", dest)
 	}
-	// Stage 2: route through the samizdat H2 CONNECT tunnel.
 	return client.DialContext(ctx, "tcp", dest)
 }
 
 // dialUpstreamUDP returns a net.PacketConn bound to a single target,
 // either via the samizdat UDP-over-H2 tunnel or a direct UDP socket.
-// The VKS chain is TCP-only (olc streams), so it does not appear here;
-// UDP flows keep the VK TURN / samizdat / direct precedence.
 func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
-	// Phase 2G PART C — same precedence as dialUpstream. The netstack
-	// uses gvisor-backed UDP sockets; we wrap into a PacketConn the
-	// callers already expect.
-	if n := VKTurnNetstack(); n != nil {
-		c, err := n.Dial("udp", dest)
-		if err != nil {
-			return nil, err
-		}
-		// gvisor's gonet.UDPConn satisfies net.Conn but not net.PacketConn.
-		// connectedNetConnUDPAdapter promotes a connected net.Conn into the
-		// PacketConn interface our callers expect.
-		return newConnectedNetConnUDPAdapter(c, dest), nil
+	switch CurrentUpstreamMode() {
+	case "vks":
+		return dialWhitelistVKSUDP(ctx, dest)
+	case "turn":
+		return dialWhitelistTURNUDP(ctx, dest)
+	default:
+		return dialMainUDP(ctx, dest)
 	}
+}
+
+// dialWhitelistVKSUDP rides the native room-transport client. The olc VKS
+// ladder is stream-only, so the native client is the UDP carrier; with no
+// native client there is no VKS UDP lane, and we refuse instead of falling
+// back to H2 or a direct socket.
+func dialWhitelistVKSUDP(ctx context.Context, dest string) (net.PacketConn, error) {
+	rt.mu.Lock()
+	nclient := rt.vksNativeClient
+	rt.mu.Unlock()
+	if nclient != nil {
+		pc, err := nclient.DialUDP(ctx, dest)
+		if err == nil {
+			return pc, nil
+		}
+		rt.appendLog(fmt.Sprintf("warn: vks-native udp %s failed: %v", dest, err))
+	}
+	return nil, errors.New("vks udp carrier unavailable — H2 fallback refused (whitelist mode)")
+}
+
+// dialWhitelistTURNUDP rides the VK TURN netstack only, with no H2 fallback.
+func dialWhitelistTURNUDP(ctx context.Context, dest string) (net.PacketConn, error) {
+	n := VKTurnNetstack()
+	if n == nil {
+		return nil, errors.New("vk turn udp carrier unavailable — H2 fallback refused (whitelist mode)")
+	}
+	c, err := n.Dial("udp", dest)
+	if err != nil {
+		return nil, err
+	}
+	// gvisor's gonet.UDPConn satisfies net.Conn but not net.PacketConn.
+	// connectedNetConnUDPAdapter promotes a connected net.Conn into the
+	// PacketConn interface our callers expect.
+	return newConnectedNetConnUDPAdapter(c, dest), nil
+}
+
+// dialMainUDP is the Main-endpoint lane: samizdat UDP-over-H2, else a direct
+// UDP socket.
+func dialMainUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	rt.mu.Lock()
 	client := rt.samizdatClient
 	rt.mu.Unlock()
-	if client == nil {
-		var d net.Dialer
-		c, err := d.DialContext(ctx, "udp", dest)
-		if err != nil {
-			return nil, err
-		}
-		// Wrap a connected UDP socket as PacketConn-like (writes go to
-		// dest; ReadFrom returns dest as Addr).
-		return newConnectedUDPAdapter(c.(*net.UDPConn), dest), nil
+	if client != nil {
+		return client.DialUDP(ctx, dest)
 	}
-	return client.DialUDP(ctx, dest)
+	var d net.Dialer
+	c, err := d.DialContext(ctx, "udp", dest)
+	if err != nil {
+		return nil, err
+	}
+	// Wrap a connected UDP socket as PacketConn-like (writes go to dest;
+	// ReadFrom returns dest as Addr).
+	return newConnectedUDPAdapter(c.(*net.UDPConn), dest), nil
 }
 
 // connectedNetConnUDPAdapter promotes any connected net.Conn (e.g.

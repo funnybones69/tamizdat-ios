@@ -259,6 +259,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // consistent value if anything reads it back; semantically a
         // no-op against the default.
         SocksstubSetPoolVariant("v1")
+        // Carrier selection. Main rides H2; the whitelist endpoint rides its
+        // selected carrier (VKS or VK TURN). dialUpstream switches on this and
+        // refuses to fall back to H2 outside Main — a whitelist carrier that is
+        // down must surface, not be papered over with the H2 path.
+        SocksstubSetUpstreamMode(Self.upstreamModeRaw(policy))
         // IPA-D21: push the configured real-internet ping probe URL into
         // Go-side before the first client is built, so the prober's first
         // tick fires against the user's chosen target. App-side updates
@@ -292,8 +297,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
         } else {
             SocksstubStopVKTurnUpstream()
-            log("info: [vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
-            ExtLog.info("[vkturn] VK TURN disabled by policy — H2 active (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
+            let carrier = Self.upstreamModeRaw(policy)
+            log("info: [vkturn] VK TURN not selected — carrier=\(carrier) (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
+            ExtLog.info("[vkturn] VK TURN not selected — carrier=\(carrier) (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
         }
 
         // VKS room transports: the ladder runs in THIS process — the same
@@ -766,6 +772,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             self.appendExtLog("info: rewire gen=\(generation) start mode=\(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue)")
+            // A mode/endpoint flip must re-point the dial path too, not only
+            // the config blob: leaving a stale mode would keep routing via the
+            // previous carrier.
+            SocksstubSetUpstreamMode(Self.upstreamModeRaw(policy))
 
             // Every authoritative rewire owns the current data-plane lifecycle.
             // H2 must clear a stale TURN netstack; TURN must drain and recreate
@@ -793,13 +803,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if policy.usesTURN {
                 Self.attachVKTurnUpstream()
             }
-            // Mirror for VKS: the ladder follows the whitelist policy on
-            // rewires (mode/endpoint flips), not only at startTunnel.
+            // Mirror for VKS: the carrier follows the whitelist policy on rewires
+            // (mode/endpoint flips), not only at startTunnel — and it must land
+            // on the SAME native room transport startTunnel uses, or a
+            // mid-session flip would silently switch the carrier.
             if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured {
-                let vksStatus = SocksstubStartVKSUpstream(
+                let vksStatus = SocksstubStartVKSNativeUpstream(
                     VKSPreferences.ladderSpec,
                     VKSPreferences.keyHex,
-                    VKSPreferences.shortIDHex,
+                    VKSPreferences.beaconShortIDHex(profileBlob: blob),
                     VKSPreferences.wakeDNS,
                     VKSPreferences.wakeZone,
                     VKSPreferences.listenPort
@@ -807,7 +819,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.appendExtLog("info: [vks] rewire start requested: \(vksStatus) server=\(VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server)")
             } else {
                 _ = SocksstubStopVKSUpstream()
-                self.appendExtLog("info: [vks] rewire - carrier is not VKS or disabled; ladder stopped")
+                _ = SocksstubStopVKSNativeUpstream()
+                self.appendExtLog("info: [vks] rewire - carrier is not VKS or disabled; room transport stopped")
             }
 
             self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
@@ -873,6 +886,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             upstream = .h2
         }
         return UpstreamPolicy(endpointMode: mode, effectiveEndpoint: effective, whitelistModeRaw: whitelist, upstream: upstream)
+    }
+
+    /// Maps the effective carrier onto the Go-side dial mode. Main rides H2;
+    /// the whitelist endpoint rides its selected carrier (VKS or VK TURN).
+    /// dialUpstream switches on this and never falls back to H2 outside Main.
+    private static func upstreamModeRaw(_ policy: UpstreamPolicy) -> String {
+        switch policy.upstream {
+        case .vks: return "vks"
+        case .turn: return "turn"
+        case .h2: return "main"
+        }
     }
 
     /// Picks the appropriate blob for a given mode. In manual modes
