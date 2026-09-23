@@ -120,8 +120,22 @@ enum VKSPreferences {
         set { defaults?.set(trim(newValue).lowercased(), forKey: keyHexKey) }
     }
 
+    /// The VKS beacon MUST carry the caller's real user shortid: the server
+    /// shortid-proofs provider beacons and REJECTS any shortid that is not a
+    /// valid user. An unset field therefore must not fall back to a
+    /// placeholder — derive it from the Main profile URI (the same identity
+    /// the H2 tunnel authenticates with) so the beacon is accepted.
     static var shortIDHex: String {
-        get { defaults?.string(forKey: shortIDKey) ?? testDefaultShortIDHex }
+        get {
+            if let stored = defaults?.string(forKey: shortIDKey), !trim(stored).isEmpty {
+                return trim(stored).lowercased()
+            }
+            if let blob = ConfigStore.shared.load(),
+               let peer = SamizdatURLCodec.h2PeerConfig(from: blob) {
+                return trim(peer.shortID).lowercased()
+            }
+            return testDefaultShortIDHex
+        }
         set { defaults?.set(trim(newValue).lowercased(), forKey: shortIDKey) }
     }
 
