@@ -58,7 +58,13 @@ struct EndpointsView: View {
         if let legacy = split.backup, !legacy.isEmpty {
             ProfileStore.add(legacy)
         }
-        _primaryURL = State(initialValue: split.primary)
+        // The active profile lives IN the list (marked inline) — no separate
+        // Active card. Seed it into the list if it's not there yet.
+        let primary = split.primary
+        if !primary.isEmpty {
+            ProfileStore.add(primary)
+        }
+        _primaryURL = State(initialValue: primary)
         _profiles = State(initialValue: ProfileStore.all())
     }
 
@@ -94,29 +100,9 @@ struct EndpointsView: View {
                 // ── Cards ─────────────────────────────────────────
                 ScrollView {
                     VStack(spacing: 12) {
-                        EndpointCard(
-                            label: "Active",
-                            labelBg: theme.mintDim,
-                            labelFg: theme.mint,
-                            accent: theme.mint,
-                            url: primaryURL,
-                            isConfirming: confirmingClear,
-                            isEditing: editingActive,
-                            editBuffer: $editBufferMain,
-                            onPaste: pasteActive,
-                            onScan: { scanning = .active },
-                            onClearRequest: { confirmingClear = true },
-                            onClearCancel:  { confirmingClear = false },
-                            onClearConfirm: clearActive,
-                            onEditStart: {
-                                editBufferMain = primaryURL
-                                editingActive = true
-                                pasteError = nil
-                            },
-                            onEditCancel: { editingActive = false; pasteError = nil },
-                            onEditSave: { saveEditedActive() }
-                        )
-
+                        // Profiles-only: no separate Active card — the active
+                        // profile is marked inline in the list; picking a row
+                        // makes it active.
                         profilesSection
 
                         if let err = pasteError {
@@ -234,23 +220,22 @@ struct EndpointsView: View {
         pasteError = nil
     }
 
-    /// Swaps a saved profile into the active slot; the previous active
-    /// stays available as a saved profile. Live-applied into the running
-    /// tunnel by persistImmediately's setConfigBlob push.
+    /// Marks a saved profile as the active one (it stays in the list, shown
+    /// with the active accent). Live-applied into the running tunnel by
+    /// persistImmediately's setConfigBlob push.
     private func activateProfile(_ url: String) {
-        let current = primaryURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty {
-            ProfileStore.add(current)
-        }
-        ProfileStore.remove(url)
         primaryURL = url
-        profiles = ProfileStore.all()
         pasteError = nil
         persistImmediately()
     }
 
     private func deleteProfile(_ url: String) {
         ProfileStore.remove(url)
+        if primaryURL == url {
+            // The deleted profile was active — clear the active selection.
+            primaryURL = ""
+            persistImmediately()
+        }
         profiles = ProfileStore.all()
         deletingProfile = nil
     }
@@ -365,10 +350,11 @@ struct EndpointsView: View {
     }
 
     private func profileRow(_ url: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "doc.text")
+        let isActive = url == primaryURL
+        return HStack(spacing: 8) {
+            Image(systemName: isActive ? "checkmark.circle.fill" : "doc.text")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(theme.blue)
+                .foregroundStyle(isActive ? theme.mint : theme.blue)
             VStack(alignment: .leading, spacing: 2) {
                 Text(endpointHost(url) ?? "tamizdat://")
                     .font(.geist(.medium, size: 13))
@@ -404,17 +390,26 @@ struct EndpointsView: View {
                 }
                 .buttonStyle(.plain)
             } else {
-                Button {
-                    activateProfile(url)
-                } label: {
-                    Text("Activate")
-                        .font(.geist(.semibold, size: 12))
+                if isActive {
+                    Text("Active")
+                        .font(.geist(.bold, size: 12))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background(Capsule().fill(theme.mintDim))
                         .foregroundStyle(theme.mint)
+                } else {
+                    Button {
+                        activateProfile(url)
+                    } label: {
+                        Text("Activate")
+                            .font(.geist(.semibold, size: 12))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(theme.mintDim))
+                            .foregroundStyle(theme.mint)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
                 Button {
                     deletingProfile = url
                 } label: {

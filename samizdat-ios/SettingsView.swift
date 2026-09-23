@@ -45,7 +45,6 @@ struct SettingsView: View {
     // persist via VKSPreferences on Save; the extension applies them on
     // the next connect.
     @State private var vksEnabledDraft: Bool = VKSPreferences.enabled
-    @State private var vksKeyDraft: String = VKSPreferences.keyHex
     @State private var vksShortIDDraft: String = VKSPreferences.shortIDHex
     @State private var vksPortDraft: String = String(VKSPreferences.listenPort)
     @State private var vksServerDraft: String = VKSPreferences.server
@@ -457,7 +456,6 @@ struct SettingsView: View {
                 vksProviderRow("WB Stream", on: $vksWbstreamOnDraft)
                 vksProviderRow("Jazz", on: $vksJazzOnDraft)
                 vksProviderRow("MTS", on: $vksMtsOnDraft)
-                vksField("olcRTC key", "64 hex", $vksKeyDraft)
                 vksField("shortid", "hex из users", $vksShortIDDraft)
             vksField("Server", "host:port (без дефолта)", $vksServerDraft)
                 vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
@@ -523,7 +521,6 @@ struct SettingsView: View {
         VKSPreferences.wbstreamEnabled = vksWbstreamOnDraft
         VKSPreferences.jazzEnabled = vksJazzOnDraft
         VKSPreferences.mtsEnabled = vksMtsOnDraft
-        VKSPreferences.keyHex = vksKeyDraft
         VKSPreferences.shortIDHex = vksShortIDDraft
         VKSPreferences.server = vksServerDraft
         let portText = vksPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -539,7 +536,6 @@ struct SettingsView: View {
         vksWbstreamOnDraft = VKSPreferences.wbstreamEnabled
         vksJazzOnDraft = VKSPreferences.jazzEnabled
         vksMtsOnDraft = VKSPreferences.mtsEnabled
-        vksKeyDraft = VKSPreferences.keyHex
         vksShortIDDraft = VKSPreferences.shortIDHex
         vksServerDraft = VKSPreferences.server
         vksPortDraft = String(VKSPreferences.listenPort)
