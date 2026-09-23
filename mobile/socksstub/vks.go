@@ -253,7 +253,7 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	if old != nil {
 		_ = old.Close()
 	}
-	rt.appendLog("info: [vks-native] upstream up (TLS+masq over the room datachannel, shortid-only)")
+	rt.appendLog(fmt.Sprintf("info: [vks-native] upstream up shortid=%s provider=%s (beacon must carry a VALID user shortid)", shortIDHex, cfgs[0].Provider))
 	return vksStatusJSON("started", "", "")
 }
 

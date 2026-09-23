@@ -120,47 +120,55 @@ enum VKSPreferences {
         set { defaults?.set(trim(newValue).lowercased(), forKey: keyHexKey) }
     }
 
+    /// The stored override, ignoring empty AND the shipped test placeholder:
+    /// a saved placeholder is not an operator choice (the server rejects it as
+    /// "bad shortid"), so it must behave exactly like "unset". Without this,
+    /// merely opening Settings once persists the placeholder over the profile
+    /// identity and every provider beacon is rejected.
+    private static func explicitShortID() -> String {
+        guard let stored = defaults?.string(forKey: shortIDKey) else { return "" }
+        let s = trim(stored).lowercased()
+        return s == testDefaultShortIDHex ? "" : s
+    }
+
+    /// First entry of a comma-separated rotation pool, else the value as-is.
+    private static func firstShortID(_ raw: String) -> String {
+        let s = trim(raw).lowercased()
+        guard let comma = s.firstIndex(of: ",") else { return s }
+        return String(s[..<comma])
+    }
+
     /// The VKS beacon MUST carry the caller's real user shortid: the server
     /// shortid-proofs provider beacons and REJECTS any shortid that is not a
-    /// valid user. An unset field therefore must not fall back to a
-    /// placeholder — derive it from the Main profile URI (the same identity
-    /// the H2 tunnel authenticates with) so the beacon is accepted.
+    /// valid user. Never resolve to the placeholder — derive from the Main
+    /// profile URI (the identity the H2 tunnel authenticates with).
     static var shortIDHex: String {
         get {
-            if let stored = defaults?.string(forKey: shortIDKey), !trim(stored).isEmpty {
-                return trim(stored).lowercased()
-            }
+            let explicit = explicitShortID()
+            if !explicit.isEmpty { return explicit }
             // Unset: fall back to the identity the app mirrors into the App
-            // Group (derived from the Main profile URI — the same one the H2
-            // tunnel authenticates with). Never a placeholder: the server
-            // shortid-proofs provider beacons and rejects unknown shortids.
-            // This file is compiled into the extension target too, where
-            // ConfigStore is unavailable — the App Group mirror is the shared
+            // Group. This file is compiled into the extension target too,
+            // where ConfigStore is unavailable — the mirror is the shared
             // source both targets can read.
-            let mirrored = trim(VKCredsPreferences.connectPassword)
-            if !mirrored.isEmpty {
-                return mirrored.lowercased()
-            }
+            let mirrored = firstShortID(VKCredsPreferences.connectPassword)
+            if !mirrored.isEmpty { return mirrored }
             return testDefaultShortIDHex
         }
         set { defaults?.set(trim(newValue).lowercased(), forKey: shortIDKey) }
     }
 
     /// The shortid the VKS provider beacon must carry. Prefers an explicit
-    /// operator override, then the identity from the active profile blob —
-    /// the extension already holds it, so this works even when the App Group
-    /// mirror was never written. The server shortid-proofs provider beacons
-    /// and REJECTS any shortid that is not a valid user, so this must never
-    /// silently resolve to a placeholder.
+    /// operator override (never the placeholder), then the identity from the
+    /// active profile blob — the extension already holds it, so this works
+    /// even when the App Group mirror was never written.
     static func beaconShortIDHex(profileBlob: String?) -> String {
-        if let stored = defaults?.string(forKey: shortIDKey), !trim(stored).isEmpty {
-            return trim(stored).lowercased()
-        }
+        let explicit = explicitShortID()
+        if !explicit.isEmpty { return explicit }
         if let blob = profileBlob, let peer = SamizdatURLCodec.h2PeerConfig(from: blob) {
-            let s = trim(peer.shortID).lowercased()
+            let s = firstShortID(peer.shortID)
             if !s.isEmpty { return s }
         }
-        let mirrored = trim(VKCredsPreferences.connectPassword).lowercased()
+        let mirrored = firstShortID(VKCredsPreferences.connectPassword)
         if !mirrored.isEmpty { return mirrored }
         return testDefaultShortIDHex
     }
