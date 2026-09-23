@@ -36,7 +36,7 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 			// answering in-band with the room spec; the client connects to
 			// the ASSIGNED room instead of its statically configured one.
 			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-				spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider)
+				spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
 				if err != nil {
 					log.Printf("vks ladder: provider beacon for %s failed: %v", cfg.Provider, err)
 					// Fall back to the static room beacon.

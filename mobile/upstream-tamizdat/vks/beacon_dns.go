@@ -246,14 +246,22 @@ func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec stri
 // DNS TXT answer. This is the beacon-assignment flow: the client beacons a
 // provider key (HMAC of the shared key), the server creates a fresh room
 // (WB/Jazz) or assigns an armed one (Telemost/MTS) and answers in-band.
-func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider string) (string, error) {
+func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, shortIDHex string) (string, error) {
 	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
 	providerKey := ProviderWakeKey(keyHex, provider)
 	nonce := make([]byte, 4)
 	if _, err := rand.Read(nonce); err != nil {
 		return "", fmt.Errorf("wake nonce: %w", err)
 	}
-	name := strings.ToLower(providerKey) + "." + hex.EncodeToString(nonce) + "." + zone + "."
+	// The server shortid-proofs provider beacons: the query name carries the
+	// client's shortid as the second label
+	// (<providerKey>.<shortid>.<nonce>.<zone>), and the server assigns a room
+	// only when that shortid is a valid user. An empty label gets REJECTED.
+	sid := strings.ToLower(strings.TrimSpace(shortIDHex))
+	if sid == "" {
+		sid = "0"
+	}
+	name := strings.ToLower(providerKey) + "." + sid + "." + hex.EncodeToString(nonce) + "." + zone + "."
 	query := buildTXTQuery(name)
 	d := net.Dialer{Timeout: 5 * time.Second}
 	c, err := d.DialContext(ctx, "udp", dnsServer)

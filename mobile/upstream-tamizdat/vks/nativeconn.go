@@ -234,7 +234,7 @@ func sendTo(tr transport.Transport, peerID string, data []byte) error {
 func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	// On-demand: beacon the provider, dial the server-assigned room.
 	if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-		if spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider); err == nil {
+		if spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex); err == nil {
 			if p, r, ok := splitProviderRoom(spec); ok {
 				cfg.Provider, cfg.RoomURL = p, r
 			}
