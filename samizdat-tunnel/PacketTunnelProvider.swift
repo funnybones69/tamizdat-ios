@@ -311,7 +311,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let vksStatus = SocksstubStartVKSNativeUpstream(
                 VKSPreferences.ladderSpec,
                 VKSPreferences.keyHex,
-                VKSPreferences.shortIDHex,
+                VKSPreferences.beaconShortIDHex(profileBlob: configBlob),
                 VKSPreferences.wakeDNS,
                 VKSPreferences.wakeZone,
                 VKSPreferences.listenPort

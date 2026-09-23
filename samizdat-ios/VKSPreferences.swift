@@ -146,6 +146,25 @@ enum VKSPreferences {
         set { defaults?.set(trim(newValue).lowercased(), forKey: shortIDKey) }
     }
 
+    /// The shortid the VKS provider beacon must carry. Prefers an explicit
+    /// operator override, then the identity from the active profile blob —
+    /// the extension already holds it, so this works even when the App Group
+    /// mirror was never written. The server shortid-proofs provider beacons
+    /// and REJECTS any shortid that is not a valid user, so this must never
+    /// silently resolve to a placeholder.
+    static func beaconShortIDHex(profileBlob: String?) -> String {
+        if let stored = defaults?.string(forKey: shortIDKey), !trim(stored).isEmpty {
+            return trim(stored).lowercased()
+        }
+        if let blob = profileBlob, let peer = SamizdatURLCodec.h2PeerConfig(from: blob) {
+            let s = trim(peer.shortID).lowercased()
+            if !s.isEmpty { return s }
+        }
+        let mirrored = trim(VKCredsPreferences.connectPassword).lowercased()
+        if !mirrored.isEmpty { return mirrored }
+        return testDefaultShortIDHex
+    }
+
     /// Explicit server for the VKS carrier (host:port). Empty = no value
     /// (deliberately no default).
     static var server: String {
