@@ -48,6 +48,8 @@ struct SettingsView: View {
     @State private var vksShortIDDraft: String = VKSPreferences.shortIDHex
     @State private var vksPortDraft: String = String(VKSPreferences.listenPort)
     @State private var vksServerDraft: String = VKSPreferences.server
+    @State private var vksWakeDNSDraft: String = VKSPreferences.wakeDNS
+    @State private var vksWakeZoneDraft: String = VKSPreferences.wakeZone
     @State private var vksTelemostOnDraft: Bool = VKSPreferences.telemostEnabled
     @State private var vksWbstreamOnDraft: Bool = VKSPreferences.wbstreamEnabled
     @State private var vksJazzOnDraft: Bool = VKSPreferences.jazzEnabled
@@ -456,9 +458,11 @@ struct SettingsView: View {
                 vksProviderRow("WB Stream", on: $vksWbstreamOnDraft)
                 vksProviderRow("Jazz", on: $vksJazzOnDraft)
                 vksProviderRow("MTS", on: $vksMtsOnDraft)
-                vksField("shortid", "hex из users", $vksShortIDDraft)
-            vksField("Server", "host:port (без дефолта)", $vksServerDraft)
-                vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
+			vksField("shortid", "hex из users", $vksShortIDDraft)
+		vksField("Server", "host:port (без дефолта)", $vksServerDraft)
+			vksField("Listen port", String(VKSPreferences.defaultListenPort), $vksPortDraft)
+			vksField("Wake DNS server", "77.88.8.8:53 (пусто = бикон выключен)", $vksWakeDNSDraft)
+			vksField("Wake zone", "w.ai-archive.ru (зона, за которую отвечает сервер)", $vksWakeZoneDraft)
 
                 Text("Мастер-тумблер (сверху): VKS активен — в whitelist-режиме перехватывает у VK TURN (тот остаётся резервом). У каждого провайдера свой тумблер — клиент хранит ТОЛЬКО провайдеров: при подключении шлёт бикон, сервер создаёт/назначает комнату и отвечает TXT. Рандомный выбор из активных + failover.")
                     .font(.geistMono(.regular, size: 10))
@@ -523,6 +527,8 @@ struct SettingsView: View {
         VKSPreferences.mtsEnabled = vksMtsOnDraft
         VKSPreferences.shortIDHex = vksShortIDDraft
         VKSPreferences.server = vksServerDraft
+        VKSPreferences.wakeDNS = vksWakeDNSDraft
+        VKSPreferences.wakeZone = vksWakeZoneDraft
         let portText = vksPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         var portNote = ""
         if let port = Int(portText), (1024...65535).contains(port), port != 9000, port != 18443 {
@@ -538,6 +544,8 @@ struct SettingsView: View {
         vksMtsOnDraft = VKSPreferences.mtsEnabled
         vksShortIDDraft = VKSPreferences.shortIDHex
         vksServerDraft = VKSPreferences.server
+        vksWakeDNSDraft = VKSPreferences.wakeDNS
+        vksWakeZoneDraft = VKSPreferences.wakeZone
         vksPortDraft = String(VKSPreferences.listenPort)
 
         if !VKSPreferences.enabled {
