@@ -4,8 +4,8 @@
 // main-app process and serves a local SOCKS5 listener; every TCP flow
 // accepted by socksstub is chained through that listener (SOCKS5 CONNECT)
 // and rides the WebRTC room tunnel to the tamizdat server. The olc client
-// is stream-only, so UDP flows keep the existing precedence
-// (VK TURN netstack → samizdat → direct).
+// is stream-only: UDP follows the carrier mode like TCP does, and neither
+// has an H2 or direct fallback outside Main mode.
 //
 // Public gomobile API (mirrors the vkturn surface):
 //
@@ -208,7 +208,9 @@ func vksStatusJSON(status, addr, errMsg string) string {
 // DialContext when this is set. The server config (pubkey, SNI) comes from
 // the active proxy profile's blob; the room config from the VKS settings.
 func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
+	rt.mu.Lock()
 	blob := rt.samizdatBlob
+	rt.mu.Unlock()
 	if blob == "" {
 		return vksStatusJSON("error", "", "no active proxy profile (server config) for the native VKS path")
 	}
@@ -249,6 +251,11 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	rt.mu.Lock()
 	old := rt.vksNativeClient
 	rt.vksNativeClient = client
+	// A fresh client invalidates the previous failure latch: keeping it would
+	// make dialWhitelistVKS refuse the new carrier for up to vksNativeFailLatch.
+	rt.vksNativeFailUntil.Store(0)
+	// Probe misses during the native room/beacon warm-up are not verdicts.
+	rt.vksCarrierReadyAtNanos.Store(time.Now().UnixNano())
 	rt.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
@@ -262,10 +269,17 @@ func StopVKSNativeUpstream() string {
 	rt.mu.Lock()
 	old := rt.vksNativeClient
 	rt.vksNativeClient = nil
+	rt.vksNativeFailUntil.Store(0)
+	rt.vksCarrierReadyAtNanos.Store(0)
 	rt.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
 	}
+	// The room sessions live inside the vks package, not on the samizdat client:
+	// closing the client alone leaves the SFU websocket, the PeerConnections and
+	// the room ping goroutine alive (and a ghost participant in the room).
+	// ShutdownNativeSessions releases them, so teardown must call it explicitly.
+	vks.ShutdownNativeSessions()
 	return vksStatusJSON("stopped", "", "")
 }
 
@@ -284,7 +298,7 @@ func dialViaSocks5(ctx context.Context, proxyAddr, dest string) (net.Conn, error
 		}
 	}()
 	// 5s cap: a flapping or dead ladder must not eat the flow's dial
-	// budget - dialUpstream falls back to samizdat after this.
+	// budget - the flow fails instead of silently falling back to H2.
 	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
 	// Greeting: VER=5, NMETHODS=1, NOAUTH.
 	if _, err := c.Write([]byte{0x05, 0x01, 0x00}); err != nil {

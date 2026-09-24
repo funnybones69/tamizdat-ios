@@ -205,7 +205,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // is unreachable RIGHT NOW. Throttled in Go to once per 15 s.
         let rewireBridge = AutoRewireBridge { [weak self] in
             guard let self else { return }
-            if self.shouldSuppressPingRewireForTURN() {
+            if self.shouldSuppressPingRewireForWhitelistCarrier() {
                 return
             }
             self.appendExtLog("info: auto-rewire fired by ping prober (consecutive fails)")
@@ -610,6 +610,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         Self.turnTunnelGenerationLock.withLock { $0 += 1 }
         SocksstubStopVKTurnUpstreamAsync()
         _ = SocksstubStopVKSUpstream()
+        _ = SocksstubStopVKSNativeUpstream()
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
@@ -722,9 +723,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// attach pollers and eventually caused rapid runner restart/quota churn.
     /// Physical NWPath changes and explicit user reconnects remain separate,
     /// authoritative lifecycle triggers.
-    private func shouldSuppressPingRewireForTURN() -> Bool {
+    /// Whitelist carriers (VKS / VK TURN) are the path the operator requires in
+    /// every non-Main mode, and a rewire is destructive: it stops the carrier
+    /// and force-closes every live flow. A prober miss must therefore surface
+    /// in the UI state instead of driving a rewire loop. Main keeps auto-rewire.
+    private func shouldSuppressPingRewireForWhitelistCarrier() -> Bool {
         let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-        guard policy.usesTURN else { return false }
+        guard policy.usesTURN else {
+            // Same invariant as TURN below: a rewire stops the carrier and
+            // force-closes every live flow, so a prober miss must never request
+            // one while a whitelist carrier owns the data path.
+            if policy.upstream != .h2 {
+                appendExtLog("info: auto-rewire ignored — whitelist carrier owns upstream; preserving live flows")
+                return true
+            }
+            return false
+        }
 
         let running = SocksstubTURNUpstreamRunning()
         let ready = !SocksstubTURNUpstreamWGConfig().isEmpty

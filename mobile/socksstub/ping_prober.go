@@ -377,6 +377,13 @@ func recordSuccess(latency time.Duration) {
 }
 
 func recordMiss() {
+	// A freshly installed whitelist carrier pays the ~12 s room/beacon warm-up
+	// while the first probe only waits 5 s, so a miss here is not a verdict:
+	// do not count it (nor light the Failed lamp) until the grace has passed.
+	if withinVKSCarrierWarmup() {
+		proberState.lastProbedAt.Store(time.Now().UnixNano())
+		return
+	}
 	proberState.ok.Store(false)
 	fails := proberState.consecutiveFails.Add(1)
 	proberState.lastProbedAt.Store(time.Now().UnixNano())
@@ -394,6 +401,17 @@ func recordMiss() {
 	if fails >= 2 {
 		maybeRequestRewire()
 	}
+}
+
+// withinVKSCarrierWarmup reports whether a whitelist carrier was installed
+// recently enough that its first probe misses are warm-up rather than a
+// verdict. Main counts misses from the very first probe.
+func withinVKSCarrierWarmup() bool {
+	if CurrentUpstreamMode() == "main" {
+		return false
+	}
+	ready := rt.vksCarrierReadyAtNanos.Load()
+	return ready != 0 && time.Since(time.Unix(0, ready)) < vksCarrierWarmupGrace
 }
 
 // RewireRequester is the gomobile-bound interface Swift implements to
@@ -416,6 +434,13 @@ func SetRewireRequester(r RewireRequester) {
 }
 
 func maybeRequestRewire() {
+	// Whitelist carriers (vks / turn) are the path the operator requires in every
+	// non-Main mode, and a rewire tears the carrier down and force-closes every
+	// live flow. So a probe miss there must surface in the UI state, never drive
+	// a rewire loop. Main keeps auto-rewire.
+	if CurrentUpstreamMode() != "main" {
+		return
+	}
 	const minInterval = 15 * time.Second
 	last := lastRewireRequestedNanos.Load()
 	if last != 0 && time.Since(time.Unix(0, last)) < minInterval {

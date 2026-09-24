@@ -223,3 +223,55 @@ func TestPingProbeUsesActiveUpstreamNotCapturedClient(t *testing.T) {
 		t.Fatalf("probe should use active upstream/dialUpstream, got OK=%v LastMs=%d", snap.OK, snap.LastMs)
 	}
 }
+
+// TestMaybeRequestRewireSuppressedForWhitelistCarrier pins the whitelist
+// invariant: while a VKS / VK TURN carrier owns the upstream, a probe miss must
+// never request an auto-rewire, because a rewire stops the carrier and
+// force-closes every live flow. Main keeps the auto-rewire it always had.
+func TestMaybeRequestRewireSuppressedForWhitelistCarrier(t *testing.T) {
+	calls := make(chan struct{}, 8)
+	// atomic.Value cannot be reset to empty and no other test in this package
+	// registers a requester, so a non-blocking recorder is safe to leave behind.
+	rewireRequester.Store(recordingRewireRequester{calls: calls})
+	rt.mu.Lock()
+	origMode := rt.upstreamMode
+	rt.mu.Unlock()
+	origLast := lastRewireRequestedNanos.Load()
+	t.Cleanup(func() {
+		rt.mu.Lock()
+		rt.upstreamMode = origMode
+		rt.mu.Unlock()
+		lastRewireRequestedNanos.Store(origLast)
+	})
+
+	for _, mode := range []string{"vks", "turn"} {
+		SetUpstreamMode(mode)
+		lastRewireRequestedNanos.Store(0) // clear the 15s throttle
+		maybeRequestRewire()
+		select {
+		case <-calls:
+			t.Fatalf("mode %q: a probe miss must not auto-rewire a whitelist carrier", mode)
+		case <-time.After(150 * time.Millisecond):
+		}
+	}
+
+	// Positive control: Main must still auto-rewire, otherwise the assertions
+	// above would also pass for a prober that never requests anything at all.
+	SetUpstreamMode("main")
+	lastRewireRequestedNanos.Store(0)
+	maybeRequestRewire()
+	select {
+	case <-calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("main: a probe miss must still auto-rewire")
+	}
+}
+
+type recordingRewireRequester struct{ calls chan struct{} }
+
+func (r recordingRewireRequester) RequestRewire() {
+	select {
+	case r.calls <- struct{}{}:
+	default:
+	}
+}

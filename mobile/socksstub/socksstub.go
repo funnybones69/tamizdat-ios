@@ -111,6 +111,10 @@ type runtimeState struct {
 	// flow pay the ~12s beacon timeout before falling back to the chain
 	// below (mirrors the olc ladder's warn-and-fall-through).
 	vksNativeFailUntil atomic.Int64
+	// vksCarrierReadyAtNanos (unix nanos) is when the native VKS client was
+	// last installed. The ping prober gives the carrier this long before a
+	// probe miss may count (see withinVKSCarrierWarmup).
+	vksCarrierReadyAtNanos atomic.Int64
 	// upstreamMode is the carrier the operator selected: "main" (samizdat
 	// H2), "vks" (whitelist room transport) or "turn" (VK TURN). dialUpstream
 	// switches on it and NEVER falls back to H2 or a direct dial while a
@@ -608,6 +612,12 @@ func SetSamizdatConfig(blob string) error {
 		// whether it was TCP dial, TLS handshake, or H2 settings that died.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
+		// H2 is never the data path outside Main, so this warm-up would put real
+		// tunnel traffic on the wire for nothing - and the operator requires
+		// none of it on a whitelist carrier.
+		if CurrentUpstreamMode() != "main" {
+			return
+		}
 		conn, err := client.DialContext(ctx, "tcp", "1.1.1.1:443")
 		if err != nil {
 			rt.appendLog(fmt.Sprintf("warn: samizdat warm-up dial: %v (cold start will be slower)", err))
@@ -1086,7 +1096,13 @@ func sendReply(client net.Conn, code byte) error {
 // failure, so a dead room does not make every flow pay the beacon timeout.
 const vksNativeFailLatch = 30 * time.Second
 
-// dialUpstream is the swap-point: stage 1 = direct, stage 2 = samizdat.
+// vksCarrierWarmupGrace covers a freshly installed native carrier: joining the
+// room and waiting for the beacon can outlast the first probe (5 s) by a wide
+// margin, so misses inside this window must not count.
+const vksCarrierWarmupGrace = 20 * time.Second
+
+// dialUpstream routes a flow onto the carrier the operator selected. There is
+// no fallback chain: outside Main mode the H2 path and any direct dial fail.
 // IPA-A1: app-hint Tier 3 removed (PacketBridge gone). Server's
 // Tier 1 (port whitelist) + Tier 2 (cadence) carry the realtime
 // classifier without us.
