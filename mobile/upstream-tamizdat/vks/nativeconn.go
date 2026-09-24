@@ -471,8 +471,21 @@ func dcStore(key string, s *dcSession) {
 
 var (
 	specCacheMu sync.Mutex
-	specCache   = map[string]string{} // provider|keyHex -> beacon-assigned spec
+	specCache   = map[string]string{}      // provider|keyHex -> beacon-assigned spec
+	specWakeMu  = map[string]*sync.Mutex{} // provider|keyHex -> beacon lock
 )
+
+// wakeSpecLock returns the per-key beacon lock, creating it on first use.
+func wakeSpecLock(key string) *sync.Mutex {
+	specCacheMu.Lock()
+	defer specCacheMu.Unlock()
+	m := specWakeMu[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		specWakeMu[key] = m
+	}
+	return m
+}
 
 // wakeSpecKey identifies an on-demand assignment: the beacon is per provider
 // and the assignment is authenticated by the shared key.
@@ -494,6 +507,15 @@ func dropWakeSpec(key string) {
 // assignment when there is one. On beacon failure it leaves the statically
 // configured room in place.
 func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) {
+	// Single-flight per key. The check-then-beacon below used to be racy: the
+	// first real flow and the ping prober's first probe dial at the same
+	// moment, both found the cache empty and both sent a beacon. The on-demand
+	// server mints a FRESH room for every beacon, so the two sides ended up in
+	// different rooms and the dial timed out (observed: one dial produced three
+	// rooms and no peer). One beacon per key, the rest wait for its result.
+	lk := wakeSpecLock(key)
+	lk.Lock()
+	defer lk.Unlock()
 	specCacheMu.Lock()
 	spec := specCache[key]
 	specCacheMu.Unlock()
