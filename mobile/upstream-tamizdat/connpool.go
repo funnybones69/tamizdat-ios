@@ -187,6 +187,12 @@ func (p *connPool) getBulkTransport(ctx context.Context) (*h2Transport, error) {
 			return nil, context.Canceled
 		}
 
+		// Closed transports can never serve again, so they must not hold
+		// capacity. Prune before reserving and before the capacity check:
+		// without this a transport closed after a conn error kept the pool at
+		// its cap until the 60s cleanup tick, blackholing every dial between.
+		p.pruneClosedLocked()
+
 		if t := p.reserveBulkLocked(); t != nil {
 			p.mu.Unlock()
 			t.touch()
@@ -590,6 +596,31 @@ func (p *connPool) updatePoolGaugesLocked() {
 // cleanupLoop periodically removes closed and idle transports. The tick
 // interval is intentionally looser than the client-visible IdleTimeout to
 // avoid being the 30 s heartbeat observable.
+// pruneClosedLocked drops transports that are provably dead (closed). A closed
+// transport can never serve a request, so keeping it only makes it count
+// against capacity -- which is how a transport closed after a conn error used
+// to blackhole every dial until the 60s cleanup tick. Draining transports are
+// deliberately NOT touched: rotation-overlap backpressure for them is pinned
+// by TestPool_BulkRotationWhileLitePresent / TestPool_V1RotationOverlapZeroBackpressures.
+// Caller must hold p.mu. Returns true when at least one transport was dropped.
+func (p *connPool) pruneClosedLocked() bool {
+	alive := p.transports[:0:0]
+	dropped := false
+	for _, t := range p.transports {
+		if t == nil || t.isClosed() {
+			p.clearLiteTransportLocked(t)
+			dropped = true
+			continue
+		}
+		alive = append(alive, t)
+	}
+	if dropped {
+		p.transports = alive
+		p.updatePoolGaugesLocked()
+	}
+	return dropped
+}
+
 func (p *connPool) cleanupLoop() {
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
@@ -694,6 +725,10 @@ func (p *connPool) topUp() {
 			p.mu.Unlock()
 			return
 		}
+
+		// Same rule on the reaper path, so the pool can rebuild itself within
+		// one 5s tick instead of waiting for the 60s cleanup.
+		p.pruneClosedLocked()
 
 		bulkAlive := 0
 		for _, tr := range p.transports {
