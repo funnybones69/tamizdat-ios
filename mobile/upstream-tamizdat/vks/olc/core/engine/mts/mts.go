@@ -207,7 +207,19 @@ func (s *Session) Connect(ctx context.Context) error {
 		log.Printf("[mts] sendLoop started")
 		close(dcReady)
 	})
+	// Only a transport that tunnels its bytes through THIS datachannel may let
+	// a close tear the session down. The media-plane transports (seichannel,
+	// vp8channel) carry data on the video track and open the engine with
+	// OnData == nil; the SFU closes this unused channel on its own schedule
+	// (a guest->LECTURER promotion renegotiation does exactly that), and the
+	// resulting reconnect loop is what killed mts/telemost right after the
+	// first frame. The plane has its own liveness (KCP + the transport's
+	// keepalive), so an unused channel closing is not a session verdict.
 	s.dc.OnClose(func() {
+		if s.cfg.OnData == nil {
+			log.Printf("[mts] dc OnClose on an unused channel (media-plane transport) - keeping the session")
+			return
+		}
 		log.Printf("[mts] dc OnClose FIRED - queuing reconnect")
 		s.queueReconnect()
 	})

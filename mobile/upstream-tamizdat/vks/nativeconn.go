@@ -33,7 +33,6 @@ import (
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/app/session"
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport"
-	"github.com/funnybones69/tamizdat/vks/olc/core/transport/datachannel"
 )
 
 const (
@@ -576,18 +575,26 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 	defer cancel()
 
 	s := newDcSession(nil)
-	tr, err := datachannel.New(sessCtx, transport.Config{
+	// The carrier must match the provider, exactly as the olc path does.
+	// transportName(): jazz -> datachannel, mts -> seichannel, telemost/wb ->
+	// vp8channel. This used to be hardcoded to datachannel, so mts and
+	// telemost ran their tunnel bytes over a carrier their SFU does not relay
+	// (odin forwards only H264 SEI media, and only to subscribers; goolom
+	// relays VP8): the session came up, the first frame went out, and the
+	// channel died in the same second.
+	tr, err := transport.New(sessCtx, cfg.transportName(), transport.Config{
 		Provider:      cfg.Provider,
 		RoomURL:       cfg.RoomURL,
 		ProviderToken: cfg.ProviderToken,
 		ChannelID:     cfg.ChannelID,
 		Name:          cfg.resolvedName(),
 		DNSServer:     cfg.DNSServer,
+		Options:       cfg.transportOptions(),
 		OnData:        s.onData,
 		OnPeerData:    s.onPeerData,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("native: open datachannel: %w", err)
+		return nil, fmt.Errorf("native: open %s: %w", cfg.transportName(), err)
 	}
 	s.tr = tr
 	log.Printf("[native] join %s: connecting room %s", cfg.Provider, cfg.RoomURL)
@@ -743,13 +750,14 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 	}
 	session.RegisterDefaults() // registers the provider auth flows (jazz/mts/wb/telemost)
 
-	tr, err := datachannel.New(ctx, transport.Config{
+	tr, err := transport.New(ctx, cfg.transportName(), transport.Config{
 		Provider:      cfg.Provider,
 		RoomURL:       cfg.RoomURL,
 		ProviderToken: cfg.ProviderToken,
 		ChannelID:     cfg.ChannelID,
 		Name:          cfg.resolvedName(),
 		DNSServer:     cfg.DNSServer,
+		Options:       cfg.transportOptions(),
 		OnData: func(data []byte) {
 			// Discovery probe: "TMZD_HELLO" + 4-byte session tag.
 			if len(data) >= 14 && string(data[:10]) == tmzdHello {
@@ -768,7 +776,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("native listen: open datachannel: %w", err)
+		return nil, fmt.Errorf("native listen: open %s: %w", cfg.transportName(), err)
 	}
 	l.tr = tr
 	if err := tr.Connect(ctx); err != nil {
