@@ -35,7 +35,7 @@ func main() {
 		shortID  = flag.String("shortid", "", "user master shortid (16 hex) carried by the beacon")
 		specs    = flag.String("vks", "jazz:stub", "ladder spec; the native transport dials the FIRST entry")
 		wakeDNS  = flag.String("wake-dns", "77.88.8.8:53", "resolver for the on-demand wake beacon")
-		wakeZone = flag.String("wake-zone", "wake.example.com", "beacon zone served by the server's authoritative NS")
+		wakeZone = flag.String("wake-zone", "", "beacon zone served by the server's authoritative NS (your own zone)")
 		port     = flag.Int("listen", 11095, "loopback SOCKS5 port the stub should listen on")
 		probe    = flag.String("probe", "http://api.ipify.org/", "plain-HTTP probe URL (no TLS: the signal is TCP through the tunnel)")
 		count    = flag.Int("n", 20, "number of probes")

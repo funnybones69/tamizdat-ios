@@ -7,7 +7,7 @@ import Foundation
 /// cellular → real ISP IP.
 ///
 /// Surfaces below the Ping chip on the Home screen as
-/// `Exit · 198.51.100.241` (tunnel up) or `Network · 88.45.123.55`
+/// `Exit · <tunnel-exit-ip>` (tunnel up) or `Network · <isp-ip>`
 /// (tunnel off). Quiet failure: if all probes fail the line just
 /// doesn't render.
 ///

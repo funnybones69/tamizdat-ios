@@ -651,7 +651,7 @@ private struct URLBreakdownView: View {
 
     private struct Parts {
         let scheme: String       // "tamizdat://"
-        let hostPort: String     // "server.example.com:443/"
+        let hostPort: String     // "<server-host>:443/"
         let pairs: [(String, String)]  // [(sni, ya.ru), (pubkey, ...), ...]
     }
 

@@ -28,7 +28,7 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	var (
 		credsFile = flag.String("credsfile", "", "JSON file with pre-fetched TURN creds")
-		peer      = flag.String("peer", "203.0.113.10:443", "wgturn server host:port")
+		peer      = flag.String("peer", "127.0.0.1:443", "wgturn server host:port (set to your own server)")
 		password  = flag.String("password", "", "wgturn password (= user shortid)")
 		deviceID  = flag.String("deviceid", "e2e-device", "wgturn device identity (distinct per parallel client)")
 		listenPort = flag.Int("listenport", 19000, "local WG endpoint port (distinct per parallel client)")

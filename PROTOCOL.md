@@ -18,7 +18,7 @@ binds the Go client runtime into the extension process.
 Main local path used by maintainers:
 
 ```text
-C:\Users\user\projects\samizdat-ios
+C:\path\to\samizdat-ios
 ```
 
 Public repository:

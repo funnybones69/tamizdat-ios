@@ -940,9 +940,9 @@ func openLogInNotepad() {
 // Sweeps:
 //   - default 0.0.0.0/0 via 10.255.0.1 (orphan TUN default)
 //   - any /32 routes via 10.255.0.1 (orphan selective-routes)
-//   - any /32 host-route to known server IPs (203.0.113.213, 198.51.100.241,
-//     resolved server.example.com, server.example.com) via the local LAN
-//     gateway 192.168.1.1 (best effort — won't error if absent)
+//   - any /32 host-route to the operator's own server prefixes
+//     (TAMIZDAT_SERVER_PREFIXES, e.g. "203.0.113.,198.51.100.") via the local
+//     LAN gateway 192.168.1.1 (best effort — won't error if absent)
 func runRouteCleanup() {
 	appendLog("[gui] cleanup: scanning routing table...")
 	// 1. Get full route table once.
@@ -954,6 +954,7 @@ func runRouteCleanup() {
 		return
 	}
 	removed := 0
+	serverPrefixes := serverPrefixesFromEnv()
 	for _, line := range strings.Split(string(out), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 5 {
@@ -963,11 +964,10 @@ func runRouteCleanup() {
 		// Match orphan TUN routes
 		isTunDefault := dest == "0.0.0.0" && mask == "0.0.0.0" && gw == "10.255.0.1"
 		isTunSlash32 := mask == "255.255.255.255" && gw == "10.255.0.1"
-		// Match host-routes to known server IPs (operator's server + srv2)
-		isServerPin := mask == "255.255.255.255" && (
-			strings.HasPrefix(dest, "203.0.113.") ||
-				strings.HasPrefix(dest, "198.51.100.") ||
-				strings.HasPrefix(dest, "192.0.2."))
+		// Match host-routes to the operator's own server prefixes, supplied via
+		// TAMIZDAT_SERVER_PREFIXES (comma-separated). Nothing deployment-specific
+		// is compiled into this source.
+		isServerPin := mask == "255.255.255.255" && hasAnyPrefix(dest, serverPrefixes)
 		if !isTunDefault && !isTunSlash32 && !isServerPin {
 			continue
 		}
@@ -985,6 +985,35 @@ func runRouteCleanup() {
 		removed++
 	}
 	appendLog(fmt.Sprintf("[gui] cleanup: removed %d Tamizdat routes", removed))
+}
+
+// serverPrefixesFromEnv returns the operator-configured server IP prefixes that
+// route cleanup may sweep, read from TAMIZDAT_SERVER_PREFIXES (comma-separated,
+// e.g. "203.0.113.,198.51.100."). Empty means only orphan TUN routes are
+// removed and host-routes are left alone. Nothing deployment-specific is
+// compiled into this source.
+func serverPrefixesFromEnv() []string {
+	v := strings.TrimSpace(os.Getenv("TAMIZDAT_SERVER_PREFIXES"))
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// hasAnyPrefix reports whether s starts with any of the given prefixes.
+func hasAnyPrefix(s string, prefixes []string) bool {
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func readSelectedVariant() string {

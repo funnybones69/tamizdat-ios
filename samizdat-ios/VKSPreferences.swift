@@ -41,16 +41,17 @@ enum VKSPreferences {
         UserDefaults(suiteName: appGroupID)
     }
 
-    // -- TEST-BUILD DEFAULTS (2026-09-20) --------------------------------
-    // Baked-in values so the on-device VKS test needs zero manual input:
-    // the card shows them pre-filled and the ladder starts on connect.
-    // Remove once server-side provisioning of rooms/key lands.
-    static let testDefaultWbstreamRoom = "stab_gw"
-    static let testDefaultKeyHex = "REDACTED-VKS-KEY"
-    static let testDefaultShortIDHex = "REDACTED-SHORTID"
-    // On-demand wake beacon: Yandex DNS (whitelisted) → wake.example.com NS (ru2).
-    static let testDefaultWakeDNS = "77.88.8.8:53"
-    static let testDefaultWakeZone = "wake.example.com"
+    // -- TEST-BUILD DEFAULTS ---------------------------------------------
+    // Nothing deployment-specific is baked into this repository: the VKS wire
+    // key and the master shortid are per-deployment secrets, and the room and
+    // wake zone identify the operator's own infrastructure. Fill them in from
+    // the VKS card (they live in the App Group defaults) or pass them to the
+    // e2e tools on the command line.
+    static let testDefaultWbstreamRoom = ""
+    static let testDefaultKeyHex = ""
+    static let testDefaultShortIDHex = ""
+    static let testDefaultWakeDNS = ""
+    static let testDefaultWakeZone = ""
 
     static var enabled: Bool {
         get {
