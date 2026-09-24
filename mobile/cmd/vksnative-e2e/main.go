@@ -43,6 +43,8 @@ func main() {
 		timeout  = flag.Duration("timeout", 25*time.Second, "per-probe timeout")
 		logPath  = flag.String("log", "", "optional file to mirror the stub's in-memory log to")
 		logTail  = flag.Int("log-tail", 40, "how many trailing stub log lines to print")
+		upstream = flag.String("upstream", "native", "which app path to exercise: native (samizdat client over the room datachannel) or olc (the olc ladder behind its own loopback SOCKS listener)")
+		olcPort  = flag.Int("olc-listen", 0, "loopback SOCKS5 port for the olc ladder; default listen+1 (must not be 18443 or 9000)")
 	)
 	flag.Parse()
 	if *blob == "" || *keyHex == "" || *shortID == "" {
@@ -65,8 +67,23 @@ func main() {
 	}
 	defer socksstub.Stop()
 
-	status := socksstub.StartVKSNativeUpstream(*specs, *keyHex, *shortID, *wakeDNS, *wakeZone, *port)
-	fmt.Printf("mode=%s listener=%s upstream_start=%s\n", socksstub.CurrentUpstreamMode(), addr, status)
+	// Exercise the operator-facing path, not just the native one: 'olc' runs
+	// the olc ladder behind its own loopback SOCKS listener, which is exactly
+	// what dialWhitelistVKS falls back to when the native client is absent.
+	var status string
+	switch *upstream {
+	case "olc":
+		lp := *olcPort
+		if lp == 0 {
+			lp = *port + 1
+		}
+		status = socksstub.StartVKSUpstream(*specs, *keyHex, *shortID, *wakeDNS, *wakeZone, lp)
+		defer socksstub.StopVKSUpstream()
+		fmt.Printf("olc ladder listening on 127.0.0.1:%d\n", lp)
+	default:
+		status = socksstub.StartVKSNativeUpstream(*specs, *keyHex, *shortID, *wakeDNS, *wakeZone, *port)
+	}
+	fmt.Printf("mode=%s upstream=%s listener=%s upstream_start=%s\n", socksstub.CurrentUpstreamMode(), *upstream, addr, status)
 
 	ok, fail := 0, 0
 	for i := 0; i < *count; i++ {
