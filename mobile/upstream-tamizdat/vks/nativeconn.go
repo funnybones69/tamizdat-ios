@@ -386,6 +386,20 @@ func dcKey(cfg ClientConfig) string {
 	return cfg.Provider + "\x00" + cfg.RoomURL + "\x00" + cfg.KeyHex
 }
 
+// resolvedName honours the documented contract (vks.go: "Name is the display
+// name shown in the room. Empty = generated."). An empty name used to be
+// passed through verbatim: jazz and mts tolerate it, but WB Stream's guest
+// register rejects it with HTTP 400 ("invalid GuestRegisterRequest.DisplayName:
+// value length must be at least 1 runes"), which killed the entire wbstream
+// leg of the ladder. Name is not part of dcKey, so resolving it here cannot
+// split a session.
+func (c Config) resolvedName() string {
+	if c.Name == "" {
+		return DisplayName()
+	}
+	return c.Name
+}
+
 // dcJoinLock returns the per-key join lock, creating it on first use.
 func dcJoinLock(key string) *sync.Mutex {
 	dcCacheMu.Lock()
@@ -521,7 +535,7 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		RoomURL:       cfg.RoomURL,
 		ProviderToken: cfg.ProviderToken,
 		ChannelID:     cfg.ChannelID,
-		Name:          cfg.Name,
+		Name:          cfg.resolvedName(),
 		DNSServer:     cfg.DNSServer,
 		OnData:        s.onData,
 		OnPeerData:    s.onPeerData,
@@ -657,7 +671,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		RoomURL:       cfg.RoomURL,
 		ProviderToken: cfg.ProviderToken,
 		ChannelID:     cfg.ChannelID,
-		Name:          cfg.Name,
+		Name:          cfg.resolvedName(),
 		DNSServer:     cfg.DNSServer,
 		OnData: func(data []byte) {
 			// Discovery probe: "TMZD_HELLO" + 4-byte session tag.
