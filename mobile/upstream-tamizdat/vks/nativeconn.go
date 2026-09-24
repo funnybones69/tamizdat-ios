@@ -274,6 +274,8 @@ type dcSession struct {
 
 	closeOnce sync.Once
 
+	everHealthy atomic.Bool
+
 	mu    sync.Mutex
 	dials map[string]*dcDial
 }
@@ -304,10 +306,11 @@ func (s *dcSession) lookup(sid string) *dcDial {
 // markDead invalidates the session and releases it. The engine websocket,
 // PeerConnections and ping goroutines all hang off tr, so a dead room that is
 // never closed leaks them (and leaves a ghost participant in the room).
-func (s *dcSession) markDead() {
-	s.dead.Store(true)
-	go func() { _ = s.Close() }()
-}
+func (s *dcSession) markDead() { s.dead.Store(true) }
+
+// healthy reports whether any dial on this session completed peer discovery,
+// i.e. the room was usable at least once.
+func (s *dcSession) healthy() bool { return s.everHealthy.Load() }
 
 // Close tears the room session down - every dial connector plus the underlying
 // transport. Idempotent.
@@ -533,9 +536,6 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		return nil, fmt.Errorf("native: connect: %w", err)
 	}
 	log.Printf("[native] join %s: room %s ready (session cached)", cfg.Provider, cfg.RoomURL)
-	// Engine health signal: if the room connection drops while no write is in
-	// flight, the engine reconnect callback still invalidates the session.
-	tr.SetReconnectCallback(s.markDead)
 	return s, nil
 }
 
@@ -596,14 +596,17 @@ func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 		select {
 		case <-ctx.Done():
 			_ = conn.Close()
-			// The dial gave up inside the discovery wait: the room may be dead,
-			// so it is not handed to the next dial.
-			evictDcSession(cfg, sess)
-			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-				dropWakeSpec(wakeKey)
+			// Only a session that has never served a dial is treated as dead:
+			// one dial giving up must not tear down a room other dials are using.
+			if !sess.healthy() {
+				evictDcSession(cfg, sess)
+				if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
+					dropWakeSpec(wakeKey)
+				}
 			}
 			return nil, ctx.Err()
 		case peer := <-serverPeer:
+			sess.everHealthy.Store(true)
 			if peer != "broadcast" {
 				conn.latchPeer(peer)
 			}
