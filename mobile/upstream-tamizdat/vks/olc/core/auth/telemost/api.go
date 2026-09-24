@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -28,7 +29,14 @@ type ConnectionInfo struct {
 	RoomID       string `json:"room_id"`
 	PeerID       string `json:"peer_id"`
 	Credentials  string `json:"credentials"`
-	ClientConfig struct {
+	// ConnectionType is "DIRECT" when the guest is admitted straight into the
+	// conference. Any other value (e.g. "WAITING_ROOM") means the API did NOT
+	// admit the guest, and ClientConfig.MediaServerURL will be empty — the
+	// engine then fails deep inside with a misleading "media server URL
+	// required", so surface the real reason here instead.
+	ConnectionType    string `json:"connection_type"`
+	WaitingRoomReason string `json:"waiting_room_connection_reason"`
+	ClientConfig      struct {
 		MediaServerURL string `json:"media_server_url"`
 	} `json:"client_configuration"`
 }
@@ -70,6 +78,19 @@ func (p Provider) connectionInfo(
 	info, err := auth.DoJSON[ConnectionInfo](client, req, ErrAPI)
 	if err != nil {
 		return ConnectionInfo{}, fmt.Errorf("telemost api: %w", err)
+	}
+	// A waiting-room answer is HTTP 200 with no media server URL. Left
+	// unchecked it surfaces from the engine as "goolom media server URL
+	// required", hiding the real cause (a conference that is full / over its
+	// limit). Report it as an API error so the ladder fails over with a
+	// legible reason instead of a cryptic one.
+	if info.ClientConfig.MediaServerURL == "" {
+		if info.ConnectionType != "" && !strings.EqualFold(info.ConnectionType, "direct") {
+			return ConnectionInfo{}, fmt.Errorf(
+				"%w: room %s not admitted (connection_type=%s reason=%s)",
+				ErrAPI, roomURL, info.ConnectionType, info.WaitingRoomReason)
+		}
+		return ConnectionInfo{}, fmt.Errorf("%w: room %s: empty media server URL", ErrAPI, roomURL)
 	}
 	return info, nil
 }

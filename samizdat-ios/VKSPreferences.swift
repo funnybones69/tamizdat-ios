@@ -202,17 +202,25 @@ enum VKSPreferences {
         get { defaults?.string(forKey: wakeZoneKey) ?? testDefaultWakeZone }
         set { defaults?.set(trim(newValue), forKey: wakeZoneKey) }
     }
-    /// Assembled `provider:room,` ladder spec in failover order. A provider
-    /// is included when its switch is on. Beacon-assignment: the client
-    /// stores only the provider — the server creates/assigns the room via
-    /// the TXT answer; an explicit room is an optional override/fallback
-    /// (used when the provider beacon fails). An empty room emits a "stub"
-    /// placeholder the server's assignment replaces.
+    /// Assembled `provider:room,` ladder spec. A provider is included when
+    /// its switch is on. Beacon-assignment: the client stores only the
+    /// provider — the server creates/assigns the room via the TXT answer; an
+    /// explicit room is an optional override/fallback (used when the provider
+    /// beacon fails). An empty room emits a "stub" placeholder the server's
+    /// assignment replaces.
+    ///
+    /// ORDER MATTERS: the native VKS transport dials a SINGLE provider — the
+    /// first entry (socksstub's StartVKSNativeUpstream takes cfgs[0]) — so the
+    /// first entry has to be one the server can provision on demand. jazz
+    /// creates its rooms ANONYMOUSLY through the server's room factory, while
+    /// telemost/wbstream/mts need an account-hosted room that can be absent or
+    /// over limit (a Telemost room, once OVERLIMIT, just fails every beacon).
+    /// jazz therefore leads; the rest stay as failover entries.
     static var ladderSpec: String {
         var parts: [String] = []
+        if jazzEnabled { parts.append("jazz:\(jazzRoom.isEmpty ? "stub" : jazzRoom)") }
         if telemostEnabled { parts.append("telemost:\(telemostRoom.isEmpty ? "stub" : telemostRoom)") }
         if wbstreamEnabled { parts.append("wbstream:\(wbstreamRoom.isEmpty ? "stub" : wbstreamRoom)") }
-        if jazzEnabled { parts.append("jazz:\(jazzRoom.isEmpty ? "stub" : jazzRoom)") }
         if mtsEnabled { parts.append("mts:\(mtsRoom.isEmpty ? "stub" : mtsRoom)") }
         return parts.joined(separator: ",")
     }

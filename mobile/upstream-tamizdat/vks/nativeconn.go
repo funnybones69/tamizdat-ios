@@ -28,6 +28,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/app/session"
@@ -38,7 +39,13 @@ import (
 const (
 	// dcMaxMessage caps one datachannel payload; TLS records up to 16KB are
 	// chunked across messages and reassemble in order on the receive side.
+	// dcMaxMessage caps ONE datachannel message, tag included. Every message is
+	// prefixed with the 4-byte session tag, and the SFU drops anything over
+	// 12 KiB, so a full-size payload chunk plus its tag would be 4 bytes too
+	// large and the stream would hang with no error and no write failure to
+	// trip the dead-session path.
 	dcMaxMessage = 12 * 1024
+	dcTagLen     = 4
 
 	// Discovery magics: client → room, server → client peer.
 	tmzdHello  = "TMZD_HELLO"
@@ -49,18 +56,19 @@ const (
 // Every message carries a 4-byte session tag so concurrent dial retries on the
 // shared broadcast lane never interleave (each session reads only its own tag).
 type dcConn struct {
-	tr   transport.Transport
-	mu   sync.Mutex
-	peer string // latched remote peerID; "" = broadcast (pre-discovery)
-	sid  []byte // 4-byte session tag (client-generated; echoed both directions)
-	rbuf []byte
-	notify chan struct{}
-	closed       bool
+	tr            transport.Transport
+	mu            sync.Mutex
+	peer          string // latched remote peerID; "" = broadcast (pre-discovery)
+	sid           []byte // 4-byte session tag (client-generated; echoed both directions)
+	rbuf          []byte
+	notify        chan struct{}
+	closed        bool
 	readDeadline  time.Time
 	writeDeadline time.Time
-	local  net.Addr
-	remote net.Addr
-	onClose func()
+	local         net.Addr
+	remote        net.Addr
+	onClose       func()
+	onWriteErr    func()
 }
 
 func newDcConn(tr transport.Transport, local, remote net.Addr) *dcConn {
@@ -137,8 +145,9 @@ func (c *dcConn) Write(p []byte) (int, error) {
 
 	// Chunk into datachannel messages, each prefixed with the session tag so a
 	// retried dial's bytes never interleave into this session's stream.
-	for off := 0; off < len(p); off += dcMaxMessage {
-		end := off + dcMaxMessage
+	chunk := dcMaxMessage - dcTagLen
+	for off := 0; off < len(p); off += chunk {
+		end := off + chunk
 		if end > len(p) {
 			end = len(p)
 		}
@@ -152,6 +161,9 @@ func (c *dcConn) Write(p []byte) (int, error) {
 			err = c.tr.Send(msg)
 		}
 		if err != nil {
+			if c.onWriteErr != nil {
+				c.onWriteErr()
+			}
 			return off, err
 		}
 	}
@@ -176,6 +188,12 @@ func (c *dcConn) Close() error {
 
 func (c *dcConn) LocalAddr() net.Addr  { return c.local }
 func (c *dcConn) RemoteAddr() net.Addr { return c.remote }
+
+// InProcessTransport reports that this conn is manufactured by the in-process
+// room datachannel rather than accepted from a socket, so server-side handling
+// keyed on a real TCP peer — the PROXY-protocol trust gate, TCP socket
+// options — must not apply. See tamizdat.isInProcessConn.
+func (c *dcConn) InProcessTransport() bool { return true }
 
 func (c *dcConn) SetDeadline(t time.Time) error {
 	_ = c.SetReadDeadline(t)
@@ -225,95 +243,374 @@ func sendTo(tr transport.Transport, peerID string, data []byte) error {
 // ---------------------------------------------------------------------------
 // Client side: dial the native tamizdat session over a room datachannel.
 // ---------------------------------------------------------------------------
+// Shared room sessions
+//
+// A VKS room join is expensive (WS + ICE + datachannel open; measured ~3 s on
+// jazz) and the SFU session must NOT be tied to a single dial's context: the
+// client transport pool discards a dial as soon as it returns, so a per-dial
+// session would die with it and the pool would re-join on every attempt - an
+// unbounded join/re-dial loop in which no traffic ever flows. The room session
+// is therefore hoisted into a cache keyed by (provider, room, key) with a
+// lifecycle independent of any single dial; each dial opens only a fresh
+// logical stream (its own 4-byte tag) over that shared session.
+// ---------------------------------------------------------------------------
 
-// NativeDial joins the room, discovers the server peer (TMZD_HELLO →
-// TMZD_SERVER), and returns a net.Conn ready for the native TLS+masq
-// handshake. Used as Client.config.Dialer. When the wake beacon is
-// configured it first asks the on-demand server for a room (the server
-// creates/assigns one and answers in-band) and dials THAT room.
-func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
-	// On-demand: beacon the provider, dial the server-assigned room.
-	if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-		if spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex); err == nil {
-			if p, r, ok := splitProviderRoom(spec); ok {
-				cfg.Provider, cfg.RoomURL = p, r
-			}
+// dcJoinTimeout bounds a single room join, so a hung join cannot block later
+// dials on the same key forever.
+const dcJoinTimeout = 45 * time.Second
+
+// dcDial is one logical stream (one dial) on a shared room session: its tag,
+// its conn, and the callback that reports discovery for that dial.
+type dcDial struct {
+	sid    string
+	conn   *dcConn
+	notify func(peerID string)
+}
+
+// dcSession is a joined VKS room shared by every dial on the same key.
+type dcSession struct {
+	tr   transport.Transport
+	dead atomic.Bool
+
+	closeOnce sync.Once
+
+	mu    sync.Mutex
+	dials map[string]*dcDial
+}
+
+func newDcSession(tr transport.Transport) *dcSession {
+	return &dcSession{tr: tr, dials: map[string]*dcDial{}}
+}
+
+func (s *dcSession) add(d *dcDial) {
+	s.mu.Lock()
+	s.dials[d.sid] = d
+	s.mu.Unlock()
+}
+
+func (s *dcSession) remove(sid string) {
+	s.mu.Lock()
+	delete(s.dials, sid)
+	s.mu.Unlock()
+}
+
+func (s *dcSession) lookup(sid string) *dcDial {
+	s.mu.Lock()
+	d := s.dials[sid]
+	s.mu.Unlock()
+	return d
+}
+
+// markDead invalidates the session and releases it. The engine websocket,
+// PeerConnections and ping goroutines all hang off tr, so a dead room that is
+// never closed leaks them (and leaves a ghost participant in the room).
+func (s *dcSession) markDead() {
+	s.dead.Store(true)
+	go func() { _ = s.Close() }()
+}
+
+// Close tears the room session down - every dial connector plus the underlying
+// transport. Idempotent.
+func (s *dcSession) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		s.dead.Store(true)
+		s.mu.Lock()
+		dials := make([]*dcDial, 0, len(s.dials))
+		for _, d := range s.dials {
+			dials = append(dials, d)
 		}
-	}
-	conn := newDcConn(nil, dcAddr("client"), dcAddr("server"))
-	// A random 4-byte session tag isolates this dial's byte stream from any
-	// retried dial on the shared broadcast lane (each session reads only its
-	// own tag; the server echoes it back so both directions are tagged alike).
-	sid := make([]byte, 4)
-	if _, err := rand.Read(sid); err != nil {
-		return nil, fmt.Errorf("native dial: session id: %w", err)
-	}
-	conn.sid = sid
-	serverPeer := make(chan string, 1)
-	session.RegisterDefaults() // registers the provider auth flows (jazz/mts/wb/telemost)
+		s.dials = map[string]*dcDial{}
+		tr := s.tr
+		s.mu.Unlock()
+		for _, d := range dials {
+			_ = d.conn.Close()
+		}
+		if tr != nil {
+			err = tr.Close()
+		}
+	})
+	return err
+}
 
-	tr, err := datachannel.New(ctx, transport.Config{
+func tagOf(data []byte) string {
+	if len(data) < 4 {
+		return ""
+	}
+	return string(data[:4])
+}
+
+// onData routes one broadcast-lane frame to the dial it belongs to: the
+// discovery answer by its embedded tag, tagged payload bytes to its conn.
+func (s *dcSession) onData(data []byte) {
+	if len(data) >= 15 && string(data[:11]) == tmzdServer {
+		if d := s.lookup(string(data[11:15])); d != nil {
+			d.notify("broadcast")
+		}
+		return
+	}
+	if len(data) >= 14 && string(data[:10]) == tmzdHello {
+		return // our own hello, echoed back by the SFU
+	}
+	if d := s.lookup(tagOf(data)); d != nil {
+		d.conn.feed(data)
+	}
+}
+
+// onPeerData is onData for the peer-addressed lane.
+func (s *dcSession) onPeerData(peerID string, data []byte) {
+	if len(data) >= 15 && string(data[:11]) == tmzdServer {
+		if d := s.lookup(string(data[11:15])); d != nil {
+			d.notify(peerID)
+		}
+		return
+	}
+	if len(data) >= 14 && string(data[:10]) == tmzdHello {
+		return
+	}
+	if d := s.lookup(tagOf(data)); d != nil {
+		d.conn.feed(data)
+	}
+}
+
+var (
+	dcCacheMu sync.Mutex
+	dcCache   = map[string]*dcSession{}  // key -> joined room session
+	dcJoinMu  = map[string]*sync.Mutex{} // key -> join lock (single-flight)
+)
+
+func dcKey(cfg ClientConfig) string {
+	return cfg.Provider + "\x00" + cfg.RoomURL + "\x00" + cfg.KeyHex
+}
+
+// dcJoinLock returns the per-key join lock, creating it on first use.
+func dcJoinLock(key string) *sync.Mutex {
+	dcCacheMu.Lock()
+	defer dcCacheMu.Unlock()
+	m := dcJoinMu[key]
+	if m == nil {
+		m = &sync.Mutex{}
+		dcJoinMu[key] = m
+	}
+	return m
+}
+
+func dcCached(key string) *dcSession {
+	dcCacheMu.Lock()
+	s := dcCache[key]
+	if s != nil && s.dead.Load() {
+		delete(dcCache, key)
+		dcCacheMu.Unlock()
+		_ = s.Close()
+		return nil
+	}
+	dcCacheMu.Unlock()
+	return s
+}
+
+// evictDcSession drops sess if it is still the cached one and closes it, so a
+// room that failed its discovery wait is not handed to the next dial.
+func evictDcSession(cfg ClientConfig, sess *dcSession) {
+	key := dcKey(cfg)
+	dcCacheMu.Lock()
+	if dcCache[key] == sess {
+		delete(dcCache, key)
+	}
+	dcCacheMu.Unlock()
+	_ = sess.Close()
+}
+
+// ShutdownNativeSessions closes every cached room session. The iOS network
+// extension calls it when it stops the native upstream, so no SFU websocket,
+// PeerConnection or ping goroutine survives the tunnel.
+func ShutdownNativeSessions() {
+	dcCacheMu.Lock()
+	sessions := make([]*dcSession, 0, len(dcCache))
+	for k, s := range dcCache {
+		sessions = append(sessions, s)
+		delete(dcCache, k)
+	}
+	dcCacheMu.Unlock()
+	for _, s := range sessions {
+		_ = s.Close()
+	}
+}
+
+func dcStore(key string, s *dcSession) {
+	dcCacheMu.Lock()
+	dcCache[key] = s
+	dcCacheMu.Unlock()
+}
+
+var (
+	specCacheMu sync.Mutex
+	specCache   = map[string]string{} // provider|keyHex -> beacon-assigned spec
+)
+
+// wakeSpecKey identifies an on-demand assignment: the beacon is per provider
+// and the assignment is authenticated by the shared key.
+func wakeSpecKey(cfg ClientConfig) string {
+	return cfg.Provider + "\x00" + cfg.KeyHex
+}
+
+// dropWakeSpec forgets the cached assignment so the next dial beacons once
+// more. Called only on a hard room failure, never per dial: the on-demand
+// server mints a FRESH room for every beacon, so re-beaconing per dial is a
+// room storm (and an idle-reaper backlog) on a single-CPU VPS.
+func dropWakeSpec(key string) {
+	specCacheMu.Lock()
+	delete(specCache, key)
+	specCacheMu.Unlock()
+}
+
+// resolveWakeSpec points cfg at the beacon-assigned room, reusing the cached
+// assignment when there is one. On beacon failure it leaves the statically
+// configured room in place.
+func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) {
+	specCacheMu.Lock()
+	spec := specCache[key]
+	specCacheMu.Unlock()
+	if spec == "" {
+		s, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
+		if err != nil {
+			return
+		}
+		spec = s
+		specCacheMu.Lock()
+		specCache[key] = spec
+		specCacheMu.Unlock()
+	}
+	if p, r, ok := splitProviderRoom(spec); ok {
+		cfg.Provider, cfg.RoomURL = p, r
+	}
+}
+
+// acquireDcSession returns the cached room session for cfg, joining at most
+// once per key at a time - a burst of SOCKS dials must not start N joins.
+func acquireDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
+	key := dcKey(cfg)
+	lk := dcJoinLock(key)
+	lk.Lock()
+	defer lk.Unlock()
+	if s := dcCached(key); s != nil {
+		return s, nil
+	}
+	s, err := joinDcSession(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	dcStore(key, s)
+	return s, nil
+}
+
+// joinDcSession performs the one expensive room join for a key. The session
+// runs on a context detached from the dial (context.WithoutCancel) so the SFU
+// session survives the dial that created it; dcJoinTimeout keeps a hung join
+// from blocking later dials on that key forever.
+func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
+	session.RegisterDefaults() // registers the provider auth flows (jazz/mts/wb/telemost)
+	sessCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dcJoinTimeout)
+	defer cancel()
+
+	s := newDcSession(nil)
+	tr, err := datachannel.New(sessCtx, transport.Config{
 		Provider:      cfg.Provider,
 		RoomURL:       cfg.RoomURL,
 		ProviderToken: cfg.ProviderToken,
 		ChannelID:     cfg.ChannelID,
 		Name:          cfg.Name,
 		DNSServer:     cfg.DNSServer,
-		// Without the olc epoch there is no peer routing — both directions
-		// use the broadcast lane (the beacon-assignment model is 1 server +
-		// 1 client per room, so broadcast IS point-to-point).
-		// Discovery + data share the broadcast lane; the 4-byte session tag
-		// isolates this dial's stream from any retried dial's stale bytes.
-		OnData: func(data []byte) {
-			if len(data) >= 15 && string(data[:11]) == tmzdServer && string(data[11:15]) == string(sid) {
-				select {
-				case serverPeer <- "broadcast":
-				default:
-				}
-				return
-			}
-			conn.feed(data)
-		},
-		OnPeerData: func(peerID string, data []byte) {
-			if len(data) >= 15 && string(data[:11]) == tmzdServer && string(data[11:15]) == string(sid) {
-				conn.latchPeer(peerID)
-				select {
-				case serverPeer <- peerID:
-				default:
-				}
-				return
-			}
-			conn.feed(data)
-		},
+		OnData:        s.onData,
+		OnPeerData:    s.onPeerData,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("native dial: open datachannel: %w", err)
+		return nil, fmt.Errorf("native: open datachannel: %w", err)
 	}
-	conn.tr = tr
-	log.Printf("[native] dial %s: connecting room %s", cfg.Provider, cfg.RoomURL)
-	if err := tr.Connect(ctx); err != nil {
-		return nil, fmt.Errorf("native dial: connect: %w", err)
+	s.tr = tr
+	log.Printf("[native] join %s: connecting room %s", cfg.Provider, cfg.RoomURL)
+	if err := tr.Connect(sessCtx); err != nil {
+		_ = tr.Close()
+		return nil, fmt.Errorf("native: connect: %w", err)
 	}
-	log.Printf("[native] dial %s: room connected, broadcasting discovery", cfg.Provider)
-	// NOTE: no olc epoch WaitForPeer here — the native path discovers the
-	// server peer via the TMZD_HELLO/TMZD_SERVER exchange below, not the olc
-	// epoch handshake (which this transport no longer runs).
+	log.Printf("[native] join %s: room %s ready (session cached)", cfg.Provider, cfg.RoomURL)
+	// Engine health signal: if the room connection drops while no write is in
+	// flight, the engine reconnect callback still invalidates the session.
+	tr.SetReconnectCallback(s.markDead)
+	return s, nil
+}
+
+// NativeDial returns a net.Conn ready for the native TLS+masq handshake. It
+// reuses the shared room session for this (provider, room, key) - joining it
+// once on first use - and discovers the server peer (TMZD_HELLO -> TMZD_SERVER)
+// with a fresh 4-byte session tag. Used as Client.config.Dialer. When the wake
+// beacon is configured it first asks the on-demand server for a room (the
+// server creates/assigns one and answers in-band) and dials THAT room.
+func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
+	// On-demand: point at the beacon-assigned room, reusing the cached
+	// assignment so the server mints one room per (provider, key) rather than
+	// one per dial.
+	wakeKey := wakeSpecKey(cfg)
+	if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
+		resolveWakeSpec(ctx, &cfg, wakeKey)
+	}
+	sess, err := acquireDcSession(ctx, cfg)
+	if err != nil {
+		if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
+			dropWakeSpec(wakeKey) // hard failure: re-beacon once on the next dial
+		}
+		return nil, fmt.Errorf("native dial: %w", err)
+	}
+	log.Printf("[native] dial %s: room %s session reused", cfg.Provider, cfg.RoomURL)
+
+	// A random 4-byte session tag isolates this dial's byte stream from any
+	// other dial on the shared room session (each stream reads only its own
+	// tag; the server echoes it back so both directions are tagged alike).
+	sid := make([]byte, 4)
+	if _, err := rand.Read(sid); err != nil {
+		return nil, fmt.Errorf("native dial: session id: %w", err)
+	}
+	conn := newDcConn(sess.tr, dcAddr("client"), dcAddr("server"))
+	conn.sid = sid
+	conn.onWriteErr = sess.markDead
+	conn.onClose = func() { sess.remove(string(sid)) }
+
+	serverPeer := make(chan string, 1)
+	sess.add(&dcDial{
+		sid:  string(sid),
+		conn: conn,
+		notify: func(peerID string) {
+			select {
+			case serverPeer <- peerID:
+			default:
+			}
+		},
+	})
 
 	// Broadcast the discovery probe (magic + session tag) until the server
 	// answers (retry while ctx).
 	hello := append([]byte(tmzdHello), sid...)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
-	_ = tr.Send(hello)
+	_ = sendTo(sess.tr, "", hello)
 	for {
 		select {
 		case <-ctx.Done():
+			_ = conn.Close()
+			// The dial gave up inside the discovery wait: the room may be dead,
+			// so it is not handed to the next dial.
+			evictDcSession(cfg, sess)
+			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
+				dropWakeSpec(wakeKey)
+			}
 			return nil, ctx.Err()
 		case peer := <-serverPeer:
+			if peer != "broadcast" {
+				conn.latchPeer(peer)
+			}
 			log.Printf("[native] dial %s: server peer discovered: %s", cfg.Provider, peer)
 			return conn, nil
 		case <-ticker.C:
-			_ = tr.Send(hello)
+			_ = sendTo(sess.tr, "", hello)
 		}
 	}
 }
