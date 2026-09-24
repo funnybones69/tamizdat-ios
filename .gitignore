@@ -35,3 +35,6 @@ ipa/
 
 # CocoaPods
 Pods/
+
+# Go build output
+*.exe
