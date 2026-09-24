@@ -380,6 +380,13 @@ var (
 	dcCacheMu sync.Mutex
 	dcCache   = map[string]*dcSession{}  // key -> joined room session
 	dcJoinMu  = map[string]*sync.Mutex{} // key -> join lock (single-flight)
+	// dcEpoch invalidates joins that were already in flight when
+	// ShutdownNativeSessions ran. A join can take up to dcJoinTimeout; the
+	// shutdown empties dcCache meanwhile, so without this the finishing join
+	// would re-insert a LIVE session that nothing owns any more — the SFU
+	// websocket, PeerConnections and ping goroutine survive the teardown as a
+	// ghost participant in the room.
+	dcEpoch atomic.Uint64
 )
 
 func dcKey(cfg ClientConfig) string {
@@ -441,6 +448,9 @@ func evictDcSession(cfg ClientConfig, sess *dcSession) {
 // extension calls it when it stops the native upstream, so no SFU websocket,
 // PeerConnection or ping goroutine survives the tunnel.
 func ShutdownNativeSessions() {
+	// Bump first: a join that is in flight right now must see the new epoch
+	// when it finishes and discard its session instead of reviving the cache.
+	dcEpoch.Add(1)
 	dcCacheMu.Lock()
 	sessions := make([]*dcSession, 0, len(dcCache))
 	for k, s := range dcCache {
@@ -506,6 +516,7 @@ func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) {
 // once per key at a time - a burst of SOCKS dials must not start N joins.
 func acquireDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 	key := dcKey(cfg)
+	epoch := dcEpoch.Load()
 	lk := dcJoinLock(key)
 	lk.Lock()
 	defer lk.Unlock()
@@ -515,6 +526,13 @@ func acquireDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error)
 	s, err := joinDcSession(ctx, cfg)
 	if err != nil {
 		return nil, err
+	}
+	if dcEpoch.Load() != epoch {
+		// The native path was shut down (or re-armed) while this join was
+		// running: the session has no owner now, so close it and report the
+		// dial as failed instead of reviving it into a cache nobody consults.
+		_ = s.Close()
+		return nil, fmt.Errorf("native: session for %s discarded: the native path was shut down during the join", key)
 	}
 	dcStore(key, s)
 	return s, nil

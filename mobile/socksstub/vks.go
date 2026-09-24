@@ -250,7 +250,11 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	}
 	rt.mu.Lock()
 	old := rt.vksNativeClient
+	oldKey := rt.vksNativeKeyHex
+	oldSpecs := rt.vksNativeSpecs
 	rt.vksNativeClient = client
+	rt.vksNativeKeyHex = keyHex
+	rt.vksNativeSpecs = specs
 	// A fresh client invalidates the previous failure latch: keeping it would
 	// make dialWhitelistVKS refuse the new carrier for up to vksNativeFailLatch.
 	rt.vksNativeFailUntil.Store(0)
@@ -259,6 +263,14 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	rt.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
+	}
+	// Sessions from a previous arming with a different key or spec are
+	// unreachable for the new client (dcKey is provider|room|key), so they
+	// would linger as ghost participants. Release them. Re-arming with the
+	// SAME key and spec keeps the warm session, so a redundant re-arm does not
+	// force a fresh room join.
+	if oldKey != "" && (oldKey != keyHex || oldSpecs != specs) {
+		vks.ShutdownNativeSessions()
 	}
 	rt.appendLog(fmt.Sprintf("info: [vks-native] upstream up shortid=%s provider=%s (beacon must carry a VALID user shortid)", shortIDHex, cfgs[0].Provider))
 	return vksStatusJSON("started", "", "")

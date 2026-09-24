@@ -106,6 +106,14 @@ type runtimeState struct {
 	// StartVKSNativeUpstream; dialUpstream tries it before the olc VKS
 	// SOCKS5 listener when set.
 	vksNativeClient upstreamClient
+	// vksNativeKeyHex and vksNativeSpecs record what the installed native
+	// client was armed with. The room sessions live in the vks package's cache,
+	// keyed by provider|room|key, so re-arming with a different key or spec
+	// makes the previous sessions unreachable: they would keep their SFU
+	// websocket, PeerConnections and ping goroutine alive as ghost
+	// participants in the room.
+	vksNativeKeyHex string
+	vksNativeSpecs  string
 	// vksNativeFailUntil (unix nanos) latches the native VKS path off for a
 	// short window after a dial failure, so a dead room does not make every
 	// flow pay the ~12s beacon timeout before falling back to the chain
