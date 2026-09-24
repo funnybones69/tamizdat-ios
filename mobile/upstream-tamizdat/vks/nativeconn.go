@@ -602,9 +602,15 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 // NativeDialLadder dials the first spec in the ladder that comes up. The
 // fallback exists for a primary that is not there: a provider that refuses
 // fast (404 room, auth rejection, dead link) must not hold the whole dial, so
-// the next spec is tried immediately. A primary that is merely slow still
-// spends the caller's budget on its own - that is the outer olc ladder's
-// business, not this function's.
+// the next spec is tried immediately.
+//
+// A primary that is merely SLOW is not covered here, and the bound is not the
+// caller's per-flow budget: each leg's room join runs on a detached context
+// (context.WithoutCancel plus dcJoinTimeout = 45s), and the Dialer is invoked
+// synchronously, so a hung leg can hold the flow past the caller's own
+// deadline before the ctx.Err() break below is reached. That case belongs to
+// the outer olc ladder - and has no equivalent on the UDP path, which refuses
+// outright rather than falling back.
 func NativeDialLadder(ctx context.Context, cfgs []ClientConfig) (net.Conn, error) {
 	var lastErr error
 	for i := range cfgs {
