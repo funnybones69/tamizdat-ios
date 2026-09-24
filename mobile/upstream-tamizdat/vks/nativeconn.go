@@ -599,6 +599,31 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 	return s, nil
 }
 
+// NativeDialLadder dials the first spec in the ladder that comes up. The
+// fallback exists for a primary that is not there: a provider that refuses
+// fast (404 room, auth rejection, dead link) must not hold the whole dial, so
+// the next spec is tried immediately. A primary that is merely slow still
+// spends the caller's budget on its own - that is the outer olc ladder's
+// business, not this function's.
+func NativeDialLadder(ctx context.Context, cfgs []ClientConfig) (net.Conn, error) {
+	var lastErr error
+	for i := range cfgs {
+		conn, err := NativeDial(ctx, cfgs[i])
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+		log.Printf("[native] ladder: %s/%s failed: %v - trying the next spec", cfgs[i].Provider, cfgs[i].RoomURL, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("native ladder: no spec to dial")
+	}
+	return nil, lastErr
+}
+
 // NativeDial returns a net.Conn ready for the native TLS+masq handshake. It
 // reuses the shared room session for this (provider, room, key) - joining it
 // once on first use - and discovers the server peer (TMZD_HELLO -> TMZD_SERVER)

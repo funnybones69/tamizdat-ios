@@ -226,8 +226,15 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	if err != nil || len(cfgs) == 0 {
 		return vksStatusJSON("error", "", "need a room spec")
 	}
-	vksCfg := vks.ClientConfig{Config: cfgs[0], ShortIDHex: shortIDHex, WakeDNSServer: wakeDNS, WakeZone: wakeZone}
-	vksCfg.KeyHex = keyHex
+	// Native ladder: every spec is a candidate, tried in order. A primary that
+	// refuses fast must not hold the dial (see vks.NativeDialLadder); the outer
+	// olc ladder stays as the fallback for a primary that is merely slow.
+	nativeLadder := make([]vks.ClientConfig, 0, len(cfgs))
+	for i := range cfgs {
+		c := vks.ClientConfig{Config: cfgs[i], ShortIDHex: shortIDHex, WakeDNSServer: wakeDNS, WakeZone: wakeZone}
+		c.KeyHex = keyHex
+		nativeLadder = append(nativeLadder, c)
+	}
 	sidBytes, err := hex.DecodeString(shortIDHex)
 	if err != nil || len(sidBytes) != 8 {
 		return vksStatusJSON("error", "", "shortid: 16 hex required")
@@ -242,7 +249,7 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 		MinTransports: 1,
 		MaxTransports: 1, // single session over the shared broadcast lane
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return vks.NativeDial(ctx, vksCfg)
+			return vks.NativeDialLadder(ctx, nativeLadder)
 		},
 	})
 	if err != nil {
