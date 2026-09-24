@@ -100,11 +100,17 @@ func IsControlPlane(tr transport.Transport) bool {
 }
 
 // SmuxConfigFor returns the data-plane smux config appropriate for the
-// transport: relaxed keep-alive for ControlPlane providers, conservative
+// transport: relaxed keep-alive for ControlPlane providers and for
+// SFUSilent datachannel transports (their SFU does not echo frames back
+// to a lone peer, so a client-less session would otherwise die to the
+// strict keepalive every ~27s, verified live on MTS odin), conservative
 // otherwise.
 func SmuxConfigFor(tr transport.Transport) *smux.Config {
 	maxWirePayload := MaxPayload(tr)
 	if IsControlPlane(tr) {
+		return SmuxConfigLong(maxWirePayload)
+	}
+	if _, silent := tr.(transport.SFUSilent); silent {
 		return SmuxConfigLong(maxWirePayload)
 	}
 	return SmuxConfig(maxWirePayload)

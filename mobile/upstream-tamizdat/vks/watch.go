@@ -29,6 +29,14 @@ type WatchServer struct {
 	idle    time.Duration
 	keyHex  string
 	creator RoomCreator
+	// nativeServe, when set, serves a woken room via the NATIVE transport
+	// (TLS+masq over the datachannel, shortid-only — no olcRTC) instead of the
+	// olcRTC RunServer. Wired by the cmd when the native serve is enabled.
+	nativeServe func(ctx context.Context, cfg Config) error
+	// validateShortID, when set, gates the provider beacon: the beacon carries
+	// the client's shortid and the room is only created/assigned when the
+	// shortid is a valid user (closes the unauthenticated-amplification gap).
+	validateShortID func(shortIDHex string) bool
 
 	mu     sync.Mutex
 	rooms  map[string]Config            // roomKey -> room it may serve
@@ -61,6 +69,24 @@ func NewWatchServer(rooms []Config, hooks ServerHooks, idle time.Duration) *Watc
 func (w *WatchServer) SetCreator(creator RoomCreator) {
 	w.mu.Lock()
 	w.creator = creator
+	w.mu.Unlock()
+}
+
+// SetNativeServe makes the watch server serve woken rooms via the NATIVE
+// transport (TLS+masq over the datachannel, shortid-only — no olcRTC).
+func (w *WatchServer) SetNativeServe(fn func(ctx context.Context, cfg Config) error) {
+	w.mu.Lock()
+	w.nativeServe = fn
+	w.mu.Unlock()
+}
+
+// SetShortIDValidator gates the provider beacon on a valid user shortid —
+// a beacon that does not prove a valid user gets no room (closes the
+// unauthenticated-amplification gap where anyone with the wire key could
+// make the server create rooms).
+func (w *WatchServer) SetShortIDValidator(fn func(shortIDHex string) bool) {
+	w.mu.Lock()
+	w.validateShortID = fn
 	w.mu.Unlock()
 }
 
@@ -141,6 +167,9 @@ func (w *WatchServer) Wake(roomKey string) {
 	w.mu.Unlock()
 
 	log.Printf("vks watch: waking room %s (%s) on demand", cfg.RoomURL, cfg.Provider)
+	w.mu.Lock()
+	nativeServe := w.nativeServe
+	w.mu.Unlock()
 	go func() {
 		defer func() {
 			w.mu.Lock()
@@ -152,6 +181,12 @@ func (w *WatchServer) Wake(roomKey string) {
 				cfg.CleanupHook() // MTS lifecycle: delete the meeting
 			}
 		}()
+		if nativeServe != nil {
+			if err := nativeServe(ctx, cfg); err != nil {
+				log.Printf("vks watch: native room %s error: %v", cfg.RoomURL, err)
+			}
+			return
+		}
 		if err := RunServer(ctx, cfg, w.hooks); err != nil {
 			log.Printf("vks watch: room %s error: %v", cfg.RoomURL, err)
 		}

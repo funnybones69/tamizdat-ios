@@ -98,6 +98,10 @@ func (p Provider) Issue(ctx context.Context, cfg auth.Config) (auth.Credentials,
 			"joinToken":      joinToken,
 			"publicKey":      conf.PublicKey,
 			"participation":  conf.ParticipationID.String(),
+			// Engine-side peer discovery (GET /eventsessions/{esid}/conferences)
+			// needs the session cookies; pass the header form so the engine
+			// can call the API directly.
+			"cookieHeader": cookieHeader(client, apiBase),
 		},
 	}, nil
 }
@@ -368,7 +372,6 @@ func restoreCookies(j http.CookieJar, saved []savedCookie) {
 	}
 	j.SetCookies(u, cookies)
 }
-
 func dumpCookies(j http.CookieJar) []savedCookie {
 	if j == nil {
 		return nil
@@ -379,6 +382,28 @@ func dumpCookies(j http.CookieJar) []savedCookie {
 		out = append(out, savedCookie{Name: c.Name, Value: c.Value, Domain: c.Domain, Path: c.Path, Expiry: c.Expires})
 	}
 	return out
+}
+
+// cookieHeader renders the session cookies as a single Cookie header value
+// for the given base URL, so the engine can call the API (peer discovery)
+// with the same authenticated session.
+func cookieHeader(c *http.Client, base string) string {
+	if c == nil || c.Jar == nil {
+		return ""
+	}
+	u, err := url.Parse(base)
+	if err != nil {
+		return ""
+	}
+	cookies := c.Jar.Cookies(u)
+	if len(cookies) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(cookies))
+	for _, ck := range cookies {
+		parts = append(parts, ck.Name+"="+ck.Value)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func jar() *cookiejar.Jar {

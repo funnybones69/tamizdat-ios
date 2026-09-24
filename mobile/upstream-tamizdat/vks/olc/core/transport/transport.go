@@ -83,8 +83,18 @@ type Transport interface {
 	Reconnect(reason string)
 }
 
+// SFUSilent is implemented by datachannel transports whose SFU does not
+// echo relay frames back to a lone sender (odin MTS Link): smux keepalive
+// pings have no one to answer while the peer has not joined yet, so these
+// transports need the relaxed keepalive window instead of the strict
+// 10s/30s default (which killed the session every ~27s, verified live).
+type SFUSilent interface {
+	// RelaxedKeepAlive reports that the strict smux keepalive must be
+	// relaxed (the SFU will not loop frames back to a lone peer).
+	RelaxedKeepAlive() bool
+}
+
 // ControlPlane is implemented by transports that can route control-plane
-// traffic independently of the bulk data plane. When a transport implements
 // this interface, callers should use ControlSend/ControlOnData for the first
 // smux stream (the olcrtc control/handshake stream) so that it does not
 // compete with bulk data in the same KCP send buffer.

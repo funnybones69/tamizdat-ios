@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 
@@ -178,6 +179,7 @@ func (s *Session) Send(data []byte) error {
 
 // Close closes the engine session.
 func (s *Session) Close() error {
+	log.Printf("[engineconn] Close() called - pipe closing")
 	_ = s.pw.CloseWithError(net.ErrClosed)
 	if err := s.inner.Close(); err != nil {
 		return fmt.Errorf("close: %w", err)
@@ -204,6 +206,7 @@ func (s *Session) SetEndedCallback(callback func(reason string)) {
 }
 
 func (s *Session) handleEnded(reason string) {
+	log.Printf("[engineconn] handleEnded reason=%q - pipe closing", reason)
 	_ = s.pw.CloseWithError(ErrSessionEnded)
 	s.endedMu.RLock()
 	callback := s.onEnded

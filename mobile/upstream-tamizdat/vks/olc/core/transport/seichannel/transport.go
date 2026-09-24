@@ -258,6 +258,13 @@ func (p *streamTransport) Features() transport.Features {
 	})
 }
 
+// RelaxedKeepAlive marks the seichannel as SFUSilent: datachannel-based SFUs
+// (odin MTS Link) do not loop frames back to a lone peer, so the strict smux
+// keepalive (10s/30s) kills a client-less session every ~27s. The relaxed
+// window (SmuxConfigLong, 120s) keeps the on-demand server alive while it
+// waits for the client to join.
+func (p *streamTransport) RelaxedKeepAlive() bool { return true }
+
 func (p *streamTransport) writerLoop() {
 	defer close(p.writerDone)
 

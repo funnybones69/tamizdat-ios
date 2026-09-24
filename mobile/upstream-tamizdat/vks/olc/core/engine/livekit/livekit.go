@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -177,12 +178,26 @@ type connectRoomFunc func(
 	url, token string, callback *lksdk.RoomCallback, opts ...lksdk.ConnectOption,
 ) (roomHandle, error)
 
+// lkLogger returns the LiveKit SDK logger: discard by default, a debug-level
+// zap logger (stderr) when VKS_LK_DEBUG is set - dumps ICE servers incl. TURN creds.
+func lkLogger() protoLogger.Logger {
+	if os.Getenv("VKS_LK_DEBUG") == "" {
+		return protoLogger.GetDiscardLogger()
+	}
+	l, err := protoLogger.NewZapLogger(&protoLogger.Config{Level: "debug"})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[lk] debug logger init failed: %v\n", err)
+		return protoLogger.GetDiscardLogger()
+	}
+	return l
+}
+
 func connectSDKRoom(
 	url, token string, callback *lksdk.RoomCallback, opts ...lksdk.ConnectOption,
 ) (roomHandle, error) {
 	opts = append([]lksdk.ConnectOption{
 		lksdk.WithAutoSubscribe(true),
-		lksdk.WithLogger(protoLogger.GetDiscardLogger()),
+		lksdk.WithLogger(lkLogger()),
 	}, opts...)
 	room, err := lksdk.ConnectToRoomWithToken(
 		url,

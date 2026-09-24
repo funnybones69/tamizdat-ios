@@ -106,17 +106,34 @@ func handleBeaconQuery(pc net.PacketConn, src net.Addr, msg []byte, zone string,
 				if !woken && watch != nil {
 					provider := watch.matchProviderKey(selector)
 					if provider != "" {
-						log.Printf("vks beacon dns: provider beacon name=%q provider=%q from %s", name, provider, src)
-						ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-						cfg, err := watch.AssignRoom(ctx, provider)
-						cancel()
-						if err != nil {
-							log.Printf("vks beacon dns: assign %s failed: %v", provider, err)
+						// Auth gap fix: the beacon carries the client's shortid
+						// as a label (<providerKey>.<shortid>.<nonce>); only a
+						// VALID user gets a room created/assigned. Without it a
+						// stranger with the wire key could spam room creation.
+						beaconShortID := ""
+						if rest := left[len(selector)+1:]; strings.HasPrefix(left, selector+".") && len(rest) > 0 {
+							if i := strings.Index(rest, "."); i > 0 {
+								beaconShortID = rest[:i]
+							}
+						}
+						watch.mu.Lock()
+						validator := watch.validateShortID
+						watch.mu.Unlock()
+						if validator != nil && !validator(beaconShortID) {
+							log.Printf("vks beacon dns: provider beacon %q REJECTED (bad shortid %q) from %s", provider, beaconShortID, src)
 						} else {
-							spec := cfg.Provider + ":" + cfg.RoomURL
-							log.Printf("vks beacon dns: assigned %s -> TXT %q", provider, spec)
-							respondTXT(pc, src, msg, qend, spec)
-							return
+							log.Printf("vks beacon dns: provider beacon name=%q provider=%q shortid=%q from %s", name, provider, beaconShortID, src)
+							ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+							cfg, err := watch.AssignRoom(ctx, provider)
+							cancel()
+							if err != nil {
+								log.Printf("vks beacon dns: assign %s failed: %v", provider, err)
+							} else {
+								spec := cfg.Provider + ":" + cfg.RoomURL
+								log.Printf("vks beacon dns: assigned %s -> TXT %q", provider, spec)
+								respondTXT(pc, src, msg, qend, spec)
+								return
+							}
 						}
 					}
 				}
@@ -246,6 +263,8 @@ func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec stri
 // DNS TXT answer. This is the beacon-assignment flow: the client beacons a
 // provider key (HMAC of the shared key), the server creates a fresh room
 // (WB/Jazz) or assigns an armed one (Telemost/MTS) and answers in-band.
+// shortIDHex is the client's tamizdat user identity — carried as a beacon
+// label so the server can gate room creation on a valid user (auth gap fix).
 func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, shortIDHex string) (string, error) {
 	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
 	providerKey := ProviderWakeKey(keyHex, provider)
@@ -253,10 +272,6 @@ func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, sh
 	if _, err := rand.Read(nonce); err != nil {
 		return "", fmt.Errorf("wake nonce: %w", err)
 	}
-	// The server shortid-proofs provider beacons: the query name carries the
-	// client's shortid as the second label
-	// (<providerKey>.<shortid>.<nonce>.<zone>), and the server assigns a room
-	// only when that shortid is a valid user. An empty label gets REJECTED.
 	sid := strings.ToLower(strings.TrimSpace(shortIDHex))
 	if sid == "" {
 		sid = "0"

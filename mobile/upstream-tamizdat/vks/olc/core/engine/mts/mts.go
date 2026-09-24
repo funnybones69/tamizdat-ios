@@ -207,7 +207,10 @@ func (s *Session) Connect(ctx context.Context) error {
 		log.Printf("[mts] sendLoop started")
 		close(dcReady)
 	})
-	s.dc.OnClose(func() { s.queueReconnect() })
+	s.dc.OnClose(func() {
+		log.Printf("[mts] dc OnClose FIRED - queuing reconnect")
+		s.queueReconnect()
+	})
 	s.dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		log.Printf("[mts] OnMessage: len=%d first 8=%x", len(m.Data), m.Data[:min(8, len(m.Data))])
 		s.deliver(m.Data)
@@ -266,6 +269,18 @@ func (s *Session) Connect(ctx context.Context) error {
 			log.Printf("[mts] publish update failed (continuing): %v", err)
 		}
 	}
+	// Automatic peer discovery: the odin SFU relays a peer's media only to
+	// subscribers, so without a player connection per foreign stream the
+	// tunnel data (SEI in H264 video) never crosses between the peers. Poll
+	// the conference list and subscribe to every NEW foreign publicKey — the
+	// on-demand server usually joins before its client, so the initial join
+	// often sees zero other streams and the client's stream must be picked
+	// up here afterwards.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.discoverAndSubscribe(ctx, base)
+	}()
 	// Subscriber path: odin forwards other participants' media only through
 	// per-stream player connections. Subscriptions run in the background so
 	// slow SFU negotiations never block Connect's deadline; each configured
@@ -400,6 +415,117 @@ func (s *Session) streamsToSubscribe() []string {
 		}
 	}
 	return out
+}
+
+// discoverAndSubscribe polls the conference roster and opens a player
+// connection for every NEW foreign public key. The odin SFU relays a
+// peer's media only to explicit subscribers, so this is what makes the
+// tunnel data (SEI in H264 video) actually cross between two engine peers.
+// The poll handles late joiners: the on-demand server usually enters the
+// room before its client, so the client's stream appears only later.
+func (s *Session) discoverAndSubscribe(ctx context.Context, base string) {
+	// Bind to the session lifetime, not the caller's Connect ctx: that ctx
+	// is typically cancelled right after Connect returns, which silently
+	// killed this loop before it ever ticked (verified live).
+	sctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-s.closeCh:
+			cancel()
+		case <-sctx.Done():
+		}
+	}()
+	own := s.cfg.Extra["publicKey"]
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	subscribed := map[string]bool{}
+	for {
+		select {
+		case <-s.closeCh:
+			return
+		case <-sctx.Done():
+			return
+		case <-ticker.C:
+		}
+		keys, err := s.listConferencePublicKeys()
+		if err != nil {
+			log.Printf("[mts] discovery: list conferences: %v", err)
+			continue
+		}
+		for _, key := range keys {
+			if key == "" || key == own || subscribed[key] {
+				continue
+			}
+			subscribed[key] = true
+			log.Printf("[mts] discovery: subscribing to foreign stream %s", key)
+			if err := s.subscribePlayer(sctx, base, s.roomID, key); err != nil {
+				log.Printf("[mts] discovery: player subscribe %s failed (will not retry): %v", key, err)
+			} else {
+				log.Printf("[mts] discovery: player subscribed to %s", key)
+			}
+		}
+	}
+}
+// session whose cookie header the auth provider passed via Extra.
+func (s *Session) listConferencePublicKeys() ([]string, error) {
+	esid := s.cfg.Extra["eventSessionID"]
+	if esid == "" {
+		return nil, errors.New("no eventSessionID")
+	}
+	cookieHdr := s.cfg.Extra["cookieHeader"]
+	if cookieHdr == "" {
+		return nil, errors.New("no cookieHeader (auth too old?)")
+	}
+	u := "https://my.mts-link.ru/api/eventsessions/" + url.PathEscape(esid) + "/conferences"
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Cookie", cookieHdr)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("conferences list: status %d", resp.StatusCode)
+	}
+	var raw struct {
+		Data []struct {
+			PublicKey string `json:"publicKey"`
+		} `json:"data"`
+		Embedded []struct {
+			PublicKey string `json:"publicKey"`
+		} `json:"_embedded"`
+	}
+	keys := make([]string, 0, 8)
+	// The API answers either {data:[...]} / {_embedded:[...]} or a BARE
+	// array (verified live); decode both without failing on either shape.
+	if err := json.Unmarshal(b, &raw); err == nil {
+		for _, c := range raw.Data {
+			keys = append(keys, c.PublicKey)
+		}
+		for _, c := range raw.Embedded {
+			keys = append(keys, c.PublicKey)
+		}
+	}
+	if len(keys) == 0 {
+		var arr []struct {
+			PublicKey string `json:"publicKey"`
+		}
+		if err := json.Unmarshal(b, &arr); err == nil {
+			for _, c := range arr {
+				keys = append(keys, c.PublicKey)
+			}
+		} else {
+			return nil, fmt.Errorf("conferences decode: %w", err)
+		}
+	}
+	return keys, nil
 }
 
 // subscribePlayer opens the odin per-stream player connection: a recvonly
