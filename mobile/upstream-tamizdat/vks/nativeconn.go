@@ -68,7 +68,7 @@ type dcConn struct {
 	local         net.Addr
 	remote        net.Addr
 	onClose       func()
-	onWriteErr    func()
+	onWriteErr    func(error)
 }
 
 func newDcConn(tr transport.Transport, local, remote net.Addr) *dcConn {
@@ -162,7 +162,7 @@ func (c *dcConn) Write(p []byte) (int, error) {
 		}
 		if err != nil {
 			if c.onWriteErr != nil {
-				c.onWriteErr()
+				c.onWriteErr(err)
 			}
 			return off, err
 		}
@@ -571,7 +571,13 @@ func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	}
 	conn := newDcConn(sess.tr, dcAddr("client"), dcAddr("server"))
 	conn.sid = sid
-	conn.onWriteErr = sess.markDead
+	conn.onWriteErr = func(err error) {
+		// Name the killer: this path used to drop the shared room session
+		// silently, so the re-join cadence had no attributable cause.
+		log.Printf("[native] dial %s: room %s write failed; marking room session dead: %v",
+			cfg.Provider, cfg.RoomURL, err)
+		sess.markDead()
+	}
 	conn.onClose = func() { sess.remove(string(sid)) }
 
 	serverPeer := make(chan string, 1)
