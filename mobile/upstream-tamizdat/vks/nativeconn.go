@@ -463,12 +463,6 @@ func ShutdownNativeSessions() {
 	}
 }
 
-func dcStore(key string, s *dcSession) {
-	dcCacheMu.Lock()
-	dcCache[key] = s
-	dcCacheMu.Unlock()
-}
-
 var (
 	specCacheMu sync.Mutex
 	specCache   = map[string]string{}      // provider|keyHex -> beacon-assigned spec
@@ -553,10 +547,22 @@ func acquireDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error)
 		// The native path was shut down (or re-armed) while this join was
 		// running: the session has no owner now, so close it and report the
 		// dial as failed instead of reviving it into a cache nobody consults.
+		// Name provider and room only - dcKey carries the shared room key.
 		_ = s.Close()
-		return nil, fmt.Errorf("native: session for %s discarded: the native path was shut down during the join", key)
+		return nil, fmt.Errorf("native: session for %s/%s discarded: the native path was shut down during the join", cfg.Provider, cfg.RoomURL)
 	}
-	dcStore(key, s)
+	// Recheck and store under dcCacheMu: ShutdownNativeSessions empties the
+	// cache under this same mutex, so a session stored after its bump is
+	// collected by that shutdown instead of landing in an emptied map (the
+	// recheck used to sit outside the lock, which left exactly that window).
+	dcCacheMu.Lock()
+	if dcEpoch.Load() != epoch {
+		dcCacheMu.Unlock()
+		_ = s.Close()
+		return nil, fmt.Errorf("native: session for %s/%s discarded: the native path was shut down during the join", cfg.Provider, cfg.RoomURL)
+	}
+	dcCache[key] = s
+	dcCacheMu.Unlock()
 	return s, nil
 }
 
