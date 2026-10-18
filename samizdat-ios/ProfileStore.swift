@@ -29,4 +29,21 @@ enum ProfileStore {
         let list = all().filter { $0 != url }
         defaults?.set(list, forKey: profilesKey)
     }
+
+    /// Replaces one saved profile in place, keeping its list position.
+    /// No-op if `original` is not stored or `replacement` is empty. A
+    /// pre-existing duplicate of `replacement` is dropped first so the list
+    /// never holds the same URL twice.
+    static func replace(_ original: String, with replacement: String) {
+        let value = replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value != original else { return }
+        var list = all()
+        guard list.contains(original) else { return }
+        if let duplicate = list.firstIndex(of: value) {
+            list.remove(at: duplicate)
+        }
+        guard let index = list.firstIndex(of: original) else { return }
+        list[index] = value
+        defaults?.set(list, forKey: profilesKey)
+    }
 }

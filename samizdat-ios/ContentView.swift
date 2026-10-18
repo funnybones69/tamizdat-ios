@@ -211,6 +211,12 @@ struct ContentView: View {
             // tunnel drops back to disconnected.
             updateWhitelistMonitorState()
         }
+        .onChange(of: currentMode) { _, _ in
+            // The mode picker lives in Settings, so this view never sees
+            // the tap directly. Without this, switching to Auto left the
+            // status line on «Мониторинг…» until the next VPN state flip.
+            updateWhitelistMonitorState()
+        }
         // Phase C iOS-notify (preserved from D20): server-pushed alert.
         .alert(
             serverNotif.latest?.title.isEmpty == false

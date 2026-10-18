@@ -1,4 +1,6 @@
 import SwiftUI
+import UIKit
+import CoreImage
 
 /// IPA-D22: Endpoints management screen. Replaces the legacy
 /// `ConfigPasteView` 2-TextEditor sheet.
@@ -33,6 +35,19 @@ struct EndpointsView: View {
     @State private var addingProfile: Bool = false
     @State private var editBufferNewProfile: String = ""
     @State private var deletingProfile: String? = nil
+
+    // Inline edit of an EXISTING saved profile: `editingProfile` holds the
+    // original URL, `editBufferProfile` the draft.
+    @State private var editingProfile: String? = nil
+    @State private var editBufferProfile: String = ""
+
+    /// Profile URL shown in the QR / share sheet.
+    @State private var sharingProfile: SharingProfile? = nil
+
+    private struct SharingProfile: Identifiable {
+        let url: String
+        var id: String { url }
+    }
 
     private enum ScanTarget: Identifiable {
         case newProfile
@@ -93,6 +108,10 @@ struct EndpointsView: View {
                 addProfile(from: code)
             }
             .environment(\.themeTokens, theme)
+        }
+        .sheet(item: $sharingProfile) { profile in
+            ProfileQRSheet(url: profile.url)
+                .environment(\.themeTokens, theme)
         }
     }
 
@@ -256,91 +275,168 @@ struct EndpointsView: View {
         }
     }
 
+    @ViewBuilder
     private func profileRow(_ url: String) -> some View {
         let isActive = url == primaryURL
-        return HStack(spacing: 8) {
-            Button {
-                guard !isActive else { return }
-                activateProfile(url)
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: isActive ? "checkmark.circle.fill" : "doc.text")
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(isActive ? theme.mint : theme.blue)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(endpointHost(url) ?? "tamizdat://")
-                            .font(.geist(.medium, size: 13))
-                            .foregroundStyle(theme.text)
-                        Text(url)
-                            .font(.geistMono(.regular, size: 10))
-                            .foregroundStyle(theme.textDim)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+        if editingProfile == url {
+            VStack(alignment: .leading, spacing: 8) {
+                TextEditor(text: $editBufferProfile)
+                    .font(.geistMono(.regular, size: 12))
+                    .foregroundStyle(theme.text)
+                    .scrollContentBackground(.hidden)
+                    .frame(minHeight: 88, maxHeight: 160)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(theme.chip)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+                HStack(spacing: 6) {
+                    ActionChip(systemName: "xmark",
+                               label: "Отмена",
+                               tint: theme.textDim) {
+                        editingProfile = nil
+                        editBufferProfile = ""
+                    }
+                    ActionChip(systemName: "checkmark",
+                               label: "Сохранить",
+                               tint: theme.mint,
+                               labelColor: theme.mint) {
+                        saveEditedProfile(original: url)
                     }
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            Spacer(minLength: 8)
-            if deletingProfile == url {
+            .padding(10)
+            .background(theme.chip)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        } else {
+            HStack(spacing: 8) {
                 Button {
-                    deletingProfile = nil
+                    guard !isActive else { return }
+                    activateProfile(url)
                 } label: {
-                    Text("Отмена")
-                        .font(.geist(.semibold, size: 12))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(theme.chip))
-                        .foregroundStyle(theme.text)
+                    HStack(spacing: 8) {
+                        Image(systemName: isActive ? "checkmark.circle.fill" : "doc.text")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(isActive ? theme.mint : theme.blue)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(endpointHost(url) ?? "tamizdat://")
+                                .font(.geist(.medium, size: 13))
+                                .foregroundStyle(theme.text)
+                            Text(url)
+                                .font(.geistMono(.regular, size: 10))
+                                .foregroundStyle(theme.textDim)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                Button {
-                    deleteProfile(url)
-                } label: {
-                    Text("Удалить")
-                        .font(.geist(.bold, size: 12))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(theme.red))
-                        .foregroundStyle(Color.white)
-                }
-                .buttonStyle(.plain)
-            } else {
-                if isActive {
-                    Text("Активен")
-                        .font(.geist(.bold, size: 12))
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(theme.mintDim))
-                        .foregroundStyle(theme.mint)
-                } else {
+                Spacer(minLength: 8)
+                if deletingProfile == url {
                     Button {
-                        activateProfile(url)
+                        deletingProfile = nil
                     } label: {
-                        Text("Выбрать")
+                        Text("Отмена")
                             .font(.geist(.semibold, size: 12))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(theme.chip))
+                            .foregroundStyle(theme.text)
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        deleteProfile(url)
+                    } label: {
+                        Text("Удалить")
+                            .font(.geist(.bold, size: 12))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(theme.red))
+                            .foregroundStyle(Color.white)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    if isActive {
+                        Text("Активен")
+                            .font(.geist(.bold, size: 12))
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
                             .background(Capsule().fill(theme.mintDim))
                             .foregroundStyle(theme.mint)
+                    } else {
+                        Button {
+                            activateProfile(url)
+                        } label: {
+                            Text("Выбрать")
+                                .font(.geist(.semibold, size: 12))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Capsule().fill(theme.mintDim))
+                                .foregroundStyle(theme.mint)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
+                    Menu {
+                        Button {
+                            beginEditing(url)
+                        } label: {
+                            Label("Изменить", systemImage: "pencil")
+                        }
+                        Button {
+                            sharingProfile = SharingProfile(url: url)
+                        } label: {
+                            Label("QR", systemImage: "qrcode")
+                        }
+                        Button(role: .destructive) {
+                            deletingProfile = url
+                        } label: {
+                            Label("Удалить", systemImage: "trash")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(theme.textDim)
+                            .frame(minWidth: 44, minHeight: 44)
+                            .contentShape(Rectangle())
+                    }
                 }
-                Button {
-                    deletingProfile = url
-                } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(theme.red)
-                        .padding(6)
-                        .background(Circle().fill(theme.redDim))
-                }
-                .buttonStyle(.plain)
+            }
+            .padding(10)
+            .background(theme.chip)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+    }
+
+    private func beginEditing(_ url: String) {
+        deletingProfile = nil
+        editBufferProfile = url
+        editingProfile = url
+    }
+
+    /// Validates and persists an inline edit of a saved profile. Keeps the
+    /// row's position; if this profile is the active one, re-applies it to
+    /// the running tunnel.
+    private func saveEditedProfile(original: String) {
+        let value = editBufferProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        if let err = SamizdatBridge.validate(value) {
+            pasteError = "Ошибка: \(err)"
+            return
+        }
+        pasteError = nil
+        if value != original {
+            ProfileStore.replace(original, with: value)
+            if primaryURL == original {
+                primaryURL = value
+                persistImmediately()
             }
         }
-        .padding(10)
-        .background(theme.chip)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        profiles = ProfileStore.all()
+        editingProfile = nil
+        editBufferProfile = ""
     }
 
     /// Called by SettingsView when it needs a hasConfig refresh after
@@ -361,6 +457,92 @@ private func endpointHost(_ s: String) -> String? {
     guard let u = URL(string: probe), let host = u.host else { return nil }
     if let port = u.port { return "\(host):\(port)" }
     return host
+}
+
+/// QR / share sheet for a saved profile link.
+///
+/// The QR carries the full tamizdat:// URL, secrets included — that is the
+/// point of the screen (hand the profile to another device). The link is
+/// never logged.
+private struct ProfileQRSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.themeTokens) private var theme
+
+    let url: String
+    @State private var qrImage: UIImage?
+
+    init(url: String) {
+        self.url = url
+        _qrImage = State(initialValue: QRCodeRenderer.image(for: url))
+    }
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                ThemeBackground(theme: theme)
+
+                ScrollView {
+                    VStack(spacing: 20) {
+                        if let qrImage {
+                            Image(uiImage: qrImage)
+                                .interpolation(.none)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(maxWidth: 280, maxHeight: 280)
+                                .padding(14)
+                                .background(Color.white)
+                                .clipShape(RoundedRectangle(cornerRadius: 16))
+                        }
+
+                        ShareLink(item: url) {
+                            HStack(spacing: 8) {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.system(size: 14, weight: .semibold))
+                                Text("Поделиться")
+                                    .font(.geist(.semibold, size: 15))
+                            }
+                            .frame(maxWidth: .infinity)
+                            .frame(minHeight: 46)
+                            .background(theme.mint)
+                            .foregroundStyle(theme.mintInk)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 16)
+                    .padding(.bottom, 24)
+                }
+            }
+            .preferredColorScheme(theme.isDark ? .dark : .light)
+            .navigationTitle("Поделиться")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Chip(label: "Готово") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+private enum QRCodeRenderer {
+    /// CoreImage QR code scaled with nearest-neighbour-friendly integer
+    /// scaling. The white padding around the image in `ProfileQRSheet`
+    /// supplies the quiet zone (CIQRCodeGenerator does not guarantee one).
+    static func image(for text: String, scale: CGFloat = 12) -> UIImage? {
+        guard !text.isEmpty,
+              let filter = CIFilter(name: "CIQRCodeGenerator") else { return nil }
+        filter.setValue(Data(text.utf8), forKey: "inputMessage")
+        filter.setValue("M", forKey: "inputCorrectionLevel")
+        guard let output = filter.outputImage else { return nil }
+        let scaled = output.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let context = CIContext(options: nil)
+        guard let cgImage = context.createCGImage(scaled, from: scaled.extent) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage)
+    }
 }
 
 private struct ActionChip: View {

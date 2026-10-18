@@ -8,9 +8,19 @@ import Network
 /// verdict; ambiguous/offline combinations are surfaced as Error detecting.
 ///
 /// Decision matrix:
-///   normal      → free internet      → activeEndpoint = primary after threshold
-///   allowlist   → whitelist active   → activeEndpoint = backup after threshold
+///   normal      → free internet      → activeEndpoint = primary
+///   allowlist   → whitelist active   → activeEndpoint = backup
 ///   error       → Error detecting    → keep current
+///
+/// Timing rules (identical to the extension's WhitelistDetector):
+///   1. Bootstrap (start / network path change): probe immediately; the
+///      first decisive verdict is applied at once. Inconclusive cycles are
+///      retried every `bootstrapRetryInterval` (3 s).
+///   2. Stable phase: the opposite endpoint is adopted only after the
+///      opposite verdict held continuously for `switchHoldSeconds` (60 s),
+///      re-probing every `switchProbeInterval` (10 s). Any agreeing or
+///      inconclusive cycle in between restarts the window.
+///   3. Steady state (nothing pending): one probe per `probeInterval`.
 @MainActor
 final class WhitelistMonitor: ObservableObject {
 
@@ -26,10 +36,13 @@ final class WhitelistMonitor: ObservableObject {
         qos: .utility
     )
 
-    // Consecutive-result counters — switching happens only after
-    // `successesNeeded` consecutive identical decisive verdicts.
-    private var whitelistCount = 0
-    private var freeCount = 0
+    /// Bootstrap state — true once a decisive verdict has been applied for
+    /// the current monitor owner / network path.
+    private var bootstrapDone = false
+    /// Endpoint we are about to switch to, and since when its verdict has
+    /// been holding. Non-nil only while a stable-phase change is pending.
+    private var pendingTarget: EndpointMode?
+    private var pendingSince: Date?
     private var lastPathSummary: String?
     private var lastConfigSignature: String?
 
@@ -38,26 +51,24 @@ final class WhitelistMonitor: ObservableObject {
         guard task == nil else { return }
         generation += 1
         let gen = generation
-        let monitor = NWPathMonitor()
-        monitor.start(queue: pathMonitorQueue)
-        pathMonitor = monitor
-        // A consecutive sequence cannot span monitor owners or carrier paths.
-        // Start clean; the 5 s settling cadence below rebuilds confidence fast.
-        whitelistCount = 0
-        freeCount = 0
+        resetDecisionState()
         lastPathSummary = nil
         lastConfigSignature = nil
         WhitelistStatusStore.resetDetectionProgress()
         let build = (Bundle.main.object(forInfoDictionaryKey: "IPAArtifactName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
             ?? "unknown"
-        AppLog.info("whitelist", "monitor started build=\(build) method=icmp_echo threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
-        task = Task { [weak self] in
-            while !Task.isCancelled {
-                let delay = await self?.runCycle(generation: gen) ?? Self.cycleInterval
-                try? await Task.sleep(for: .seconds(delay))
+        AppLog.info("whitelist", "monitor started build=\(build) method=icmp_echo interval=\(Int(Self.cycleInterval))s bootstrapRetry=\(Int(WhitelistProbePreferences.bootstrapRetryInterval))s hold=\(Int(WhitelistProbePreferences.switchHoldSeconds))s blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            let summary = WhitelistProbeEngine.pathSelection(path).summary
+            Task { @MainActor in
+                self?.handlePathUpdate(summary: summary)
             }
         }
+        monitor.start(queue: pathMonitorQueue)
+        pathMonitor = monitor
+        launchLoop(generation: gen)
     }
 
     func stop() {
@@ -66,7 +77,41 @@ final class WhitelistMonitor: ObservableObject {
         task = nil
         pathMonitor?.cancel()
         pathMonitor = nil
+        resetDecisionState()
         AppLog.info("whitelist", "monitor stopped")
+    }
+
+    private func launchLoop(generation gen: Int) {
+        task = Task { [weak self] in
+            while !Task.isCancelled {
+                let delay = await self?.runCycle(generation: gen) ?? Self.cycleInterval
+                try? await Task.sleep(for: .seconds(delay))
+                if Task.isCancelled { return }
+            }
+        }
+    }
+
+    /// A new physical path invalidates everything the previous path said.
+    /// Rule 1: bootstrap again, starting with an immediate probe.
+    private func handlePathUpdate(summary: String) {
+        guard task != nil else { return }
+        let previous = lastPathSummary
+        lastPathSummary = summary
+        guard let previous, previous != summary else { return }
+        AppLog.info("whitelist", "monitor path changed — bootstrap restarted {\(previous)} → {\(summary)}")
+        generation += 1
+        let gen = generation
+        resetDecisionState()
+        task?.cancel()
+        task = nil
+        WhitelistStatusStore.current = .unknown
+        launchLoop(generation: gen)
+    }
+
+    private func resetDecisionState() {
+        bootstrapDone = false
+        pendingTarget = nil
+        pendingSince = nil
     }
 
     // MARK: – cycle
@@ -76,63 +121,97 @@ final class WhitelistMonitor: ObservableObject {
             WhitelistStatusStore.current = .unknown
             return Self.cycleInterval
         }
-        let threshold = WhitelistProbePreferences.successesNeeded
-        let pathSelection = WhitelistProbeEngine.pathSelection(pathMonitor?.currentPath)
-        let configSignature = "\(WhitelistProbePreferences.testHost)|\(WhitelistProbePreferences.whitelistHost)|\(threshold)|\(WhitelistProbePreferences.probeInterval)"
-        if let previous = lastPathSummary, previous != pathSelection.summary {
-            resetProgress(reason: "network path changed: {\(previous)} → {\(pathSelection.summary)}")
-        }
+        let configSignature = "\(WhitelistProbePreferences.testHost)|\(WhitelistProbePreferences.whitelistHost)|\(WhitelistProbePreferences.probeInterval)"
         if let previous = lastConfigSignature, previous != configSignature {
+            lastConfigSignature = configSignature
             resetProgress(reason: "probe configuration changed")
+            return 0
         }
-        lastPathSummary = pathSelection.summary
         lastConfigSignature = configSignature
 
-        AppLog.info("whitelist", "monitor ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
+        let pathSelection = WhitelistProbeEngine.pathSelection(pathMonitor?.currentPath)
+        AppLog.info("whitelist", "monitor ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) bootstrap=\(bootstrapDone) pending=\(pendingTarget?.rawValue ?? "none") path={\(pathSelection.summary)} blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
         let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex)
         guard gen == generation, !Task.isCancelled else { return Self.cycleInterval }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
             AppLog.info("whitelist", "monitor probe \(line)")
         }
+        AppLog.info("whitelist", "monitor result=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue)")
+        return decide(classification: result.classification)
+    }
 
-        switch result.classification {
-        case .normal:
-            // Free internet — domestic + foreign controls reachable.
-            whitelistCount = 0
-            freeCount += 1
-            WhitelistStatusStore.current = .off
-            if WhitelistStatusStore.activeEndpoint == .backup
-                && freeCount >= threshold {
-                WhitelistStatusStore.activeEndpoint = .primary
-                freeCount = 0
+    /// Applies one completed cycle and returns the delay until the next one.
+    private func decide(classification: WhitelistProbeCycleResult.Classification) -> TimeInterval {
+        guard bootstrapDone else {
+            switch classification {
+            case .normal:
+                bootstrapDone = true
+                WhitelistStatusStore.current = .off
+                applyBootstrapVerdict(endpoint: .primary)
+                return Self.cycleInterval
+            case .allowlist:
+                bootstrapDone = true
+                WhitelistStatusStore.current = .detected
+                applyBootstrapVerdict(endpoint: .backup)
+                return Self.cycleInterval
+            case .error:
+                WhitelistStatusStore.current = .error
+                return WhitelistProbePreferences.bootstrapRetryInterval
             }
-
-        case .allowlist:
-            // Default-deny allowlist — domestic reachable, foreign controls fail.
-            freeCount = 0
-            whitelistCount += 1
-            WhitelistStatusStore.current = .detected
-            if WhitelistStatusStore.activeEndpoint != .backup
-                && whitelistCount >= threshold {
-                WhitelistStatusStore.activeEndpoint = .backup
-                whitelistCount = 0
-            }
-
-        case .error:
-            freeCount = 0
-            whitelistCount = 0
-            WhitelistStatusStore.current = .error
         }
 
-        AppLog.info("whitelist", "monitor result=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
-        let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && whitelistCount > 0)
-            || (WhitelistStatusStore.activeEndpoint == .backup && freeCount > 0)
-        return switchPending ? 5 : Self.cycleInterval
+        let current = WhitelistStatusStore.activeEndpoint
+        switch classification {
+        case .normal:
+            WhitelistStatusStore.current = .off
+            return stablePhase(target: .primary, current: current)
+        case .allowlist:
+            WhitelistStatusStore.current = .detected
+            return stablePhase(target: .backup, current: current)
+        case .error:
+            WhitelistStatusStore.current = .error
+            guard pendingTarget != nil else { return Self.cycleInterval }
+            pendingSince = Date()
+            AppLog.info("whitelist", "monitor pending change restarted (error) target=\(pendingTarget?.rawValue ?? "none")")
+            return WhitelistProbePreferences.switchProbeInterval
+        }
+    }
+
+    private func applyBootstrapVerdict(endpoint: EndpointMode) {
+        WhitelistStatusStore.activeEndpoint = endpoint
+        AppLog.info("whitelist", "monitor bootstrap verdict=\(endpoint.rawValue) — applied immediately")
+    }
+
+    /// Rule 2: a later flip needs `switchHoldSeconds` of continuous
+    /// agreement. Any agreeing cycle cancels the pending change.
+    private func stablePhase(target: EndpointMode, current: EndpointMode) -> TimeInterval {
+        guard target != current else {
+            if let pending = pendingTarget {
+                AppLog.info("whitelist", "monitor pending change cancelled target=\(pending.rawValue)")
+                pendingTarget = nil
+                pendingSince = nil
+            }
+            return Self.cycleInterval
+        }
+        if pendingTarget != target {
+            pendingTarget = target
+            pendingSince = Date()
+            AppLog.info("whitelist", "monitor pending change started target=\(target.rawValue) hold=\(Int(WhitelistProbePreferences.switchHoldSeconds))s")
+            return WhitelistProbePreferences.switchProbeInterval
+        }
+        let held = Date().timeIntervalSince(pendingSince ?? Date())
+        guard held >= WhitelistProbePreferences.switchHoldSeconds else {
+            return WhitelistProbePreferences.switchProbeInterval
+        }
+        WhitelistStatusStore.activeEndpoint = target
+        AppLog.info("whitelist", "monitor pending change committed target=\(target.rawValue) held=\(Int(held))s")
+        pendingTarget = nil
+        pendingSince = nil
+        return Self.cycleInterval
     }
 
     private func resetProgress(reason: String) {
-        whitelistCount = 0
-        freeCount = 0
+        resetDecisionState()
         WhitelistStatusStore.resetDetectionProgress()
         AppLog.info("whitelist", "monitor progress reset — \(reason)")
     }

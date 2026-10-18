@@ -13,13 +13,26 @@ enum WhitelistProbePreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
     private static let testHostKey = "tamizdat.whitelistTestHost"
     private static let whitelistHostKey = "tamizdat.whitelistWhitelistHost"
-    private static let successesKey = "tamizdat.whitelistSuccessesNeeded"
     private static let intervalKey = "tamizdat.whitelistProbeInterval"
 
     static let defaultTestHost = "8.8.8.8"
     static let defaultWhitelistHost = "77.88.8.8"
-    static let defaultSuccessesNeeded = 3
     static let defaultProbeInterval = 30
+
+    /// Detection timing shared by the app-side WhitelistMonitor and the
+    /// extension-side WhitelistDetector, so both obey the same rules.
+    ///
+    /// Bootstrap (monitor/detector start, network path change): probe
+    /// immediately and apply the first decisive verdict at once. An
+    /// inconclusive cycle is retried at this cadence.
+    static let bootstrapRetryInterval: TimeInterval = 3
+
+    /// Stable phase: the opposite endpoint is adopted only after the
+    /// opposite verdict has held continuously for this long.
+    static let switchHoldSeconds: TimeInterval = 60
+
+    /// Re-probe cadence while a switch is pending.
+    static let switchProbeInterval: TimeInterval = 10
 
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
@@ -69,20 +82,8 @@ enum WhitelistProbePreferences {
         Array(splitTargets(whitelistHost, fallback: defaultWhitelistHost).prefix(1))
     }
 
-    /// Consecutive agreeing classifications before endpoint flips. Default 3.
-    /// Range 1…10.
-    static var successesNeeded: Int {
-        get {
-            let v = defaults?.integer(forKey: successesKey) ?? 0
-            return v >= 1 && v <= 10 ? v : defaultSuccessesNeeded
-        }
-        set {
-            let clamped = max(1, min(10, newValue))
-            defaults?.set(clamped, forKey: successesKey)
-        }
-    }
-
-    /// Seconds between foreground probe cycles. Default 30. Range 5…120.
+    /// Seconds between foreground probe cycles in the steady state.
+    /// Default 30. Range 5…120.
     static var probeInterval: Int {
         get {
             let v = defaults?.integer(forKey: intervalKey) ?? 0
@@ -98,7 +99,6 @@ enum WhitelistProbePreferences {
     static func reset() {
         defaults?.removeObject(forKey: testHostKey)
         defaults?.removeObject(forKey: whitelistHostKey)
-        defaults?.removeObject(forKey: successesKey)
         defaults?.removeObject(forKey: intervalKey)
     }
 

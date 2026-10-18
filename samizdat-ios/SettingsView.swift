@@ -47,6 +47,9 @@ struct SettingsView: View {
     /// getter'ах нельзя, иначе после тапа ничего не перерисовывается и
     /// подсветка «отстаёт».
     @State private var mode: EndpointMode = EndpointModeStore.current
+    /// Provider row currently highlighted as a drop target during a
+    /// drag-reorder of the VKS ladder.
+    @State private var targetProvider: String?
     @State private var providerEnabled: [String: Bool] = Dictionary(
         uniqueKeysWithValues: VKSPreferences.allProviders.map {
             ($0, VKSPreferences.providerEnabled($0))
@@ -176,6 +179,10 @@ struct SettingsView: View {
                         guard newValue != mode else { return }
                         mode = newValue
                         EndpointModeStore.current = newValue
+                        // Report immediately so the parent re-derives
+                        // `currentMode` and starts/stops WhitelistMonitor
+                        // without waiting for the 2 s status poll.
+                        onConfigChanged(ConfigStore.shared.load() != nil)
                         Task {
                             _ = await VPNProfileStore.shared.switchEndpoint(to: newValue)
                         }
@@ -190,27 +197,30 @@ struct SettingsView: View {
 
     // MARK: – Каналы VKS
 
-    /// Переупорядочиваемый список провайдеров VKS: drag-хэндл слева,
-    /// тумблер справа. Первая включённая строка — основной канал, остальные
-    /// — failover. Изменения применяются при следующем подключении (или
-    /// живьём, если туннель поднят).
+    /// Переупорядочиваемый список провайдеров VKS: тумблер справа, порядок
+    /// меняется долгим нажатием + перетаскиванием. Первая включённая
+    /// строка — основной канал, остальные — failover. Изменения
+    /// применяются при следующем подключении (или живьём, если туннель
+    /// поднят).
     private var channelsCard: some View {
         CardContainer(padding: 0) {
             VStack(spacing: 0) {
-                ForEach(Array(providerOrder.enumerated()), id: \.element) { index, provider in
-                    channelProviderRow(provider, orderIndex: index)
+                ForEach(providerOrder, id: \.self) { provider in
+                    channelProviderRow(provider)
                 }
             }
         }
     }
 
-    /// Строка одного провайдера: drag-хэндл + имя + тумблер.
-    private func channelProviderRow(_ provider: String, orderIndex: Int) -> some View {
+    /// Строка одного провайдера: имя + тумблер.
+    ///
+    /// Порядок меняется системным drag & drop: вся строка — источник
+    /// перетаскивания (`.draggable` стартует по долгому нажатию, поэтому
+    /// обычный скролл и тап по тумблеру не ломаются), `.dropDestination`
+    /// на строке-цели переносит провайдера на её позицию (remove + insert,
+    /// не swap).
+    private func channelProviderRow(_ provider: String) -> some View {
         HStack(spacing: 12) {
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(theme.textMuted)
-                .opacity(0.6)
             Text(VKSPreferences.providerDisplayName(provider))
                 .font(.geist(.medium, size: 15))
                 .tracking(-0.16)
@@ -229,38 +239,63 @@ struct SettingsView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
-        .background(providerRowBackground(orderIndex: orderIndex))
+        .background(providerRowBackground(provider: provider))
+        .overlay(alignment: .top) {
+            if targetProvider == provider {
+                Rectangle()
+                    .fill(theme.mint)
+                    .frame(height: 2)
+            }
+        }
         .contentShape(Rectangle())
-        .gesture(channelDragGesture(provider: provider))
+        .draggable(provider) {
+            Text(VKSPreferences.providerDisplayName(provider))
+                .font(.geist(.semibold, size: 13))
+                .foregroundStyle(theme.text)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 7)
+                .background(Capsule().fill(theme.chip))
+        }
+        .dropDestination(for: String.self) { items, _ in
+            guard let dragged = items.first else { return false }
+            let moved = moveProvider(dragged, before: provider)
+            targetProvider = nil
+            return moved
+        } isTargeted: { targeted in
+            if targeted {
+                targetProvider = provider
+            } else if targetProvider == provider {
+                targetProvider = nil
+            }
+        }
+    }
+
+    /// Переносит `dragged` на позицию `destination` (remove + insert).
+    /// Возвращает false, если строка не найдена или порядок не изменился.
+    private func moveProvider(_ dragged: String, before destination: String) -> Bool {
+        guard dragged != destination,
+              let from = providerOrder.firstIndex(of: dragged),
+              let to = providerOrder.firstIndex(of: destination) else { return false }
+        var updated = providerOrder
+        updated.remove(at: from)
+        let insertAt = min(to, updated.count)
+        updated.insert(dragged, at: insertAt)
+        guard updated != providerOrder else { return false }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            providerOrder = updated
+        }
+        VKSPreferences.providerOrder = updated
+        pushLadderUpdate()
+        return true
     }
 
     @ViewBuilder
-    private func providerRowBackground(orderIndex: Int) -> some View {
+    private func providerRowBackground(provider: String) -> some View {
         // Отключённый провайдер визуально гаснет.
-        let on = providerEnabled[providerOrder[orderIndex]] ?? true
+        let on = providerEnabled[provider] ?? true
         Rectangle()
             .fill(on ? Color.clear : theme.chip)
             .opacity(on ? 0 : 0.5)
-    }
-
-    /// Drag-reorder: перекидываем строку внутри providerOrder и
-    /// персистим новый порядок.
-    private func channelDragGesture(provider: String) -> some Gesture {
-        DragGesture(minimumDistance: 12)
-            .onEnded { value in
-                // Простая эвристика: вертикальный drag > 40pt двигает
-                // строку на одну позицию вверх/вниз. Полноценный
-                // List-based reorder здесь не используется — карточный
-                // дизайн держит строки в CardContainer.
-                guard abs(value.translation.height) > 40 else { return }
-                guard let index = providerOrder.firstIndex(of: provider) else { return }
-                let direction = value.translation.height > 0 ? 1 : -1
-                let target = index + direction
-                guard providerOrder.indices.contains(target) else { return }
-                providerOrder.swapAt(index, target)
-                VKSPreferences.providerOrder = providerOrder
-                pushLadderUpdate()
-            }
     }
 
     /// Живое применение лестницы в работающий туннель (no-op при
@@ -543,7 +578,6 @@ private struct AdvancedView: View {
     // Детектор белых списков.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
     @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
-    @State private var wlSuccessesDraft: Int = WhitelistProbePreferences.successesNeeded
     @State private var wlIntervalDraft: Int = WhitelistProbePreferences.probeInterval
 
     // Проверка связи.
@@ -731,21 +765,6 @@ private struct AdvancedView: View {
                 detectorField("Заблокированный хост", placeholder: "8.8.8.8", text: $testHostDraft)
                 detectorField("Разрешённый хост", placeholder: "77.88.8.8", text: $whitelistHostDraft)
 
-                Text("Циклов до переключения")
-                    .font(.geist(.medium, size: 12))
-                    .foregroundStyle(theme.textMuted)
-                Stepper(value: $wlSuccessesDraft, in: 1...10) {
-                    Text("\(wlSuccessesDraft)")
-                        .font(.geistMono(.regular, size: 14))
-                        .foregroundStyle(theme.text)
-                }
-                .tint(theme.mint)
-                .onChange(of: wlSuccessesDraft) { _, newValue in
-                    WhitelistProbePreferences.successesNeeded = newValue
-                    WhitelistStatusStore.resetDetectionProgress()
-                    Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
-                }
-
                 Text("Интервал опроса (секунды)")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
@@ -797,13 +816,11 @@ private struct AdvancedView: View {
     private func saveDetector() {
         WhitelistProbePreferences.testHost = testHostDraft
         WhitelistProbePreferences.whitelistHost = whitelistHostDraft
-        WhitelistProbePreferences.successesNeeded = wlSuccessesDraft
         WhitelistProbePreferences.probeInterval = wlIntervalDraft
         WhitelistStatusStore.resetDetectionProgress()
         // Re-sync drafts so blank-saves snap back to the resolved default.
         testHostDraft = WhitelistProbePreferences.testHost
         whitelistHostDraft = WhitelistProbePreferences.whitelistHost
-        wlSuccessesDraft = WhitelistProbePreferences.successesNeeded
         wlIntervalDraft = WhitelistProbePreferences.probeInterval
         Task { await VPNProfileStore.shared.refreshWhitelistProbes() }
     }

@@ -8,9 +8,18 @@ import UserNotifications
 /// The UI receives a final verdict after every cycle: «Обычный»,
 /// «Белые списки» or «Ошибка определения». TCP/TLS/HTTP are not part of
 /// detection.
+///
+/// Timing rules (identical to the app-side WhitelistMonitor):
+///   1. Bootstrap (detector start / network path change): probe
+///      immediately; the first decisive verdict is applied at once.
+///      Inconclusive cycles retry every `bootstrapRetryInterval` (3 s).
+///   2. Stable phase: the opposite endpoint is adopted only after the
+///      opposite verdict held continuously for `switchHoldSeconds` (60 s),
+///      re-probing every `switchProbeInterval` (10 s). Any agreeing or
+///      inconclusive cycle in between restarts the window.
+///   3. Steady state (nothing pending): one probe per `probeInterval`,
+///      doubled on backup and tripled in Low Power Mode.
 final class WhitelistDetector {
-
-    private static let holdDownSeconds: TimeInterval = 60
 
     /// Read user-configured cadence; double it when on backup.
     private static var normalCadence: TimeInterval {
@@ -19,8 +28,13 @@ final class WhitelistDetector {
     private static var onBackupCadence: TimeInterval {
         TimeInterval(WhitelistProbePreferences.probeInterval) * 2
     }
-    private static var failbackSuccessesNeeded: Int {
-        WhitelistProbePreferences.successesNeeded
+    /// Cadence for the next steady-state cycle, recomputed after every
+    /// decision so an endpoint switch takes effect immediately.
+    private static var steadyCadence: TimeInterval {
+        let base = WhitelistStatusStore.activeEndpoint == .backup
+            ? onBackupCadence
+            : normalCadence
+        return ProcessInfo.processInfo.isLowPowerModeEnabled ? base * 3 : base
     }
 
     // Hooks injected by PacketTunnelProvider.
@@ -37,9 +51,9 @@ final class WhitelistDetector {
     private var configSignature = ""
 
     // State.
-    private var lastSwitchedAt = Date.distantPast
-    private var failbackSuccesses = 0
-    private var whitelistSuccesses = 0
+    private var bootstrapDone = false
+    private var pendingTarget: EndpointMode?
+    private var pendingSince: Date?
     private var isPathSatisfied = true
     private var lastPathFingerprint: String?
     private var stopped = false
@@ -58,15 +72,12 @@ final class WhitelistDetector {
             guard let self else { return }
             self.stopped = false
             self.probeGeneration += 1
-            // Consecutive confidence is local to this detector instance. A
-            // previous extension/app process may have observed another path.
-            self.failbackSuccesses = 0
-            self.whitelistSuccesses = 0
-            WhitelistStatusStore.failbackSuccesses = 0
-            WhitelistStatusStore.whitelistSuccessesExtension = 0
+            // Decision state is local to this detector instance. A previous
+            // extension/app process may have observed another path.
+            self.resetDecisionStateLocked()
             self.applyConfigLocked()
-            self.scheduleNextProbe(after: 2)
-            self.log("info: WhitelistDetector started method=icmp_echo threshold=\(Self.failbackSuccessesNeeded) interval=\(Int(Self.normalCadence))s blocked=\(self.foreignTargets) allowed=\(self.domesticTargets)")
+            self.scheduleNextProbe(after: 0)
+            self.log("info: WhitelistDetector started method=icmp_echo interval=\(Int(Self.normalCadence))s bootstrapRetry=\(Int(WhitelistProbePreferences.bootstrapRetryInterval))s hold=\(Int(WhitelistProbePreferences.switchHoldSeconds))s blocked=\(self.foreignTargets) allowed=\(self.domesticTargets)")
         }
     }
 
@@ -107,7 +118,7 @@ final class WhitelistDetector {
     private func applyConfigLocked() {
         let f = WhitelistProbePreferences.testHost
         let d = WhitelistProbePreferences.whitelistHost
-        let signature = "\(f)|\(d)|\(WhitelistProbePreferences.successesNeeded)|\(WhitelistProbePreferences.probeInterval)"
+        let signature = "\(f)|\(d)|\(WhitelistProbePreferences.probeInterval)"
         let changed = !configSignature.isEmpty && signature != configSignature
         if f != foreignTargets || d != domesticTargets {
             log("info: detector targets updated: foreign=\(f) domestic=\(d)")
@@ -118,13 +129,13 @@ final class WhitelistDetector {
         if changed {
             probeGeneration += 1
             resetProgressLocked(reason: "probe configuration changed")
-            scheduleNextProbe(after: 1)
+            scheduleNextProbe(after: 0)
         }
     }
 
-    /// Notify the detector about every physical-path update. Consecutive
-    /// confidence cannot cross Wi-Fi/cellular/SIM changes even when both old
-    /// and new NWPath values are `.satisfied`.
+    /// Notify the detector about every physical-path update. The verdict
+    /// belongs to one physical path: a Wi-Fi/cellular/SIM change even when
+    /// both old and new NWPath values are `.satisfied` re-enters bootstrap.
     func notePathChange(satisfied: Bool, fingerprint: String) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
@@ -142,15 +153,20 @@ final class WhitelistDetector {
                 self.log("info: detector paused (path unsatisfied)")
             } else {
                 WhitelistStatusStore.current = .unknown
-                self.log("info: detector resumed on fresh path")
-                self.scheduleNextProbe(after: 1)
+                self.log("info: detector resumed on fresh path — bootstrap")
+                self.scheduleNextProbe(after: 0)
             }
         }
     }
 
+    private func resetDecisionStateLocked() {
+        bootstrapDone = false
+        pendingTarget = nil
+        pendingSince = nil
+    }
+
     private func resetProgressLocked(reason: String) {
-        failbackSuccesses = 0
-        whitelistSuccesses = 0
+        resetDecisionStateLocked()
         WhitelistStatusStore.resetDetectionProgress()
         log("info: detector progress reset — \(reason)")
     }
@@ -174,20 +190,17 @@ final class WhitelistDetector {
 
         guard EndpointModeStore.current == .auto else {
             log("info: detector cycle skip (mode=\(EndpointModeStore.current.rawValue))")
-            scheduleNextProbe(after: Self.normalCadence)
+            scheduleNextProbe(after: Self.steadyCadence)
             return
         }
         if !isPathSatisfied {
             log("info: detector cycle skip (path unsatisfied)")
-            scheduleNextProbe(after: Self.normalCadence)
+            scheduleNextProbe(after: Self.steadyCadence)
             return
         }
         let pathSelection = WhitelistProbeEngine.pathSelection(pathProvider())
         let iface = pathSelection.interfaceIndex
-        let onBackup = (WhitelistStatusStore.activeEndpoint == .backup)
-        let baseCadence = onBackup ? Self.onBackupCadence : Self.normalCadence
-        let cadence = ProcessInfo.processInfo.isLowPowerModeEnabled ? baseCadence * 3 : baseCadence
-        log("info: detector ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded) path={\(pathSelection.summary)} blocked=\(foreignTargets) allowed=\(domesticTargets)")
+        log("info: detector ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) bootstrap=\(bootstrapDone) pending=\(pendingTarget?.rawValue ?? "none") path={\(pathSelection.summary)} blocked=\(foreignTargets) allowed=\(domesticTargets)")
         if iface == nil {
             log("info: detector probe uses NECP/default route (no unambiguous physical interface)")
         }
@@ -202,10 +215,8 @@ final class WhitelistDetector {
                 for line in WhitelistProbeEngine.detailedLogLines(result) {
                     self.log("info: detector probe \(line)")
                 }
-                self.handleOutcome(Self.outcome(from: result))
-                let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && self.whitelistSuccesses > 0)
-                    || (WhitelistStatusStore.activeEndpoint == .backup && self.failbackSuccesses > 0)
-                self.scheduleNextProbe(after: switchPending ? 5 : cadence)
+                let next = self.decide(outcome: Self.outcome(from: result))
+                self.scheduleNextProbe(after: next)
             }
         }
     }
@@ -229,54 +240,84 @@ final class WhitelistDetector {
 
     // MARK: – decisions
 
-    private func handleOutcome(_ outcome: Outcome) {
-        let now = Date()
-        let inHoldDown = now.timeIntervalSince(lastSwitchedAt) < Self.holdDownSeconds
-        log("info: detector cycle outcome=\(outcome.rawValue) holdDown=\(inHoldDown)")
+    /// Applies one completed cycle and returns the delay until the next.
+    private func decide(outcome: Outcome) -> TimeInterval {
+        log("info: detector cycle outcome=\(outcome.rawValue)")
 
-        switch outcome {
-        case .clearAll:
-            whitelistSuccesses = 0
-            failbackSuccesses += 1
-            if WhitelistStatusStore.activeEndpoint == .backup
-                && failbackSuccesses >= Self.failbackSuccessesNeeded
-                && !inHoldDown {
-                log("info: detector: failback → primary (whitelist gone)")
-                applySwitch(to: .primary)
-                failbackSuccesses = 0
+        guard bootstrapDone else {
+            switch outcome {
+            case .clearAll:
+                bootstrapDone = true
+                WhitelistStatusStore.current = .off
+                applyBootstrapVerdict(.primary)
+                return Self.steadyCadence
+            case .whitelistOn:
+                bootstrapDone = true
+                WhitelistStatusStore.current = .detected
+                applyBootstrapVerdict(.backup)
+                return Self.steadyCadence
+            case .error:
+                WhitelistStatusStore.current = .error
+                log("info: detector bootstrap inconclusive — retry in \(Int(WhitelistProbePreferences.bootstrapRetryInterval))s")
+                return WhitelistProbePreferences.bootstrapRetryInterval
             }
-            WhitelistStatusStore.current = .off
-
-        case .whitelistOn:
-            failbackSuccesses = 0
-            whitelistSuccesses += 1
-            if WhitelistStatusStore.activeEndpoint != .backup
-                && whitelistSuccesses >= Self.failbackSuccessesNeeded
-                && !inHoldDown {
-                log("warn: detector: WHITELIST ACTIVE — switching to backup")
-                applySwitch(to: .backup)
-                whitelistSuccesses = 0
-            }
-            WhitelistStatusStore.current = .detected
-
-        case .error:
-            failbackSuccesses = 0
-            whitelistSuccesses = 0
-            WhitelistStatusStore.current = .error
-            log("warn: detector: ERROR DETECTING — ping matrix is not decisive; keeping current endpoint")
         }
 
-        // Keep counters process-local; only the current verdict/endpoint cross
-        // the App Group boundary. Persisting partial confidence made a fresh
-        // detector inherit results from another network.
-        log("info: detector counters status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistSuccesses)/\(Self.failbackSuccessesNeeded) freeCount=\(failbackSuccesses)/\(Self.failbackSuccessesNeeded)")
+        let current = WhitelistStatusStore.activeEndpoint
+        switch outcome {
+        case .clearAll:
+            WhitelistStatusStore.current = .off
+            return stablePhase(target: .primary, current: current)
+        case .whitelistOn:
+            WhitelistStatusStore.current = .detected
+            return stablePhase(target: .backup, current: current)
+        case .error:
+            WhitelistStatusStore.current = .error
+            log("warn: detector: ERROR DETECTING — ping matrix is not decisive; keeping current endpoint")
+            guard pendingTarget != nil else { return Self.steadyCadence }
+            pendingSince = Date()
+            log("info: detector pending change restarted (error) target=\(pendingTarget?.rawValue ?? "none")")
+            return WhitelistProbePreferences.switchProbeInterval
+        }
     }
 
-    private func applySwitch(to endpoint: EndpointMode) {
-        lastSwitchedAt = Date()
+    private func applyBootstrapVerdict(_ endpoint: EndpointMode) {
+        let previous = WhitelistStatusStore.activeEndpoint
         WhitelistStatusStore.activeEndpoint = endpoint
+        log("info: detector bootstrap verdict=\(endpoint.rawValue) — applied immediately (previous=\(previous.rawValue))")
+        guard endpoint != previous else { return }
         switchEndpoint(endpoint)
         postSwitchNotification(to: endpoint)
+    }
+
+    /// Rule 2: a later flip needs `switchHoldSeconds` of continuous
+    /// agreement. Any agreeing cycle cancels the pending change.
+    private func stablePhase(target: EndpointMode, current: EndpointMode) -> TimeInterval {
+        guard target != current else {
+            if let pending = pendingTarget {
+                log("info: detector pending change cancelled target=\(pending.rawValue)")
+                pendingTarget = nil
+                pendingSince = nil
+            }
+            return Self.steadyCadence
+        }
+        if pendingTarget != target {
+            pendingTarget = target
+            pendingSince = Date()
+            log("info: detector pending change started target=\(target.rawValue) hold=\(Int(WhitelistProbePreferences.switchHoldSeconds))s")
+            return WhitelistProbePreferences.switchProbeInterval
+        }
+        let held = Date().timeIntervalSince(pendingSince ?? Date())
+        guard held >= WhitelistProbePreferences.switchHoldSeconds else {
+            return WhitelistProbePreferences.switchProbeInterval
+        }
+        WhitelistStatusStore.activeEndpoint = target
+        log("warn: detector pending change committed target=\(target.rawValue) held=\(Int(held))s")
+        switchEndpoint(target)
+        postSwitchNotification(to: target)
+        pendingTarget = nil
+        pendingSince = nil
+        return Self.steadyCadence
     }
 
     private func postSwitchNotification(to endpoint: EndpointMode) {
