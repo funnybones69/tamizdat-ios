@@ -38,6 +38,13 @@ struct ManualCaptchaSheet: View {
     @State private var statusMessage: String = ""
     @State private var errorMessage: String?
     @State private var hasResolved: Bool = false
+    /// Overall manual timeout task. MUST be cancelled on disappear —
+    /// otherwise a sheet that was dismissed without resolving (swipe
+    /// dismiss keeps `hasResolved == false`) fires `onCancel` up to
+    /// 60 s later against a NEWER challenge: `cancelManual()` would
+    /// resume the newer continuation with `.cancelled` and kill its
+    /// pending notification.
+    @State private var timeoutTask: Task<Void, Never>?
 
     /// Overall manual timeout — match Android (60 s).
     private static let manualTimeout: TimeInterval = 60.0
@@ -100,6 +107,12 @@ struct ManualCaptchaSheet: View {
             TURNLog.info("captcha", "manual sheet presented")
             startTimeout()
         }
+        .onDisappear {
+            // Swipe/system dismissal without resolving must not leave
+            // the 60-s timeout armed — see timeoutTask.
+            timeoutTask?.cancel()
+            timeoutTask = nil
+        }
         .interactiveDismissDisabled(false)
     }
 
@@ -133,15 +146,16 @@ struct ManualCaptchaSheet: View {
     }
 
     private func startTimeout() {
-        Task { @MainActor in
+        timeoutTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(Self.manualTimeout * 1_000_000_000))
-            guard !hasResolved else { return }
+            guard !Task.isCancelled, !hasResolved else { return }
             hasResolved = true
             log.info("manual timeout (60s)")
             TURNLog.warn("captcha", "manual sheet timed out")
             errorMessage = "Таймаут ввода капчи. Попробуйте ещё раз."
             // After 2 s for the user to read, cancel.
             try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
             onCancel()
             dismiss()
         }

@@ -70,8 +70,16 @@ final class WhitelistDetector {
     }
 
     func stop() {
-        queue.async { [weak self] in
-            guard let self else { return }
+        // Strong self on purpose: the provider calls stop() and then
+        // immediately drops its only strong reference (whitelistDetector = nil
+        // in stopTunnel / startWhitelistDetectorIfNeeded). With a weak capture
+        // this block would find self == nil, never cancel the resumed
+        // DispatchSourceTimer, and the detector would deallocate while its
+        // timer source is still active (libdispatch UAF). Capturing strongly
+        // keeps the instance alive until the timer is cancelled on its own
+        // queue; the block does not outlive its execution, so no cycle.
+        queue.async {
+            // Implicit strong self capture (no [weak self]) — see comment above.
             self.stopped = true
             self.probeGeneration += 1
             self.timer?.cancel(); self.timer = nil

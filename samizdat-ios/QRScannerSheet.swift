@@ -209,6 +209,11 @@ private struct QRScannerRepresentable: UIViewControllerRepresentable {
 fileprivate final class QRScannerVC: UIViewController {
     weak var coordinator: QRScannerRepresentable.Coordinator?
     private let session = AVCaptureSession()
+    // Serial queue owning startRunning/stopRunning. Serial ordering
+    // matters: a stop dispatched while an async start is still queued
+    // runs AFTER it, so the camera can never be left running once the
+    // sheet is dismissed.
+    private let sessionQueue = DispatchQueue(label: "com.anarki.samizdat-test.qrscanner", qos: .userInitiated)
     private var previewLayer: AVCaptureVideoPreviewLayer?
 
     override func viewDidLoad() {
@@ -219,17 +224,24 @@ fileprivate final class QRScannerVC: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        if !session.isRunning {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                self?.session.startRunning()
-            }
+        // startRunning() blocks for hundreds of ms — keep it off main.
+        // Unconditional: re-running start on a running session is a
+        // no-op, and the old isRunning check on main raced the queue.
+        sessionQueue.async { [weak self] in
+            self?.session.startRunning()
         }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        if session.isRunning {
-            session.stopRunning()
+        // stopRunning() blocks too, and checking isRunning on main here
+        // raced the async start above: a swipe-dismiss right after
+        // present saw isRunning == false (start still queued), skipped
+        // the stop, and the start then landed with the sheet already
+        // gone — camera kept running (privacy indicator stayed on).
+        // Unconditionally dispatch the stop on the same serial queue.
+        sessionQueue.async { [weak self] in
+            self?.session.stopRunning()
         }
     }
 

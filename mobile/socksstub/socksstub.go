@@ -213,13 +213,21 @@ type NotificationCallback interface {
 // CoverConfigBundle.Notification entries. Pass nil to detach.
 func SetNotificationCallback(cb NotificationCallback) {
 	if cb == nil {
-		notificationSink.Store((NotificationCallback)(nil))
+		// atomic.Value.Store panics on a nil interface value; store a
+		// no-op sink instead so "detach" works and the per-call type
+		// assertion in currentNotificationCallback stays valid.
+		notificationSink.Store(noopNotificationCallback{})
 		rt.appendLog("info: notification sink cleared")
 		return
 	}
 	notificationSink.Store(cb)
 	rt.appendLog("info: notification sink registered")
 }
+
+// noopNotificationCallback is the stored placeholder meaning "no sink".
+type noopNotificationCallback struct{}
+
+func (noopNotificationCallback) OnNotification(code, title, body, locale string) {}
 
 func currentNotificationCallback() NotificationCallback {
 	v, _ := notificationSink.Load().(NotificationCallback)
@@ -276,27 +284,15 @@ func Start(addrSpec string) error {
 		rt.mu.Unlock()
 		return errors.New("already listening")
 	}
-	rt.mu.Unlock()
 
 	// Pin the Go runtime under iOS's NEPacketTunnelProvider memory cap.
 	// iOS jetsam-reaps the extension if RSS approaches ~50 MB.
-	//
-	// IPA-Z5: bump soft limit 25 MB → 37 MB (sing-box-for-apple's
-	// formula: 75% of the 50 MB jetsam cap). At 25 MB the GC pacer was
-	// running so aggressively that small bursts couldn't be absorbed
-	// without paging — and the headroom we kept (25 MB unused) was
-	// just sitting useless because Go won't touch it. 37 MB lets the
-	// heap actually breathe under speedtest fanout while still leaving
-	// 13 MB headroom for non-Go state (Swift, hev, NEPacketTunnel
-	// internals).
-	//
-	// IPA-D18: GOGC 20 → 100 (Go default). With 5-10 MB heap baseline
-	// observed in D14 and 25+ MB headroom under SetMemoryLimit, the
+	// IPA-Z5: 37 MB = sing-box-for-apple's formula (75% of the 50 MB
+	// jetsam cap). IPA-D18: GOGC back to 100 (Go default); the
 	// aggressive 20% growth threshold caused ~5x more GC cycles than
 	// necessary at idle — each cycle wakes CPU and burns battery.
-	// SetMemoryLimit(37 MB) below remains as the emergency cap; if
-	// the heap actually approaches 37 MB the runtime biases GC harder
-	// regardless of GOGC.
+	// SetMemoryLimit(37 MB) remains as the emergency cap: if the heap
+	// approaches it the runtime biases GC harder regardless of GOGC.
 	debug.SetMemoryLimit(37 * 1024 * 1024)
 	debug.SetGCPercent(100)
 
@@ -310,8 +306,15 @@ func Start(addrSpec string) error {
 		_ = os.Remove(addr)
 	}
 
+	// rt.mu is deliberately held across net.Listen: the previous pattern
+	// (check → unlock → listen → re-lock → assign) let two concurrent
+	// Start calls both pass the nil check; the second assignment orphaned
+	// the first listener and its acceptLoop goroutine forever. Start is a
+	// rare lifecycle call and the Listen is a fast loopback/UDS bind, so
+	// this is the smallest correct fix.
 	ln, err := net.Listen(network, addr)
 	if err != nil {
+		rt.mu.Unlock()
 		return fmt.Errorf("listen %s %s: %w", network, addr, err)
 	}
 	if network == "unix" {
@@ -319,7 +322,6 @@ func Start(addrSpec string) error {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	rt.mu.Lock()
 	rt.listener = ln
 	rt.ctx = ctx
 	rt.cancel = cancel
@@ -1048,7 +1050,7 @@ func readSocksAddr(r io.Reader, atyp byte) (string, uint16, error) {
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return "", 0, fmt.Errorf("ipv6: %w", err)
 		}
-		host = "[" + net.IP(buf).String() + "]"
+		host = net.IP(buf).String()
 	default:
 		return "", 0, fmt.Errorf("bad atyp 0x%02x", atyp)
 	}
@@ -1584,14 +1586,27 @@ func putRelayBuf(b *[]byte) { relayBufPool.Put(b) }
 // the same platform under same constraints have already solved this.
 func relay(a, b net.Conn, idx uint64) {
 	done := make(chan struct{}, 2)
+	// Half-close aware: when one direction finishes (EOF or error) only the
+	// write side of the peer is closed, so the opposite direction can still
+	// deliver data (an HTTP client that FINs while awaiting the response
+	// must not kill the reply stream). Both conns are fully closed only
+	// after both directions finish — same semantics as sing's CopyConn.
+	closeWrite := func(c net.Conn) {
+		if cw, ok := c.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	go func() {
 		_, _ = singBufio.Copy(b, a)
+		closeWrite(b)
 		done <- struct{}{}
 	}()
 	go func() {
 		_, _ = singBufio.Copy(a, b)
+		closeWrite(a)
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 	_ = a.Close()
 	_ = b.Close()

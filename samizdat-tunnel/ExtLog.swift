@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Darwin
 
 /// Synchronous, fsync-per-write logger for the Network Extension.
@@ -45,6 +46,10 @@ enum ExtLog {
         return url.appendingPathComponent(logFileName).path
     }()
 
+    // DateFormatter is NOT thread-safe; ExtLog is called from arbitrary
+    // queues (Task.detached pollers, rewireQueue, hevQueue). One lock
+    // around the shared instance beats re-creating the formatter per line.
+    private static let formatterLock = OSAllocatedUnfairLock<Bool>(initialState: false)
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
@@ -74,7 +79,9 @@ enum ExtLog {
     /// Logging must never propagate errors back to callers.
     private static func write(level: String, text: String) {
         guard let path = cachedPath else { return }
-        let stamp = timeFormatter.string(from: Date())
+        let stamp = formatterLock.withLock {
+            timeFormatter.string(from: Date())
+        }
         let line = "\(stamp) \(level): \(text)\n"
         let bytes = Array(line.utf8)
         let fd = path.withCString { cpath -> Int32 in

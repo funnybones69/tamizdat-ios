@@ -392,6 +392,11 @@ final class VPNProfileStore {
         guard let url = components?.url else { return nil }
         var request = URLRequest(url: url)
         request.setValue("application/dns-json", forHTTPHeaderField: "Accept")
+        // The system getaddrinfo path above is capped at 2.5 s; the DoH
+        // fallback must be capped too. URLSession's default 60 s request
+        // timeout hangs tunnel start for a full minute exactly where this
+        // fallback runs: 1.1.1.1:443 blackholed under a whitelist.
+        request.timeoutInterval = 5
 
         do {
             let (data, _) = try await URLSession.shared.data(for: request)

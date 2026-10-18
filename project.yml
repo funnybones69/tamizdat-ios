@@ -10,7 +10,7 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "0.2.0"
+    MARKETING_VERSION: "0.3.0"
     CURRENT_PROJECT_VERSION: "1"
     IPA_ARTIFACT_NAME: "Tamizdat-local.ipa"
     DEVELOPMENT_TEAM: DRMTP6V372

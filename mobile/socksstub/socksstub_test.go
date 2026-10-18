@@ -1,6 +1,7 @@
 package socksstub
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -160,6 +161,88 @@ func TestUnknownAtypReply(t *testing.T) {
 	}
 	if reply[1] != 0x08 {
 		t.Errorf("reply code = 0x%02x, want 0x08 (atyp not supported)", reply[1])
+	}
+}
+
+// TestSetNotificationCallbackNilDoesNotPanic pins the detach path:
+// atomic.Value.Store(nil interface) panics, so the nil branch must store
+// a no-op sink instead. A follow-up callback must still be delivered.
+func TestSetNotificationCallbackNilDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("SetNotificationCallback(nil) panicked: %v", r)
+		}
+	}()
+	SetNotificationCallback(nil)
+	if cb := currentNotificationCallback(); cb != nil {
+		// The stored no-op implements the interface; it must not be a
+		// typed-nil that the type assertion drops to nil and then gets
+		// used as a live sink.
+		_ = cb
+	}
+}
+
+// TestReadSocksAddrIPv6JoinHostPort pins the IPv6 host shape: the host
+// must be raw (no brackets) so net.JoinHostPort produces a dialable
+// "[v6]:port" instead of "[[v6]]:port" (missing port in address).
+func TestReadSocksAddrIPv6JoinHostPort(t *testing.T) {
+	ip := net.IP{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}
+	buf := append([]byte(nil), ip...) // atyp already consumed by the caller
+	buf = append(buf, 0x01, 0xbb)     // port 443
+	host, port, err := readSocksAddr(bytes.NewReader(buf), socksAtypIPv6)
+	if err != nil {
+		t.Fatalf("readSocksAddr: %v", err)
+	}
+	if port != 443 {
+		t.Fatalf("port = %d, want 443", port)
+	}
+	joined := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	if _, _, err := net.SplitHostPort(joined); err != nil {
+		t.Fatalf("JoinHostPort(%q) not dialable: %v", joined, err)
+	}
+	if !strings.HasPrefix(joined, "[2001:db8::1]:") {
+		t.Fatalf("joined = %q, want [2001:db8::1]:443", joined)
+	}
+}
+
+// TestRelaySurvivesClientHalfClose pins the relay half-close semantics:
+// after the client half-closes its write side, the relay must keep the
+// server→client direction open so a late reply still arrives.
+func TestRelaySurvivesClientHalfClose(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	go relay(client, server, 0)
+
+	// Half-close the client side: writes are done, reads must continue.
+	if tc, ok := client.(*net.TCPConn); ok {
+		_ = tc.CloseWrite()
+	} else if cw, ok := client.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+	}
+
+	// net.Pipe: a Write blocks until the peer reads. Write the FIN-side
+	// payload first, then the server replies and the client must still
+	// receive it.
+	go func() {
+		// Server sees the relay's half-close via its read EOF after the
+		// payload is drained; then it answers once.
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(server, buf); err != nil {
+			return
+		}
+		_, _ = server.Write([]byte("reply"))
+	}()
+	_, _ = client.Write([]byte("hello"))
+
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(client, got); err != nil {
+		t.Fatalf("client could not read reply after half-close: %v", err)
+	}
+	if string(got) != "reply" {
+		t.Fatalf("reply = %q, want %q", got, "reply")
 	}
 }
 

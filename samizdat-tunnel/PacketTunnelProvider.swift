@@ -50,6 +50,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let socksPort: UInt16 = 18443
 
     private var swiftHeartbeatTimer: DispatchSourceTimer?
+    /// Serial queue for provider messages whose handling can block for
+    /// many seconds (VK TURN allocate). Keeps handleAppMessage responsive
+    /// for the 500 ms "status" polls.
+    private let turnIpcQueue = DispatchQueue(label: "com.anarki.samizdat-test.turnipc", qos: .userInitiated)
     // IPA-D18: emit heartbeat log line only every 5 ticks (every ~150 s
     // at the new 30 s cadence) to drop file-write rate from 3600/hour
     // to ~24/hour. Pressure events are still logged immediately.
@@ -59,6 +63,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let memoryPressureState = OSAllocatedUnfairLock<MemoryPressureState>(initialState: .init())
     private static let memoryPressureCooldown: TimeInterval = 60
     private var hevQueue = DispatchQueue(label: "com.anarki.samizdat-test.hev", qos: .userInitiated)
+    // Syncs stopTunnel's hev_socks5_tunnel_quit() with the async hev
+    // start block: stop waits (bounded) until the start block has at
+    // least begun executing, so quit() cannot precede main().
+    private var hevEntryGroup: DispatchGroup?
 
     // IPA-O: auto-reconnect on network change (Wi-Fi ↔ cellular flip).
     // Mirrors what V2Box / FoXray / Hiddify do: when the OS default interface
@@ -67,10 +75,42 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // we re-call SocksstubSetSamizdatConfig with the same blob, which
     // closes the old samizdat.Client and rebuilds a fresh one over the
     // current default interface.
-    private let pathMonitor = NWPathMonitor()
+    // NWPathMonitor is permanently invalid after cancel(). The provider
+    // object survives a stop/start cycle in the same process (hot restart
+    // — see the "already listening, reusing" path in startInProcessSocks),
+    // so the monitor MUST be recreated on every startPathMonitor, never
+    // restarted on the cancelled instance.
+    private let pathMonitorLock = NSLock()
+    private var _pathMonitor: NWPathMonitor?
+    private var pathMonitor: NWPathMonitor? {
+        get {
+            pathMonitorLock.lock()
+            defer { pathMonitorLock.unlock() }
+            return _pathMonitor
+        }
+        set {
+            pathMonitorLock.lock()
+            _pathMonitor = newValue
+            pathMonitorLock.unlock()
+        }
+    }
     private let pathMonitorQueue = DispatchQueue(label: "com.anarki.samizdat-test.path", qos: .utility)
-    private var lastPathInterfaceID: String? // sortable key from path.availableInterfaces
     private var lastReconnectAt = Date.distantPast
+    // Written on pathMonitorQueue, read on the provider queue when seeding
+    // the WhitelistDetector — confined behind one unfair lock.
+    private struct PathState {
+        var interfaceID: String? = nil
+        var satisfied: Bool = true
+    }
+    private let pathStateLock = OSAllocatedUnfairLock<PathState>(initialState: .init())
+    private var lastPathInterfaceID: String? {
+        get { pathStateLock.withLock { $0.interfaceID } }
+        set { pathStateLock.withLock { $0.interfaceID = newValue } }
+    }
+    private var lastPathSatisfied: Bool {
+        get { pathStateLock.withLock { $0.satisfied } }
+        set { pathStateLock.withLock { $0.satisfied = newValue } }
+    }
 
     // IPA-D22: timestamp when startTunnel completed (the SOCKS5 listener
     // is up and we handed packets to hev). Surfaced in the "status" RPC
@@ -100,14 +140,38 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // (read from App Group UserDefaults — the main app writes when the
     // user taps the picker, then sends a "switchEndpoint" provider
     // message so we re-read live without disconnect).
-    private var combinedConfigBlob: String = ""
-    private var primaryBlob: String = ""
-    private var backupBlob: String?
+    //
+    // Writers run on the provider queue (startTunnel / handleAppMessage);
+    // readers run on rewireQueue (rewireUpstream) and the auto-rewire
+    // global queue. Backed by one unfair lock — String/Optional CoW
+    // storage reads racing a write are a real data race.
+    private struct BlobState {
+        var combined: String = ""
+        var primary: String = ""
+        var backup: String? = nil
+        var serverIP: String? = nil
+    }
+    private let blobLock = OSAllocatedUnfairLock<BlobState>(initialState: .init())
+    private var combinedConfigBlob: String {
+        get { blobLock.withLock { $0.combined } }
+        set { blobLock.withLock { $0.combined = newValue } }
+    }
+    private var primaryBlob: String {
+        get { blobLock.withLock { $0.primary } }
+        set { blobLock.withLock { $0.primary = newValue } }
+    }
+    private var backupBlob: String? {
+        get { blobLock.withLock { $0.backup } }
+        set { blobLock.withLock { $0.backup = newValue } }
+    }
     /// Server IPv4 mirrored from providerConfiguration at startTunnel and
     /// refreshed by the app's setConfigBlob push (Proxies live-apply).
     /// Drives the excludedRoutes /32 so the tunnel never loops on its own
     /// upstream server.
-    private var currentServerIP: String?
+    private var currentServerIP: String? {
+        get { blobLock.withLock { $0.serverIP } }
+        set { blobLock.withLock { $0.serverIP = newValue } }
+    }
 
     private enum EffectiveUpstream: String {
         case h2
@@ -140,8 +204,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // IPA-Q: WhitelistDetector — periodic out-of-tunnel cascade probe
     // that flips to backup when TSPU restricted-profile mode is detected and
     // back to primary when it lifts.
-    private var whitelistDetector: WhitelistDetector?
-    private var lastPathSatisfied: Bool = true
+    // Stored under NSLock: written on the provider queue
+    // (stopTunnel/startWhitelistDetectorIfNeeded) and read on
+    // pathMonitorQueue (onPathUpdate) — an unguarded Optional load racing
+    // the release store is a UAF.
+    private let detectorLock = NSLock()
+    private var _whitelistDetector: WhitelistDetector?
+    private var whitelistDetector: WhitelistDetector? {
+        get {
+            detectorLock.lock()
+            defer { detectorLock.unlock() }
+            return _whitelistDetector
+        }
+        set {
+            detectorLock.lock()
+            _whitelistDetector = newValue
+            detectorLock.unlock()
+        }
+    }
 
     // IPA-D26: bridge object retained while the tunnel is up so the
     // Go-side rewire requester atomic.Value holds a valid pointer.
@@ -218,8 +298,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let settings = makeNetworkSettings(serverIP: serverIP)
         appendExtLog("info: applying packet tunnel network settings")
-        setTunnelNetworkSettings(settings) { [weak self] error in
-            guard let self else { return }
+        setTunnelNetworkSettings(settings) { error in
+            // Strong self on purpose: NE requires startTunnel's
+            // completionHandler to run on every path; with [weak self] a
+            // mid-start dealloc would silently drop it. The closure runs
+            // once and returns, so no retain cycle.
             if let error {
                 self.appendExtLog("error: setTunnelNetworkSettings: \(error.localizedDescription)")
                 completionHandler(error)
@@ -595,6 +678,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // IPA-D26: drop the auto-rewire bridge so it doesn't keep a
         // strong reference to self after the tunnel is torn down.
         autoRewireBridge = nil
+        // Invalidate any rewire still queued/running on rewireQueue so it
+        // observes a superseded generation and bails before re-calling
+        // SocksstubSetSamizdatConfig / re-attaching TURN after teardown.
+        _ = nextRewireGeneration()
         whitelistDetector?.stop()
         whitelistDetector = nil
         // D61 FIX: do NOT call WhitelistStatusStore.reset() here.
@@ -603,7 +690,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // even though the network is still whitelist-filtered. The
         // main-app WhitelistMonitor resumes on disconnect and writes
         // fresh values; the 200s stale-check handles truly stale data.
-        pathMonitor.cancel()
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        // Reset the path baseline so the next startTunnel re-learns the
+        // "first update = baseline, no rewire" fingerprint instead of
+        // comparing a hot restart against the previous session's kind.
+        lastPathInterfaceID = nil
         // NE stop must return promptly: cancel/reset synchronously, but drain
         // TURN workers/allocations in Go background. Replacement starts remain
         // gated until that drain completes.
@@ -611,12 +703,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         SocksstubStopVKTurnUpstreamAsync()
         _ = SocksstubStopVKSUpstream()
         _ = SocksstubStopVKSNativeUpstream()
+        // Ensure the async hev start block has begun before quitting it.
+        // Bounded wait: if hevQueue is wedged we still must return
+        // promptly from stopTunnel (NE watchdog).
+        if let entryGroup = hevEntryGroup {
+            _ = entryGroup.wait(timeout: .now() + 0.5)
+        }
+        hevEntryGroup = nil
         hev_socks5_tunnel_quit()
         swiftHeartbeatTimer?.cancel()
         swiftHeartbeatTimer = nil
         stopBurstProtection()  // IPA-D2
-        try? swiftLogHandle?.close()
-        swiftLogHandle = nil
+        // Close on logQueue: drain any queued log writes first so no
+        // write races the close (use-after-close on the FileHandle).
+        logQueue.sync {
+            try? swiftLogHandle?.close()
+            swiftLogHandle = nil
+        }
         completionHandler()
     }
 
@@ -630,10 +733,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// fix and matches what every other production iOS network adapter client
     /// does.
     private func startPathMonitor() {
-        pathMonitor.pathUpdateHandler = { [weak self] path in
+        // Fresh instance every time: a cancelled NWPathMonitor can never
+        // be restarted, and the provider instance survives hot restarts.
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        monitor.pathUpdateHandler = { [weak self] path in
             self?.onPathUpdate(path)
         }
-        pathMonitor.start(queue: pathMonitorQueue)
+        monitor.start(queue: pathMonitorQueue)
         appendExtLog("info: path monitor started")
     }
 
@@ -979,7 +1086,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.appendExtLog("info: detector requested switch → \(target.rawValue)")
                 self.rewireUpstream()
             },
-            pathProvider: { [weak self] in self?.pathMonitor.currentPath }
+            pathProvider: { [weak self] in self?.pathMonitor?.currentPath }
         )
         // Seed with current path status/fingerprint so first-cycle decisions
         // cannot inherit confidence from another physical path.
@@ -1058,31 +1165,39 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
         case "refreshVKTurnCreds":
-            // Main app fetched fresh VK TURN session params and wrote them to the
-            // App Group. The active runner lives in THIS extension
-            // process, so update it here; calling the gomobile bridge
-            // in the main app only touches that process' idle Go runtime.
             appendExtLog("info: app requested VK TURN creds refresh")
-            let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-            guard policy.usesTURN else {
-                SocksstubStopVKTurnUpstream()
-                appendExtLog("info: VK TURN creds refresh ignored by policy — effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw), H2 active")
-                completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
-                return
-            }
+            // attachVKTurnUpstream performs a synchronous VK Allocate that
+            // can block up to 15 s. handleAppMessage is delivered on the
+            // provider's serial IPC queue — running the attach there stalls
+            // every other provider message (the 500 ms "status" polls freeze).
+            // Hop to a background queue; completionHandler may be invoked
+            // from any queue.
+            turnIpcQueue.async { [weak self] in
+                guard let self else {
+                    completionHandler?(Data())
+                    return
+                }
+                let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob)
+                guard policy.usesTURN else {
+                    SocksstubStopVKTurnUpstream()
+                    self.appendExtLog("info: VK TURN creds refresh ignored by policy — effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw), H2 active")
+                    completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
+                    return
+                }
 
-            let result = Self.refreshVKTurnCredsFromAppGroup()
-            if result == "not running" {
-                // If the tunnel started before VK session params existed,
-                // attachVKTurnUpstream() skipped. A later successful
-                // refresh should start the runner immediately, but only
-                // while the effective endpoint is Restricted+Relay.
-                appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
-                let attachResult = Self.attachVKTurnUpstream()
-                let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
-                completionHandler?(response.data(using: .utf8))
-            } else {
-                completionHandler?(result.data(using: .utf8))
+                let result = Self.refreshVKTurnCredsFromAppGroup()
+                if result == "not running" {
+                    // If the tunnel started before VK session params existed,
+                    // attachVKTurnUpstream() skipped. A later successful
+                    // refresh should start the runner immediately, but only
+                    // while the effective endpoint is Restricted+Relay.
+                    self.appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
+                    let attachResult = Self.attachVKTurnUpstream()
+                    let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
+                    completionHandler?(response.data(using: .utf8))
+                } else {
+                    completionHandler?(result.data(using: .utf8))
+                }
             }
         case "restartVKTurnUpstream":
             // Settings → VK TURN workers changed. Workers are only read
@@ -1090,25 +1205,33 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // current TURN runner and starting a fresh attach if TURN is
             // the active policy. H2/Main users just keep the saved value
             // for the next Restricted+Relay connect.
-            let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-            appendExtLog("info: app requested VK TURN restart → rooms=\(VKCredsPreferences.roomHashes.count) workersPerRoom=20 effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
-            guard policy.usesTURN else {
+            // Runs on turnIpcQueue: attachVKTurnUpstream blocks up to 15 s
+            // (VK Allocate) and must not stall the IPC queue ("status").
+            turnIpcQueue.async { [weak self] in
+                guard let self else {
+                    completionHandler?(Data())
+                    return
+                }
+                let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob)
+                self.appendExtLog("info: app requested VK TURN restart → rooms=\(VKCredsPreferences.roomHashes.count) workersPerRoom=20 effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
+                guard policy.usesTURN else {
+                    SocksstubStopVKTurnUpstream()
+                    completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
+                    return
+                }
                 SocksstubStopVKTurnUpstream()
-                completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
-                return
+                let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
+                let hasBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)?.isEmpty == false
+                let hasLegacy = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")?.isEmpty == false
+                guard hasBundle || hasLegacy else {
+                    self.appendExtLog("warn: VK TURN restart skipped — no credential payload in App Group")
+                    completionHandler?("noCreds".data(using: .utf8))
+                    return
+                }
+                let attachResult = Self.attachVKTurnUpstream()
+                let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
+                completionHandler?(response.data(using: .utf8))
             }
-            SocksstubStopVKTurnUpstream()
-            let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
-            let hasBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)?.isEmpty == false
-            let hasLegacy = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")?.isEmpty == false
-            guard hasBundle || hasLegacy else {
-                appendExtLog("warn: VK TURN restart skipped — no credential payload in App Group")
-                completionHandler?("noCreds".data(using: .utf8))
-                return
-            }
-            let attachResult = Self.attachVKTurnUpstream()
-            let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
-            completionHandler?(response.data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
             // Snapshot is built from in-process Socksstub*() getters which
@@ -1281,9 +1404,18 @@ misc:
         tunnelStartedAt = Date()
 
         // hev_socks5_tunnel_main_from_str blocks until quit. Run it on a
-        // dedicated background queue.
+        // dedicated background queue. A DispatchGroup lets stopTunnel wait
+        // for the start block to begin before calling quit() — otherwise a
+        // fast stop (startTunnel error path / NE cancel racing the start)
+        // could call quit() BEFORE the queued main() runs, and hev would
+        // then run the tunnel forever (quit-before-start is a no-op for a
+        // tunnel that hasn't started yet).
+        let entryGroup = DispatchGroup()
+        entryGroup.enter()
+        hevEntryGroup = entryGroup
         let yamlCopy = yaml
         hevQueue.async { [weak self] in
+            entryGroup.leave()
             let rc = yamlCopy.withCString { cstr -> Int32 in
                 hev_socks5_tunnel_main_from_str(cstr, UInt32(yamlCopy.utf8.count), fd)
             }
@@ -1560,7 +1692,12 @@ misc:
         try? Data().write(to: logURL, options: .atomic)
         if let h = try? FileHandle(forWritingTo: logURL) {
             try? h.seekToEnd()
-            swiftLogHandle = h
+            // The handle is owned by logQueue (see appendExtLog); hop on
+            // that queue so a still-in-flight log write from a previous
+            // session can never interleave with this swap.
+            logQueue.sync {
+                swiftLogHandle = h
+            }
         }
     }
 
@@ -1710,17 +1847,27 @@ misc:
     }()
 
     private func appendExtLog(_ message: String) {
-        let stamp = Self.timeFormatter.string(from: Date())
+        // appendExtLog is called from hevQueue, rewireQueue, pathMonitorQueue
+        // and global queues. DateFormatter is not thread-safe; the handle
+        // write serializes on a shared queue to keep App Group file writes
+        // ordered and the @unchecked state safe.
+        let stamp = Self.formatterLock.withLock {
+            Self.timeFormatter.string(from: Date())
+        }
         let line = "\(stamp) \(message)\n"
         log.info("\(message, privacy: .public)")
-        guard let h = swiftLogHandle else { return }
-        do {
-            try h.write(contentsOf: Data(line.utf8))
-            try h.synchronize()
-        } catch {
-            // best-effort
+        logQueue.async { [weak self] in
+            guard let self, let h = self.swiftLogHandle else { return }
+            do {
+                try h.write(contentsOf: Data(line.utf8))
+                try h.synchronize()
+            } catch {
+                // best-effort
+            }
         }
     }
+    private let logQueue = DispatchQueue(label: "com.anarki.samizdat-test.extlog", qos: .utility)
+    private static let formatterLock = OSAllocatedUnfairLock<Bool>(initialState: false)
 
     private func makeError(_ message: String) -> NSError {
         NSError(

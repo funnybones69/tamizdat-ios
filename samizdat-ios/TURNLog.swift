@@ -18,6 +18,15 @@ enum TURNLog {
     static let appGroupID = "group.com.anarki.samizdat-test"
     static let fileName = "extension-log.txt"
 
+    // Serializes the whole write path. DateFormatter is NOT
+    // thread-safe (concurrent string(from:) can crash), and the
+    // open/seek/write sequence is not atomic either — without
+    // O_APPEND, two handles that both seeked to EOF overwrite each
+    // other's bytes. TURNLog is called from the main actor, the
+    // VKCredsClient actor, URLSession delegate queues and the
+    // extension concurrently.
+    private static let writeLock = NSLock()
+
     private static let timeFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
@@ -67,6 +76,8 @@ enum TURNLog {
     }
 
     private static func write(level: String, tag: String, message: String) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         let line = "\(timeFormatter.string(from: Date())) \(level): \(tag): \(message)\n"
         guard let h = handle() else { return }
         defer { try? h.close() }

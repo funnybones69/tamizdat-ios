@@ -201,6 +201,13 @@ struct LogView: View {
                 guard autoScroll, !filteredLines.isEmpty else { return }
                 withAnimation { proxy.scrollTo(filteredLines.count - 1, anchor: .bottom) }
             }
+            // Once bridge.logs hits its 500-line cap the count stops changing
+            // while content keeps sliding — also key on the tail line so
+            // auto-scroll keeps working.
+            .onChange(of: filteredLines.last?.raw) {
+                guard autoScroll, !filteredLines.isEmpty else { return }
+                withAnimation { proxy.scrollTo(filteredLines.count - 1, anchor: .bottom) }
+            }
             .onAppear {
                 guard !filteredLines.isEmpty else { return }
                 proxy.scrollTo(filteredLines.count - 1, anchor: .bottom)
@@ -383,26 +390,36 @@ struct LogView: View {
             critFlash = .failed("No auto-dump available")
             return
         }
-        guard let data = try? Data(contentsOf: latest) else {
-            critFlash = .failed("Cannot read \(latest.lastPathComponent)")
-            return
-        }
+        let latestName = latest.lastPathComponent
+        // defaultCaption touches UIDevice — compute on main before hopping.
+        let caption = TelegramReporter.defaultCaption(extra: "auto-dump (\(latestName))")
         critFlash = .sending
-        let caption = TelegramReporter.defaultCaption(extra: "auto-dump (\(latest.lastPathComponent))")
-        TelegramReporter.sendFile(
-            data: data,
-            filename: latest.lastPathComponent,
-            mimeType: "application/gzip",
-            caption: caption
-        ) { result in
-            switch result {
-            case .success:
-                critFlash = .sent
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
-                    if case .sent = critFlash { critFlash = .idle }
+        // Heap dumps can be hundreds of KB — keep the disk read off the
+        // main thread; only UI state hops back.
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard let data = try? Data(contentsOf: latest) else {
+                DispatchQueue.main.async {
+                    if case .sending = critFlash { critFlash = .failed("Cannot read \(latestName)") }
                 }
-            case .failure(let err):
-                critFlash = .failed(err.errorDescription ?? "unknown")
+                return
+            }
+            TelegramReporter.sendFile(
+                data: data,
+                filename: latestName,
+                mimeType: "application/gzip",
+                caption: caption
+            ) { result in
+                DispatchQueue.main.async {
+                    switch result {
+                    case .success:
+                        critFlash = .sent
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+                            if case .sent = critFlash { critFlash = .idle }
+                        }
+                    case .failure(let err):
+                        critFlash = .failed(err.errorDescription ?? "unknown")
+                    }
+                }
             }
         }
     }

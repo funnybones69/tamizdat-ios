@@ -129,7 +129,7 @@ jobs:
         run: |
           SHORT_SHA=${GITHUB_SHA:0:7}
           BUILD_NUM=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
-          NAME="Tamizdat-0.2.${BUILD_NUM}-${SHORT_SHA}-build-${BUILD_NUM}"
+          NAME="Tamizdat-0.3.${BUILD_NUM}-${SHORT_SHA}-build-${BUILD_NUM}"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "Artifact will be: ${NAME}.ipa"
 
@@ -141,7 +141,7 @@ jobs:
           # the source revision).
           GIT_SHA=$(git rev-parse --short HEAD)
           BUILD_NUM=$((GITHUB_RUN_NUMBER + BUILD_NUMBER_OFFSET))
-          MARKETING="0.2.${BUILD_NUM}-${GIT_SHA}"
+          MARKETING="0.3.${BUILD_NUM}-${GIT_SHA}"
           IPA_ARTIFACT_NAME="${{ steps.ipa_name.outputs.name }}.ipa"
           echo "Stamping MARKETING_VERSION=$MARKETING CURRENT_PROJECT_VERSION=$BUILD_NUM IPA_ARTIFACT_NAME=$IPA_ARTIFACT_NAME"
           xcodebuild archive \

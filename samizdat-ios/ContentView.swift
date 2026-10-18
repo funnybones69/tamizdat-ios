@@ -192,16 +192,9 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(theme.isDark ? .dark : .light)
-        .sheet(isPresented: $showSettings) {
-            SettingsView(onConfigChanged: { saved in
-                hasConfig = saved
-                hasBackupConfigured = ContentView.checkBackupConfigured()
-                if !hasBackupConfigured {
-                    if manualEndpoint == .backup { manualEndpoint = .primary }
-                    if EndpointModeStore.current == .backup {
-                        EndpointModeStore.current = .primary
-                    }
-                }
+        .sheet(isPresented: $showSettings, onDismiss: refreshConfigDerivedState) {
+            SettingsView(onConfigChanged: { _ in
+                refreshConfigDerivedState()
             })
             .environment(\.themeTokens, theme)
         }
@@ -209,16 +202,9 @@ struct ContentView: View {
             LogView(injectedBridge: bridge)
                 .environment(\.themeTokens, theme)
         }
-        .sheet(isPresented: $showEndpoints) {
-            EndpointsView { saved in
-                hasConfig = saved
-                hasBackupConfigured = ContentView.checkBackupConfigured()
-                if !hasBackupConfigured {
-                    if manualEndpoint == .backup { manualEndpoint = .primary }
-                    if EndpointModeStore.current == .backup {
-                        EndpointModeStore.current = .primary
-                    }
-                }
+        .sheet(isPresented: $showEndpoints, onDismiss: refreshConfigDerivedState) {
+            EndpointsView { _ in
+                refreshConfigDerivedState()
             }
             .environment(\.themeTokens, theme)
         }
@@ -306,7 +292,7 @@ struct ContentView: View {
                         .tracking(-0.15)
                         .foregroundStyle(theme.text)
                     // Bundle version + build is baked by the CI Archive step
-                    // (MARKETING_VERSION=0.2.<run>-<sha>, CURRENT_PROJECT_VERSION=<run>).
+                    // (MARKETING_VERSION=0.3.<run>-<sha>, CURRENT_PROJECT_VERSION=<run>).
                     // Showing it right under the logo lets us answer "what's
                     // installed?" at a glance without diving into Settings →
                     // About.
@@ -594,6 +580,22 @@ struct ContentView: View {
         }
     }
 
+    /// Re-derives config-dependent state (hasConfig / hasBackupConfigured
+    /// and the manual-endpoint fallback). Called from the config sheets'
+    /// callbacks AND their onDismiss — EndpointsView persists on Done via
+    /// closeAndPersist, but a swipe-down dismissal bypasses closeAndPersist
+    /// entirely, leaving the home screen showing stale hasConfig state.
+    private func refreshConfigDerivedState() {
+        hasConfig = ConfigStore.shared.load() != nil
+        hasBackupConfigured = ContentView.checkBackupConfigured()
+        if !hasBackupConfigured {
+            if manualEndpoint == .backup { manualEndpoint = .primary }
+            if EndpointModeStore.current == .backup {
+                EndpointModeStore.current = .primary
+            }
+        }
+    }
+
     /// IPA-D25 fix6: flip the optimistic "reconnecting" flag instantly
     /// so the shield turns amber the moment the user taps. The flag
     /// auto-clears after 3 s — by then the extension's isRewiring
@@ -716,8 +718,13 @@ struct ContentView: View {
     private func refreshWhitelistStatus() {
         whitelistStatus = WhitelistStatusStore.current
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
+        // Mirror WhitelistStatusStore.autoDecisionMaxAge (≥200 s, widened
+        // by probeInterval×7 at long intervals) instead of the old fixed
+        // 200 s — with a 120 s probe interval the detector legitimately
+        // goes silent for >200 s while still healthy, and this poll then
+        // mis-rendered "Error detecting" over a live verdict.
         if isAutoMode && bridge.state == .connected
-            && WhitelistStatusStore.ageSeconds > 200 {
+            && WhitelistStatusStore.ageSeconds > max(200, TimeInterval(WhitelistProbePreferences.probeInterval * 7)) {
             whitelistStatus = .error
         }
     }

@@ -288,16 +288,29 @@ private final class SolveSession {
         //  - the JS posts `{ kind: slider }` or `{ kind: error }`
         //  - the post-click watcher sees a slider in DOM
         //  - the parent task group times out (caller-side)
-        let token = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            self.continuation = cont
-            self.continuationDone = false
+        let token = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+                self.continuation = cont
+                self.continuationDone = false
 
-            // Kick off page load.
-            log.info("loading captcha page")
-            onStep?("Загружаем страницу капчи...")
-            var req = URLRequest(url: redirectURI)
-            req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
-            wv.load(req)
+                // Kick off page load.
+                log.info("loading captcha page")
+                onStep?("Загружаем страницу капчи...")
+                var req = URLRequest(url: redirectURI)
+                req.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+                wv.load(req)
+            }
+        } onCancel: {
+            // A checked continuation is NOT resumed by task
+            // cancellation. Without this handler, the 45-s overall
+            // timeout in `solveCaptcha` (group.cancelAll) leaves this
+            // task suspended forever when the page never loads — and
+            // the throwing task group waits for every child before
+            // rethrowing, so the whole solve deadlocks and
+            // `inFlight` stays true, rejecting all later solves.
+            Task { @MainActor [weak self] in
+                self?.finish(with: .failure(CaptchaError.cancelled))
+            }
         }
 
         log.info("token received (\(token.count, privacy: .public) chars)")

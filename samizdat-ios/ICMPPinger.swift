@@ -81,6 +81,22 @@ final class ICMPPinger {
         self.queue = DispatchQueue(label: "com.anarki.samizdat-test.icmp", qos: .utility)
     }
 
+    /// If the caller drops the last reference before the reply/timeout
+    /// settles (the engine gives up after pingTimeout + 1 s, while a slow
+    /// DNS resolve can push settle past that window), the queued timeout
+    /// work and source handler hold only weak references — nothing else
+    /// would close the socket. Handlers run under a temporary strong
+    /// `self`, so they cannot be mid-`recvfrom` while deinit executes;
+    /// after cancellation their weak-self no-ops are harmless.
+    deinit {
+        timeoutWork?.cancel()
+        dispatchSource?.cancel()
+        if fd >= 0 {
+            close(fd)
+            fd = -1
+        }
+    }
+
     /// Sends one echo, awaits the matching reply or `timeout`, then
     /// invokes `completion(success, roundTripTime)`. Exactly once.
     /// `completion` is delivered on an internal queue.

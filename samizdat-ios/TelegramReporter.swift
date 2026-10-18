@@ -45,7 +45,7 @@ enum TelegramReporter {
         case http(Int, String)
         case transport(Error)
         case encoding
-
+        case badURL
         var errorDescription: String? {
             switch self {
             case .notConfigured:
@@ -56,6 +56,8 @@ enum TelegramReporter {
                 return "Transport: \(err.localizedDescription)"
             case .encoding:
                 return "Could not encode log"
+            case .badURL:
+                return "Bot token contains characters that make the request URL invalid"
             }
         }
     }
@@ -79,7 +81,10 @@ enum TelegramReporter {
             DispatchQueue.main.async { completion(.failure(.encoding)) }
             return
         }
-        let url = URL(string: "https://api.telegram.org/bot\(token)/sendDocument")!
+        guard let url = URL(string: "https://api.telegram.org/bot\(token)/sendDocument") else {
+            DispatchQueue.main.async { completion(.failure(.badURL)) }
+            return
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         let boundary = "Boundary-\(UUID().uuidString)"
@@ -149,7 +154,10 @@ enum TelegramReporter {
             DispatchQueue.main.async { completion(.failure(.notConfigured)) }
             return
         }
-        let url = URL(string: "https://api.telegram.org/bot\(token)/sendDocument")!
+        guard let url = URL(string: "https://api.telegram.org/bot\(token)/sendDocument") else {
+            DispatchQueue.main.async { completion(.failure(.badURL)) }
+            return
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         let boundary = "Boundary-\(UUID().uuidString)"

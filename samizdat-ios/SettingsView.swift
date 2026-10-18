@@ -193,7 +193,13 @@ struct SettingsView: View {
                     .tint(theme.mint)
                     .onChange(of: notificationsEnabled) { _, newValue in
                         if newValue {
-                            Task { await handleEnableNotifications() }
+                            // onChange's action closure is nonisolated, so a
+                            // bare Task{} runs handleEnableNotifications on the
+                            // global executor — mutating @State permissionStatus /
+                            // notificationsEnabled / permissionDeniedAlert off main.
+                            Task { @MainActor in
+                                await handleEnableNotifications()
+                            }
                         } else {
                             NotificationPreferences.enabled = false
                         }

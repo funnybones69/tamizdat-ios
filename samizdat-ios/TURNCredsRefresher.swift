@@ -1,4 +1,5 @@
 import Foundation
+import os
 import SwiftUI
 import BackgroundTasks
 import UserNotifications
@@ -66,7 +67,27 @@ final class TURNCredsRefresher: ObservableObject {
     /// When non-nil, a the manual verification sheet should be presented so
     /// the user can solve the slider. The sheet calls `resolveManual`
     /// / `cancelManual` to drive the refresh forward.
-    @Published var manualChallenge: ManualChallenge?
+    ///
+    /// IMPORTANT: the sheet is swipe-dismissible (`.interactiveDismiss
+    /// Disabled(false)` in ManualCaptchaSheet). A system dismissal
+    /// writes `manualChallenge = nil` WITHOUT calling `onCancel`, so
+    /// `didSet` must resume the waiting continuation with
+    /// `.cancelled` — otherwise the suspended `awaitManual` task never
+    /// resumes and the refresh generation wedges at `isRefreshing == true`
+    /// forever. `resolveManual`/`cancelManual` resume their
+    /// continuation BEFORE clearing (so the didSet sees a nil
+    /// `manualContinuation` and does nothing).
+    @Published var manualChallenge: ManualChallenge? {
+        didSet {
+            if oldValue != nil && manualChallenge == nil {
+                if let cont = manualContinuation {
+                    manualContinuation = nil
+                    cont.resume(throwing: CaptchaError.cancelled)
+                }
+                CaptchaNotification.cancel()
+            }
+        }
+    }
 
     /// Active single-flight task; we cancel + replace rather than
     /// stacking refreshes when multiple scene-active events fire in
@@ -266,19 +287,23 @@ final class TURNCredsRefresher: ObservableObject {
     /// solved token back to the in-flight refresh task.
     func resolveManual(token: String) {
         TURNLog.info("turncreds", "manual token resolved (length=\(token.count))")
-        manualChallenge = nil
-        CaptchaNotification.cancel()
-        manualContinuation?.resume(returning: token)
+        // Resume BEFORE clearing manualChallenge — the didSet guard
+        // (see manualChallenge) resumes any still-set continuation
+        // with .cancelled, so the continuation must already be nil
+        // when the didSet fires.
+        let cont = manualContinuation
         manualContinuation = nil
+        cont?.resume(returning: token)
+        manualChallenge = nil
     }
 
     /// Called by `manual verification sheet.onCancel` — aborts the refresh.
     func cancelManual() {
         TURNLog.warn("turncreds", "manual captcha cancelled by user")
-        manualChallenge = nil
-        CaptchaNotification.cancel()
-        manualContinuation?.resume(throwing: CaptchaError.cancelled)
+        let cont = manualContinuation
         manualContinuation = nil
+        cont?.resume(throwing: CaptchaError.cancelled)
+        manualChallenge = nil
     }
 
     // MARK: – Private
@@ -439,8 +464,9 @@ final class TURNCredsRefresher: ObservableObject {
         refreshGeneration += 1
         inFlight?.cancel()
         inFlight = nil
-        manualContinuation?.resume(throwing: error)
+        let cont = manualContinuation
         manualContinuation = nil
+        cont?.resume(throwing: error)
         manualChallenge = nil
         CaptchaNotification.cancel()
         isRefreshing = false
@@ -540,15 +566,32 @@ final class TURNCredsRefresher: ObservableObject {
 
         // 25-s budget watchdog. Fires the success/failure callback so
         // iOS marks us complete before it would have killed us.
+        // `completed` guards against double `setTaskCompleted` — iOS
+        // treats calling it twice as a programmer error (crash in
+        // debug, undefined BG budget behaviour in release). The poll
+        // loop sleeps in 1-s ticks but a tick can overshoot the 25-s
+        // watchdog fire, and `expirationHandler` may race the poll
+        // loop's own completion path.
+        let completed = OSAllocatedUnfairLock(initialState: false)
+        let complete: (Bool) -> Void = { success in
+            let already = completed.withLock { state -> Bool in
+                if state { return true }
+                state = true
+                return false
+            }
+            if already { return }
+            task.setTaskCompleted(success: success)
+        }
         let budget: TimeInterval = 25
         let deadline = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
             TURNLog.warn("turncreds", "BG refresh budget exhausted (\(Int(budget))s) — marking complete")
-            task.setTaskCompleted(success: false)
+            complete(false)
         }
         task.expirationHandler = {
             TURNLog.warn("turncreds", "BG refresh expired by iOS")
             deadline.cancel()
+            complete(false)
         }
         Task { @MainActor in
             TURNCredsRefresher.shared.refreshIfNeeded(reason: "background")
@@ -563,7 +606,7 @@ final class TURNCredsRefresher: ObservableObject {
             deadline.cancel()
             let ok = (TURNCredsRefresher.shared.lastError == nil)
             TURNLog.info("turncreds", "BG refresh completing success=\(ok)")
-            task.setTaskCompleted(success: ok)
+            complete(ok)
         }
     }
 
@@ -587,12 +630,31 @@ final class TURNCredsRefresher: ObservableObject {
         // must be unconditional (alternate path NotificationPreferences.enabled)
         // because the VPN silently dies otherwise.
         CaptchaNotification.post()
-        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
-            self.manualContinuation = cont
-            self.manualChallenge = ManualChallenge(
-                redirectURI: redirectURI,
-                sessionToken: sessionToken
-            )
+        // Cancellation-aware: a checked continuation is NOT resumed by
+        // task cancellation. Without the handler, the 180-s watchdog
+        // (group.cancelAll) and every refresh restart would leave this
+        // task suspended forever with `isRefreshing == true` — the
+        // task group waits for the suspended child before rethrowing,
+        // so the whole refresh deadlocks.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (cont: CheckedContinuation<String, Error>) in
+                self.manualContinuation = cont
+                self.manualChallenge = ManualChallenge(
+                    redirectURI: redirectURI,
+                    sessionToken: sessionToken
+                )
+            }
+        } onCancel: {
+            // A checked continuation is NOT auto-resumed by task
+            // cancellation. The hop task is enqueued on MainActor at
+            // cancel time — FIFO order guarantees it runs BEFORE any
+            // replacement refresh generation can install its own
+            // continuation (gen2's Task is always created after the
+            // cancel that enqueued this hop), so `cancelManual` here
+            // can only ever resume THIS task's continuation or no-op.
+            Task { @MainActor [weak self] in
+                self?.cancelManual()
+            }
         }
     }
 }

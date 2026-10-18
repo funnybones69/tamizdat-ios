@@ -658,16 +658,32 @@ func relay(a, b net.Conn) {
 	// per-stream on the iOS extension (64 streams × 2 dirs × 256 KB =
 	// 32 MB just for the relay copy buffers).
 	done := make(chan struct{}, 2)
+	// Half-close aware: when one direction finishes, only the write side
+	// of the peer is closed (CloseWrite), so the opposite direction can
+	// still deliver data — a client that FINs while awaiting the server's
+	// response must not have the reply stream killed. Both conns are
+	// fully closed only after both directions finish. gVisor's
+	// gonet.TCPConn and the upstream tamizdat h2StreamRWC both implement
+	// CloseWrite; the type assertion degrades to a full close for conns
+	// that don't.
+	closeWrite := func(c net.Conn) {
+		if cw, ok := c.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		}
+	}
 	go func() {
 		buf := make([]byte, 32*1024)
 		io.CopyBuffer(b, a, buf)
+		closeWrite(b)
 		done <- struct{}{}
 	}()
 	go func() {
 		buf := make([]byte, 32*1024)
 		io.CopyBuffer(a, b, buf)
+		closeWrite(a)
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 	a.Close()
 	b.Close()
