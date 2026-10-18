@@ -729,6 +729,8 @@ private struct AdvancedView: View {
         if let zone = linkParams?.wakeZone, !zone.isEmpty {
             return "из ссылки: \(zone)"
         }
+        let derived = VKSPreferences.derivedWakeZone(profileBlob: activeProfileBlob)
+        if !derived.isEmpty { return "по умолчанию: \(derived)" }
         return "из ссылки (нет)"
     }
 

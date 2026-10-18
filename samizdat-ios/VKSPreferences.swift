@@ -14,7 +14,10 @@ import Foundation
 ///   2. the `wakedns` / `wakezone` query params of the active
 ///      tamizdat:// profile link (see `SamizdatURLCodec.vksParams`);
 ///   3. `defaultWakeDNS` when neither the override nor the link carries a
-///      wake DNS server.
+///      wake DNS server, and a derived wake zone — `w.` + the primary
+///      profile host's registrable domain (see `derivedWakeZone`) — when
+///      the link carries no `wakezone`. IP-literal hosts and hosts with
+///      fewer than two labels derive no zone, so the beacon stays off.
 ///
 /// The room credential is the profile's shortid — the same identity the H2
 /// tunnel authenticates with. There is no separate VKS wire key: beacon
@@ -193,7 +196,8 @@ enum VKSPreferences {
 
     /// On-demand wake beacon: the zone the server's NS is authoritative
     /// for (e.g. "wake.example.com"). Resolution: explicit override →
-    /// link's `wakezone` param → "" (beacon disabled).
+    /// link's `wakezone` param → derived zone (`derivedWakeZone`), so a
+    /// profile link alone enables the beacon.
     static func wakeZone(profileBlob: String?) -> String {
         let explicit = defaults?.string(forKey: wakeZoneKey) ?? ""
         if !explicit.isEmpty { return explicit }
@@ -201,7 +205,45 @@ enum VKSPreferences {
            !params.wakeZone.isEmpty {
             return params.wakeZone
         }
-        return ""
+        return derivedWakeZone(profileBlob: profileBlob)
+    }
+
+    /// Wake zone implied by the active profile link: the wake server is
+    /// expected under `w.<registrable domain>` of the primary tamizdat://
+    /// host, so the operator never has to type a zone. Registrable domain
+    /// is the last two DNS labels, lowercased, trailing dot stripped
+    /// (`sync.ai-archive.ru` → `ai-archive.ru` → zone `w.ai-archive.ru`).
+    /// IP-literal hosts and hosts with fewer than two labels yield "" —
+    /// no zone, so the beacon stays disabled exactly as before.
+    static func derivedWakeZone(profileBlob: String?) -> String {
+        guard let blob = profileBlob else { return "" }
+        let primary = SamizdatURLCodec.split(blob).primary
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: primary),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "tamizdat" || scheme == "samizdat",
+              var host = components.host?.lowercased() else {
+            return ""
+        }
+        // `components.host` carries no port and normally drops the
+        // brackets of an IPv6 literal; tolerate both spellings anyway.
+        if host.hasPrefix("[") {
+            guard let close = host.firstIndex(of: "]") else { return "" }
+            host = String(host[host.index(after: host.startIndex)..<close])
+        }
+        if host.hasSuffix(".") { host.removeLast() }
+        if host.isEmpty { return "" }
+        // IPv6 literal.
+        if host.contains(":") { return "" }
+        // IPv4 literal.
+        let octets = host.split(separator: ".", omittingEmptySubsequences: false)
+        if octets.count == 4,
+           octets.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isNumber } && (Int($0) ?? 256) <= 255 }) {
+            return ""
+        }
+        let labels = host.split(separator: ".", omittingEmptySubsequences: true)
+        guard labels.count >= 2 else { return "" }
+        return "w." + labels.suffix(2).joined(separator: ".")
     }
 
     /// Assembled `provider:room,` ladder spec over the user's order. A
