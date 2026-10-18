@@ -794,6 +794,31 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?("configApplied".data(using: .utf8))
             return
         }
+        // Provider login from Settings: "uploadCreds\n<provider>\n<cookie header>".
+        // The upload rides the live tunnel (Go side dials through the active
+        // carrier), so it must run here, not in the app's idle Go runtime.
+        if cmd.hasPrefix("uploadCreds\n") {
+            let rest = cmd.dropFirst("uploadCreds\n".count)
+            let parts = rest.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
+                completionHandler?("error: bad request".data(using: .utf8))
+                return
+            }
+            let provider = String(parts[0])
+            let cookies = String(parts[1])
+            appendExtLog("info: [vks] credentials upload requested provider=\(provider) bytes=\(cookies.utf8.count)")
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                let err = SocksstubUploadVKSCredentials(provider, cookies)
+                if err.isEmpty {
+                    self?.appendExtLog("info: [vks] credentials upload \(provider): accepted")
+                    completionHandler?("ok".data(using: .utf8))
+                } else {
+                    self?.appendExtLog("warn: [vks] credentials upload \(provider) failed: \(err)")
+                    completionHandler?("error: \(err)".data(using: .utf8))
+                }
+            }
+            return
+        }
         switch cmd {
         case "ping":
             completionHandler?("pong".data(using: .utf8))
@@ -906,6 +931,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "desiredUpstream": policy.upstream.rawValue,
                 "upstreamKind": actualUpstream,
                 "vksRunning":  vksRunning ? 1 : 0,
+                "loginRequired": SocksstubVKSLoginRequired(),
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

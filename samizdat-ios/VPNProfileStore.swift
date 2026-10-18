@@ -168,6 +168,23 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshVKSLadder")
     }
 
+    /// Sends provider cookies to the server through the running tunnel.
+    /// Returns nil on success, otherwise a short user-facing error.
+    func uploadVKSCredentials(provider: String, cookieHeader: String) async -> String? {
+        let header = cookieHeader
+            .replacingOccurrences(of: "\r", with: "")
+            .replacingOccurrences(of: "\n", with: "")
+        do {
+            let response = try await sendProviderMessage("uploadCreds\n\(provider)\n\(header)")
+            if response == "ok" { return nil }
+            if response.isEmpty { return "VPN не подключён" }
+            if response.hasPrefix("error: ") { return String(response.dropFirst("error: ".count)) }
+            return response
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
 
     /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
     /// the extension. Used by the main-screen lamp at 500 ms cadence.

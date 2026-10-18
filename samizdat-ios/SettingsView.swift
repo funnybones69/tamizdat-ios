@@ -56,6 +56,16 @@ struct SettingsView: View {
         }
     )
 
+    /// Providers the server reported as needing a fresh login (from the
+    /// extension status). Empty while disconnected.
+    @State private var loginRequired: Set<String> = []
+    @State private var loginTarget: LoginTarget?
+
+    private struct LoginTarget: Identifiable {
+        let provider: String
+        var id: String { provider }
+    }
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -112,6 +122,23 @@ struct SettingsView: View {
             }
             .task {
                 permissionStatus = await NotificationPreferences.currentSystemAuthorization()
+            }
+            .task {
+                while !Task.isCancelled {
+                    let snap = await VPNProfileStore.shared.fetchTamizdatStatus()
+                    let set = Set(snap.loginRequired.split(separator: ",").map {
+                        $0.trimmingCharacters(in: .whitespaces)
+                    }.filter { !$0.isEmpty })
+                    if set != loginRequired { loginRequired = set }
+                    try? await Task.sleep(for: .seconds(3))
+                }
+            }
+            .sheet(item: $loginTarget) { target in
+                ProviderLoginSheet(provider: target.provider) {
+                    loginRequired.remove(target.provider)
+                    pushLadderUpdate()
+                }
+                .environment(\.themeTokens, theme)
             }
             .alert("Уведомления не выданы", isPresented: $permissionDeniedAlert) {
                 Button("Открыть настройки") { openSystemSettings() }
@@ -221,11 +248,23 @@ struct SettingsView: View {
     /// не swap).
     private func channelProviderRow(_ provider: String) -> some View {
         HStack(spacing: 12) {
-            Text(VKSPreferences.providerDisplayName(provider))
-                .font(.geist(.medium, size: 15))
-                .tracking(-0.16)
-                .foregroundStyle(theme.text)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(VKSPreferences.providerDisplayName(provider))
+                    .font(.geist(.medium, size: 15))
+                    .tracking(-0.16)
+                    .foregroundStyle(theme.text)
+                if loginRequired.contains(provider) {
+                    Text("Нужен вход")
+                        .font(.geist(.regular, size: 12.5))
+                        .foregroundStyle(theme.red)
+                }
+            }
             Spacer(minLength: 8)
+            if loginRequired.contains(provider) {
+                Chip(label: "Войти", isActive: true) {
+                    loginTarget = LoginTarget(provider: provider)
+                }
+            }
             Toggle("", isOn: Binding(
                 get: { providerEnabled[provider] ?? true },
                 set: { newValue in

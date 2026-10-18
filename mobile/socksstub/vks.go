@@ -13,6 +13,8 @@
 //	StopVKSUpstream() string
 //	VKSUpstreamRunning() bool
 //	VKSUpstreamStatsJSON() string
+//	VKSLoginRequired() string
+//	UploadVKSCredentials(provider, cookieHeader string) string
 package socksstub
 
 import (
@@ -29,9 +31,37 @@ import (
 	"sync"
 	"time"
 
-	"github.com/funnybones69/tamizdat/vks"
 	samizdat "github.com/funnybones69/tamizdat"
+	"github.com/funnybones69/tamizdat/vks"
 )
+
+// vksCredsUploadTimeout bounds one upload: the server validates by creating
+// a real room (telemost) or calling GetLoginData (mts) before replying.
+const vksCredsUploadTimeout = 45 * time.Second
+
+// VKSLoginRequired returns the comma-separated providers the server reported
+// as needing a fresh login in its last beacon answer ("" = none).
+func VKSLoginRequired() string {
+	return strings.Join(vks.LoginRequiredProviders(), ",")
+}
+
+// UploadVKSCredentials sends a provider Cookie header to the server through
+// whichever carrier is currently up (H2 in Main mode, the room tunnel in
+// Whitelist mode). The server validates before storing. Returns "" on
+// success, otherwise the error text.
+func UploadVKSCredentials(provider, cookieHeader string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), vksCredsUploadTimeout)
+	defer cancel()
+	dial := func(ctx context.Context, _, addr string) (net.Conn, error) {
+		return dialUpstream(ctx, addr)
+	}
+	if err := vks.UploadProviderCredentials(ctx, dial, provider, cookieHeader); err != nil {
+		rt.appendLog(fmt.Sprintf("warn: vks creds upload %s: %v", provider, err))
+		return err.Error()
+	}
+	rt.appendLog(fmt.Sprintf("vks creds upload %s: accepted", provider))
+	return ""
+}
 
 type vksState struct {
 	mu      sync.Mutex

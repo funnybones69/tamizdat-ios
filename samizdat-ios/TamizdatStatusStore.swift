@@ -92,6 +92,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     /// gomobile calls hit a separate idle Go runtime, so never read Go
     /// state directly here.
     let vksRunning: Int
+    /// Comma-separated providers the server asked to re-login ("telemost,mts").
+    let loginRequired: String
 
     static let offline = TamizdatStatusSnapshot(
         realShape: "", lockedFlows: 0, liteAlive: 0,
@@ -112,7 +114,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
         case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
-        case vksRunning
+        case vksRunning, loginRequired
     }
 
     init(realShape: String, lockedFlows: Int, liteAlive: Int,
@@ -124,7 +126,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
          effectiveEndpoint: String = "primary",
          desiredUpstream: String = "h2",
          upstreamKind: String = "h2",
-         vksRunning: Int = 0) {
+         vksRunning: Int = 0,
+         loginRequired: String = "") {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
         self.liteAlive = liteAlive
@@ -144,6 +147,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.desiredUpstream = desiredUpstream
         self.upstreamKind = upstreamKind
         self.vksRunning = vksRunning
+        self.loginRequired = loginRequired
     }
 
     init(from decoder: Decoder) throws {
@@ -167,6 +171,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.desiredUpstream = (try? c.decode(String.self, forKey: .desiredUpstream)) ?? "h2"
         self.upstreamKind = (try? c.decode(String.self, forKey: .upstreamKind)) ?? "h2"
         self.vksRunning = (try? c.decode(Int.self, forKey: .vksRunning)) ?? 0
+        self.loginRequired = (try? c.decode(String.self, forKey: .loginRequired)) ?? ""
     }
 }
 
