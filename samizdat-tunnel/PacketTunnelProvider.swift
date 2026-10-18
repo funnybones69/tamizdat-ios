@@ -1851,7 +1851,7 @@ misc:
         // and global queues. DateFormatter is not thread-safe; the handle
         // write serializes on a shared queue to keep App Group file writes
         // ordered and the @unchecked state safe.
-        let stamp = Self.formatterLock.withLock {
+        let stamp = Self.formatterLock.withLock { _ in
             Self.timeFormatter.string(from: Date())
         }
         let line = "\(stamp) \(message)\n"

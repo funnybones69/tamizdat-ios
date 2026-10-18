@@ -79,7 +79,7 @@ enum ExtLog {
     /// Logging must never propagate errors back to callers.
     private static func write(level: String, text: String) {
         guard let path = cachedPath else { return }
-        let stamp = formatterLock.withLock {
+        let stamp = formatterLock.withLock { _ in
             timeFormatter.string(from: Date())
         }
         let line = "\(stamp) \(level): \(text)\n"
