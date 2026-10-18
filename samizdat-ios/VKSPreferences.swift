@@ -107,10 +107,6 @@ enum VKSPreferences {
     /// ladder even when it is first in the order, so a single provider
     /// can be exercised in isolation.
     static func providerEnabled(_ provider: String) -> Bool {
-        get { providerEnabledValue(provider) }
-    }
-
-    private static func providerEnabledValue(_ provider: String) -> Bool {
         let key = "tamizdat.vks.\(provider)Enabled"
         guard let d = defaults, d.object(forKey: key) != nil else { return true }
         return d.bool(forKey: key)

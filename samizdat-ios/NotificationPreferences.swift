@@ -46,3 +46,4 @@ enum NotificationIDs {
     static let categoryIdentifier = "WHITELIST_DETECTION"
     static let detectedID = "whitelist.detected"
     static let recoveredID = "whitelist.recovered"
+}
