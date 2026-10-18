@@ -168,7 +168,6 @@ func (u pingProbeTestUpstream) LiteTransportAlive() int32  { return 0 }
 func (u pingProbeTestUpstream) RTTProbeSnapshot() tamizdat.RTTProbeStats {
 	return tamizdat.RTTProbeStats{}
 }
-func (u pingProbeTestUpstream) ServerPushedTURNCreds() *tamizdat.TURNCredsEntry { return nil }
 
 type failingProbeDialer struct{}
 
@@ -225,7 +224,7 @@ func TestPingProbeUsesActiveUpstreamNotCapturedClient(t *testing.T) {
 }
 
 // TestMaybeRequestRewireSuppressedForWhitelistCarrier pins the whitelist
-// invariant: while a VKS / VK TURN carrier owns the upstream, a probe miss must
+// invariant: while the VKS carrier owns the upstream, a probe miss must
 // never request an auto-rewire, because a rewire stops the carrier and
 // force-closes every live flow. Main keeps the auto-rewire it always had.
 func TestMaybeRequestRewireSuppressedForWhitelistCarrier(t *testing.T) {
@@ -244,15 +243,13 @@ func TestMaybeRequestRewireSuppressedForWhitelistCarrier(t *testing.T) {
 		lastRewireRequestedNanos.Store(origLast)
 	})
 
-	for _, mode := range []string{"vks", "turn"} {
-		SetUpstreamMode(mode)
-		lastRewireRequestedNanos.Store(0) // clear the 15s throttle
-		maybeRequestRewire()
-		select {
-		case <-calls:
-			t.Fatalf("mode %q: a probe miss must not auto-rewire a whitelist carrier", mode)
-		case <-time.After(150 * time.Millisecond):
-		}
+	SetUpstreamMode("vks")
+	lastRewireRequestedNanos.Store(0) // clear the 15s throttle
+	maybeRequestRewire()
+	select {
+	case <-calls:
+		t.Fatalf("a probe miss must not auto-rewire a whitelist carrier")
+	case <-time.After(150 * time.Millisecond):
 	}
 
 	// Positive control: Main must still auto-rewire, otherwise the assertions

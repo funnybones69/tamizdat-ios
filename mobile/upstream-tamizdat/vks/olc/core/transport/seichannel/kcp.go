@@ -227,6 +227,13 @@ func (p *kcpPlane) start(hdr [epochHdrLen]byte) (bool, error) {
 		if p.closed {
 			return
 		}
+		// A restart before the first Connect (a provider reconnect can fire
+		// between building the transport and connecting it) already installed
+		// a runtime; building another here would strand its reader goroutine
+		// and KCP queues for the lifetime of the process.
+		if p.get() != nil {
+			return
+		}
 		var rt *kcpRuntime
 		rt, err = startKCP(p.out, p.onData, hdr)
 		if err != nil {

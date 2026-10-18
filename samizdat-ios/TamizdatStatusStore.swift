@@ -85,12 +85,11 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     let endpointMode: String
     let effectiveEndpoint: String
     let desiredUpstream: String
-    let upstreamKind: String
-    let turnRunning: Int
-    let turnNetstackReady: Int
-
-    /// VK TURN relay session parameters available from the server.
-    let hasTURNCreds: Bool
+    /// VKS ladder carrier state from the status RPC: 1 while the native
+    /// room transport owns the upstream. Extension-ground-truth; main-app
+    /// gomobile calls hit a separate idle Go runtime, so never read Go
+    /// state directly here.
+    let vksRunning: Int
 
     static let offline = TamizdatStatusSnapshot(
         realShape: "", lockedFlows: 0, liteAlive: 0,
@@ -98,8 +97,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         pingMs: -1, pingOK: false, pingFailed: false, pingURL: "",
         rxBytes: 0, txBytes: 0, uptimeSec: 0, isRewiring: 0,
         rewireGeneration: 0, endpointMode: "primary", effectiveEndpoint: "primary",
-        desiredUpstream: "h2", upstreamKind: "h2", turnRunning: 0, turnNetstackReady: 0,
-        hasTURNCreds: false
+        desiredUpstream: "h2", upstreamKind: "h2", vksRunning: 0
     )
 
     // IPA-D21: tolerate older extension JSON (pre-D21 lacks ping*
@@ -112,9 +110,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case pingMs, pingOK, pingFailed, pingURL
         case rxBytes, txBytes, uptimeSec, isRewiring
         case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
-        case turnRunning, turnNetstackReady
-        case hasTURNCreds
-    }
+        case vksRunning
 
     init(realShape: String, lockedFlows: Int, liteAlive: Int,
          rttLiteMs: Int, rttBulkMs: Int,
@@ -125,9 +121,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
          effectiveEndpoint: String = "primary",
          desiredUpstream: String = "h2",
          upstreamKind: String = "h2",
-         turnRunning: Int = 0,
-         turnNetstackReady: Int = 0,
-         hasTURNCreds: Bool = false) {
+         vksRunning: Int = 0) {
         self.realShape = realShape
         self.lockedFlows = lockedFlows
         self.liteAlive = liteAlive
@@ -146,9 +140,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.effectiveEndpoint = effectiveEndpoint
         self.desiredUpstream = desiredUpstream
         self.upstreamKind = upstreamKind
-        self.turnRunning = turnRunning
-        self.turnNetstackReady = turnNetstackReady
-        self.hasTURNCreds = hasTURNCreds
+        self.vksRunning = vksRunning
     }
 
     init(from decoder: Decoder) throws {
@@ -171,9 +163,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         self.effectiveEndpoint = (try? c.decode(String.self, forKey: .effectiveEndpoint)) ?? "primary"
         self.desiredUpstream = (try? c.decode(String.self, forKey: .desiredUpstream)) ?? "h2"
         self.upstreamKind = (try? c.decode(String.self, forKey: .upstreamKind)) ?? "h2"
-        self.turnRunning = (try? c.decode(Int.self, forKey: .turnRunning)) ?? 0
-        self.turnNetstackReady = (try? c.decode(Int.self, forKey: .turnNetstackReady)) ?? 0
-        self.hasTURNCreds = (try? c.decode(Bool.self, forKey: .hasTURNCreds)) ?? false
+        self.vksRunning = (try? c.decode(Int.self, forKey: .vksRunning)) ?? 0
     }
 }
 
@@ -202,25 +192,6 @@ final class TamizdatStatusStore: ObservableObject {
 
     private var timer: Timer?
 
-    /// IPA-D65b: True while the main-app refresher is solving a VK
-    /// verification challenge (auto WKWebView or manual sheet). Drives a small
-    /// "Решаем капчу..." indicator under the shield. Backed by a
-    /// `Combine`-style mirror of `TURNSession paramsRefresher.isRefreshing`.
-    @Published private(set) var captchaIsActive: Bool = false
-
-    /// IPA-D65b: published mirror — true iff the cached VK TURN session params
-    /// in App Group UserDefaults are fresh enough to use without
-    /// triggering a refresh. The extension surfaces the same bit via
-    /// the status RPC (`snapshot.hasTURNSession params`); this main-app-side
-    /// mirror lets `ContentView` repaint when the cache changes while
-    /// the VPN is offline.
-    @Published private(set) var turnCredsValid: Bool = TURNCredsStore.shared.isFresh
-
-    /// Extension-ground-truth TURN runner state from the status RPC.
-    /// Main-app gomobile calls hit a separate idle Go runtime, so never
-    /// read SocksstubTURNUpstreamRunning() here.
-    var turnUpstreamRunning: Bool { snapshot.turnRunning != 0 }
-    var turnNetstackReady: Bool { snapshot.turnNetstackReady != 0 }
 
     /// Pollling cadence. 500 ms is the same value sing-box-for-apple
     /// uses for its connection-stat polling. Drop to 250 ms or lower
@@ -285,14 +256,6 @@ final class TamizdatStatusStore: ObservableObject {
             snapshot = result
         }
         applyDerivedState(snap: result)
-
-        // IPA-D65b: mirror the refresher's in-flight flag so any
-        // observer of this store can render a "Решаем капчу..." chip
-        // without separately subscribing to `TURNSession paramsRefresher`.
-        let active = TURNCredsRefresher.shared.isRefreshing
-        if captchaIsActive != active {
-            captchaIsActive = active
-        }
     }
 
     // MARK: – Derived state (IPA-D22)
@@ -328,11 +291,6 @@ final class TamizdatStatusStore: ObservableObject {
         if rxBytes != snap.rxBytes { rxBytes = snap.rxBytes }
         if txBytes != snap.txBytes { txBytes = snap.txBytes }
 
-        // VK TURN session params are written by the main app even when the VPN
-        // is offline, so mirror the local cache separately from the NE
-        // status RPC and publish changes for the TURN stat tile.
-        let freshTurnCreds = TURNCredsStore.shared.isFresh
-        if turnCredsValid != freshTurnCreds { turnCredsValid = freshTurnCreds }
         // IPA-D25: per-sample rate computation removed with the
         // bandwidth chip; `now` is no longer used here, but kept on
         // the signature for the uptime block above.
@@ -341,17 +299,15 @@ final class TamizdatStatusStore: ObservableObject {
 
     // MARK: – Formatted strings (IPA-D22)
 
-    /// "Main" / "Whitelist" / "TURN" — synced from `EndpointModeStore.current`.
-    /// When the active endpoint is .backup AND the operator picked
-    /// WhitelistMode.vkTurn, render "TURN" so the home-screen tile
-    /// reflects the actual transport — not just the abstract "we are
-    /// on the whitelist endpoint" position. Operator looking at the
-    /// tile expects to see what's carrying traffic.
+    /// "Main" / "Whitelist" / "Auto" — synced from `EndpointModeStore.current`.
+    /// Under the whitelist endpoint the carrier is always VKS now
+    /// (VK TURN was removed), so the tile reflects the endpoint
+    /// position; the home-screen status line names the live provider
+    /// separately.
     static func modeLabel(active: EndpointMode) -> String {
         switch active {
         case .primary: return "Main"
-        case .backup:
-            return WhitelistMode.current == .vkTurn ? "TURN" : "Whitelist"
+        case .backup:  return "Whitelist"
         case .auto:    return "Auto"
         }
     }

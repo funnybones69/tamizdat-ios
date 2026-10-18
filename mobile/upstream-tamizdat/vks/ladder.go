@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 )
+
 // RunLadder runs the VKS client over an ordered list of room specs, failing
 // over to the next when the active room link dies. This is the fallback
 // ladder across providers (telemost → wbstream → jazz → …). All specs share
@@ -32,16 +33,23 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 				return nil
 			}
 			// On-demand: ask the server for a room on this provider. The
-			// server creates a fresh one (WB/Jazz) or assigns an armed one,
-			// answering in-band with the room spec; the client connects to
-			// the ASSIGNED room instead of its statically configured one.
+			// server creates a fresh one (WB/Jazz) or assigns an armed/pool
+			// one, answering in-band with the room spec; the client connects
+			// to the ASSIGNED room instead of its statically configured one.
+			// An EMPTY spec means the server could not assign a room (dead
+			// provider cookies, room cap) — skip the provider so the ladder
+			// moves to the next one instead of dialing a stale assignment.
 			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-				spec, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
+				spec, _, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
 				if err != nil {
 					log.Printf("vks ladder: provider beacon for %s failed: %v", cfg.Provider, err)
 					// Fall back to the static room beacon.
 					rk := RoomWakeKey(cfg.KeyHex, cfg.Provider, cfg.RoomURL)
 					_ = SendWake(ctx, cfg.WakeDNSServer, cfg.WakeZone, rk)
+				} else if strings.TrimSpace(spec) == "" {
+					log.Printf("vks ladder: provider beacon for %s answered with an empty spec (login required: %v) — skipping the provider",
+						cfg.Provider, LoginRequiredProviders())
+					continue
 				} else {
 					log.Printf("vks ladder: server assigned room %q (provider %s)", spec, cfg.Provider)
 					if p, r, ok := splitProviderRoom(spec); ok {

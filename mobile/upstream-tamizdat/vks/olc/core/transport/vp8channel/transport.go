@@ -154,7 +154,16 @@ type streamTransport struct {
 	bindingToken uint32
 	epochMu      sync.RWMutex
 	localEpoch   uint32
-	peerEpoch    atomic.Uint32
+	// peerEpoch is the data epoch of the latched peer (client mode).
+	peerEpoch atomic.Uint32
+	// peerControlEpoch latches the server's control epoch whose frames the
+	// singleton control KCP is reassembling. The server restarts with a new
+	// epoch but the same static conv id, so its fresh segments arrive at the
+	// old KCP as stale/duplicate sequence numbers and are silently dropped -
+	// the client then never re-handshakes ("read welcome timeout"). Latching
+	// the src epoch here and restarting the plane when it changes hands the
+	// fresh stream a fresh KCP. Only the client side uses it.
+	peerControlEpoch atomic.Uint32
 
 	// lastPeerFrameNano stamps the wall-clock time of the most recent frame
 	// from the latched peer epoch, peerRestarting guards the provider rebuild
@@ -225,6 +234,7 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	tr := newStreamTransport(stream, track, cfg, opts)
 
 	if err := stream.AddTrack(track); err != nil {
+		_ = stream.Close()
 		return nil, fmt.Errorf("attach local video track: %w", err)
 	}
 	stream.SetTrackHandler(tr.handleRemoteTrack)
@@ -427,6 +437,11 @@ var _ transport.PeerResetter = (*streamTransport)(nil)
 // this before rebuilding smux so replacement handshakes are not parsed behind
 // stale bytes from streams that were active when the old session died.
 func (p *streamTransport) ResetPeer() {
+	// Forget the latched peer control epoch too: the planes restart fresh
+	// here, so the next targeted control frame must latch without firing
+	// the epoch-change restart (which would drop the in-flight
+	// CLIENT_HELLO of the very handshake attempt this reset prepares).
+	p.peerControlEpoch.Store(0)
 	p.restartPlanes()
 }
 
@@ -434,6 +449,12 @@ func (p *streamTransport) ResetPeer() {
 // controlEpochValue() derives live from the new data epoch, so the control
 // header follows automatically and the peer re-correlates the two by
 // arithmetic.
+//
+// peerControlEpoch is NOT reset: when the caller is the epoch-change latch
+// in handleControlFrame, it holds the fresh peer control epoch and resetting
+// it would make the very next frame from that epoch re-latch from zero. The
+// peerEpoch (data) latch is reset because the data plane waits for the
+// handshake's ConfirmPeer to re-latch it.
 func (p *streamTransport) restartPlanes() {
 	p.peerConfirmed.Store(false)
 	p.peerEpoch.Store(0)

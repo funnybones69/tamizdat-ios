@@ -72,6 +72,14 @@ type kcpConn struct {
 	mu        sync.Mutex
 	rDeadline time.Time
 	wDeadline time.Time
+	// writeMu serializes WriteTo against Close: a WriteTo that passed the
+	// closed check and is queued into `out` by the time Close takes the lock
+	// is already in the queue the plane's drain then reclaims; one that
+	// arrives after Close sees closed. Without the lock, a WriteTo parked
+	// between its check and its send could land in the queue after the drain
+	// - a stale-conv packet riding next to the fresh session's (the random
+	// send-vs-closed select pick made it a coin flip).
+	writeMu sync.Mutex
 }
 
 type packetBuffer struct {
@@ -227,6 +235,26 @@ func (c *kcpConn) ReadFrom(p []byte) (int, net.Addr, error) {
 }
 
 func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	// writeMu serializes the whole write against Close, so ordering is
+	// deterministic: a write queued before Close returns is reclaimed by the
+	// plane's drain (which runs after), and every write after Close fails.
+	// This matters because kcp-go keeps draining its transmit queue for a
+	// while after UDPSession.Close returns (postProcess exits only after the
+	// queue empties), so WriteTo can race the teardown. A plain select would
+	// leave the send-vs-closed race to the runtime's random pick - a coin
+	// flip that lets a stale-conv packet from the closed session land in the
+	// queue the next session - same static conv id - is already using,
+	// corrupting its re-handshake. The lock is not held for the whole tick
+	// wait: the select below still honours deadlines and close while parked.
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+
 	// Layout: [epoch header][KCP packet p][CRC32(p)]. The receiver strips the
 	// epoch header before deliver(), which then verifies and strips the CRC.
 	packet := acquirePacketBuffer(&c.outPools, epochHdrLen+len(p)+wireCRCLen)
@@ -265,7 +293,15 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 func (c *kcpConn) Close() error {
-	c.closeOnce.Do(func() { close(c.closed) })
+	c.closeOnce.Do(func() {
+		// Take writeMu so an in-flight WriteTo finishes its enqueue first:
+		// its packet lands in the queue before the plane's drain (which runs
+		// after Close returns) reclaims it, and every later WriteTo observes
+		// closed deterministically instead of winning a random select race.
+		c.writeMu.Lock()
+		defer c.writeMu.Unlock()
+		close(c.closed)
+	})
 	return nil
 }
 

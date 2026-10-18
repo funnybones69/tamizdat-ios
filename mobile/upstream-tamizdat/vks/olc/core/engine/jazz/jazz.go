@@ -19,12 +19,18 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/engine"
+	"github.com/funnybones69/tamizdat/vks/olc/core/logger"
 )
 
 const (
 	maxDataChannelMessageSize = 12288
 	sendDelay                 = 2 * time.Millisecond
 	dataChannelLabel          = "_reliable"
+	// wsWriteTimeout bounds every signaling write. gorilla has no write
+	// deadline by default: on a black-holed socket a write blocks forever
+	// with wsMu held, which takes down the keepalive that would notice the
+	// dead link, and Close's wsMu section behind it.
+	wsWriteTimeout = 15 * time.Second
 )
 
 var (
@@ -36,13 +42,13 @@ var (
 type Session struct {
 	cfg engine.Config
 
-	ws     *websocket.Conn
-	wsMu   sync.Mutex
-	pcSub  *webrtc.PeerConnection
-	pcPub  *webrtc.PeerConnection
-	dc     *webrtc.DataChannel
+	ws      *websocket.Conn
+	wsMu    sync.Mutex
+	pcSub   *webrtc.PeerConnection
+	pcPub   *webrtc.PeerConnection
+	dc      *webrtc.DataChannel
 	groupID string
-	epoch  *epochState
+	epoch   *epochState
 
 	reconnectCb atomic.Value // func()
 	shouldConn  atomic.Value // func() bool
@@ -99,9 +105,11 @@ func (s *Session) Connect(ctx context.Context) error {
 	s.setupDC(dcReady)
 
 	if err := s.dialWS(ctx); err != nil {
+		s.Close()
 		return err
 	}
 	if err := s.sendJoin(roomID, password); err != nil {
+		s.Close()
 		return err
 	}
 	s.wg.Add(1)
@@ -113,8 +121,13 @@ func (s *Session) Connect(ctx context.Context) error {
 		go func() { defer s.wg.Done(); s.pingLoop() }()
 		return nil
 	case <-time.After(30 * time.Second):
+		// A join that never opened its datachannel must not leak the PCs,
+		// the socket and the readLoop we just started: they are ours to
+		// tear down, and nothing above us knows they exist.
+		s.Close()
 		return errors.New("jazz: datachannel open timeout")
 	case <-ctx.Done():
+		s.Close()
 		return ctx.Err()
 	}
 }
@@ -129,36 +142,45 @@ func (s *Session) pingLoop() {
 		case <-s.closeCh:
 			return
 		case <-t.C:
-			s.wsMu.Lock()
-			if s.ws != nil {
-				_ = s.ws.WriteJSON(map[string]any{
-					"roomId": s.cfg.Extra["roomID"], "event": "media-in", "groupId": s.groupID,
-					"requestId": uuid.New().String(),
-					"payload": map[string]any{
-						"method":  "rtc:ping",
-						"pingReq": map[string]any{"timestamp": time.Now().UnixMilli(), "rtt": 0},
-					},
-				})
-			}
-			s.wsMu.Unlock()
+			_ = s.wsWrite(map[string]any{
+				"roomId": s.cfg.Extra["roomID"], "event": "media-in", "groupId": s.groupID,
+				"requestId": uuid.New().String(),
+				"payload": map[string]any{
+					"method":  "rtc:ping",
+					"pingReq": map[string]any{"timestamp": time.Now().UnixMilli(), "rtt": 0},
+				},
+			})
 		}
 	}
 }
 
 // pong replies to a server-initiated rtc:ping.
 func (s *Session) pong() {
+	_ = s.wsWrite(map[string]any{
+		"roomId": s.cfg.Extra["roomID"], "event": "media-in", "groupId": s.groupID,
+		"requestId": uuid.New().String(),
+		"payload": map[string]any{
+			"method":  "rtc:pong",
+			"pingRes": map[string]any{"timestamp": time.Now().UnixMilli(), "rtt": 0},
+		},
+	})
+}
+
+// wsWrite is the single writer path onto the signaling socket: it owns wsMu
+// (gorilla permits one concurrent writer), tolerates a nil/never-connected
+// socket, and bounds every write so a black-holed link cannot wedge the lock
+// forever (see wsWriteTimeout).
+func (s *Session) wsWrite(v any) error {
 	s.wsMu.Lock()
-	if s.ws != nil {
-		_ = s.ws.WriteJSON(map[string]any{
-			"roomId": s.cfg.Extra["roomID"], "event": "media-in", "groupId": s.groupID,
-			"requestId": uuid.New().String(),
-			"payload": map[string]any{
-				"method":  "rtc:pong",
-				"pingRes": map[string]any{"timestamp": time.Now().UnixMilli(), "rtt": 0},
-			},
-		})
+	defer s.wsMu.Unlock()
+	if s.ws == nil {
+		return errors.New("jazz: signaling websocket closed")
 	}
-	s.wsMu.Unlock()
+	_ = s.ws.SetWriteDeadline(time.Now().Add(wsWriteTimeout))
+	if err := s.ws.WriteJSON(v); err != nil {
+		return fmt.Errorf("jazz ws write: %w", err)
+	}
+	return nil
 }
 
 func (s *Session) dialWS(ctx context.Context) error {
@@ -193,9 +215,7 @@ func (s *Session) sendJoin(roomID, password string) error {
 			"isSilent": false,
 		},
 	}
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
-	return s.ws.WriteJSON(msg)
+	return s.wsWrite(msg)
 }
 
 func (s *Session) setupDC(dcReady chan struct{}) {
@@ -246,15 +266,21 @@ func (s *Session) deliver(data []byte) {
 }
 
 func (s *Session) readLoop() {
+	// The connection is captured once: gorilla allows a single concurrent
+	// reader, and the (single) writer path is wsWrite. gorilla tolerates a
+	// concurrent read with the writer, but Close's wsMu section runs no
+	// writes, so nothing here races it.
+	conn := s.ws
 	for {
 		var msg map[string]any
-		if err := s.ws.ReadJSON(&msg); err != nil {
+		if err := conn.ReadJSON(&msg); err != nil {
+			if !s.closed.Load() {
+				logger.Debugf("jazz: ws read error: %v", err)
+			}
 			s.queueReconnect()
 			return
 		}
-		s.wsMu.Lock()
-		_ = s.ws.SetReadDeadline(time.Now().Add(60 * time.Second))
-		s.wsMu.Unlock()
+		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		event, _ := msg["event"].(string)
 		payload, _ := msg["payload"].(map[string]any)
 		switch event {
@@ -267,7 +293,6 @@ func (s *Session) readLoop() {
 		}
 	}
 }
-
 
 func (s *Session) applyICE(payload map[string]any) {
 	cfg, _ := payload["configuration"].(map[string]any)
@@ -351,9 +376,7 @@ func (s *Session) handleICE(payload map[string]any) {
 }
 
 func (s *Session) mediaIn(method, sdp string) {
-	s.wsMu.Lock()
-	defer s.wsMu.Unlock()
-	_ = s.ws.WriteJSON(map[string]any{
+	_ = s.wsWrite(map[string]any{
 		"roomId": s.cfg.Extra["roomID"], "event": "media-in", "groupId": s.groupID,
 		"requestId": uuid.New().String(),
 		"payload": map[string]any{"method": method,
@@ -427,11 +450,14 @@ func (s *Session) Close() error {
 	if s.pcSub != nil {
 		_ = s.pcSub.Close()
 	}
-	if s.ws != nil {
-		s.wsMu.Lock()
-		_ = s.ws.Close()
-		s.wsMu.Unlock()
+	s.wsMu.Lock()
+	ws := s.ws
+	s.ws = nil
+	s.wsMu.Unlock()
+	if ws != nil {
+		_ = ws.Close()
 	}
+	s.wg.Wait()
 	s.ended("closed")
 	return nil
 }

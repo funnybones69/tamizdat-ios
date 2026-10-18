@@ -50,26 +50,29 @@ var (
 
 // Session is one MTS Link room participant connection.
 type Session struct {
-	cfg          engine.Config
-	client       *http.Client
-	playerClient *http.Client // shorter timeout keeps failed negotiations cycling fast
-	dc           *webrtc.DataChannel
-	pc           *webrtc.PeerConnection
-	pcSubs       []*webrtc.PeerConnection // per-stream player connections (subscribers)
-	subMu        sync.Mutex
-	audioTrack   *webrtc.TrackLocalStaticRTP
-	peerID       string
-	roomID       string
-	pubToken     string
+	cfg           engine.Config
+	client        *http.Client
+	playerClient  *http.Client // shorter timeout keeps failed negotiations cycling fast
+	dc            *webrtc.DataChannel
+	dcMu          sync.RWMutex // guards dc: the SFU-opened channel swap races Send/CanSend readers
+	pc            *webrtc.PeerConnection
+	pcSubs        []*webrtc.PeerConnection          // per-stream player connections (subscribers)
+	playerStreams map[string]*webrtc.PeerConnection // discovery players keyed by roster publicKey
+	subMu         sync.Mutex
+	audioTrack    *webrtc.TrackLocalStaticRTP
+	peerID        string
+	roomID        string
+	pubToken      string
 
-	reconnectCb atomic.Value
-	shouldConn  atomic.Value
-	endedCb     atomic.Value
-	closeCh     chan struct{}
-	closed      atomic.Bool
-	sendQueue   chan []byte
-	wg          sync.WaitGroup
-	epoch       *epochState // peer-addressing epochs (SFU relays frames to every participant)
+	reconnectCb  atomic.Value
+	shouldConn   atomic.Value
+	endedCb      atomic.Value
+	closeCh      chan struct{}
+	closed       atomic.Bool
+	sendQueue    chan []byte
+	sendLoopOnce sync.Once // one sendLoop serves the session; channel swaps re-read s.dc
+	wg           sync.WaitGroup
+	epoch        *epochState // peer-addressing epochs (SFU relays frames to every participant)
 
 	engine.VideoTrackState // local video tracks + remote-track handler (vp8channel transport)
 }
@@ -77,12 +80,13 @@ type Session struct {
 // New creates an MTS engine session.
 func New(ctx context.Context, cfg engine.Config) (engine.Session, error) {
 	return &Session{
-		cfg:          cfg,
-		client:       &http.Client{Timeout: 20 * time.Second},
-		playerClient: &http.Client{Timeout: 9 * time.Second},
-		closeCh:      make(chan struct{}),
-		sendQueue:    make(chan []byte, 5000),
-		epoch:        newEpochState(cfg.RequireTargetedPeer),
+		cfg:           cfg,
+		client:        &http.Client{Timeout: 20 * time.Second},
+		playerClient:  &http.Client{Timeout: 9 * time.Second},
+		closeCh:       make(chan struct{}),
+		playerStreams: map[string]*webrtc.PeerConnection{},
+		sendQueue:     make(chan []byte, 5000),
+		epoch:         newEpochState(cfg.RequireTargetedPeer),
 	}, nil
 }
 
@@ -169,6 +173,7 @@ func (s *Session) Connect(ctx context.Context) error {
 	unordered := false
 	maxRetr := uint16(0)
 	if s.dc, err = s.pc.CreateDataChannel(dataChannelLabel, &webrtc.DataChannelInit{Ordered: &unordered, MaxRetransmits: &maxRetr}); err != nil {
+		_ = s.pc.Close()
 		return fmt.Errorf("mts datachannel: %w", err)
 	}
 	log.Printf("[mts] dc created label=%s", dataChannelLabel)
@@ -178,11 +183,13 @@ func (s *Session) Connect(ctx context.Context) error {
 		log.Printf("[mts] OnDataChannel: label=%q ready=%v", dc.Label(), dc.ReadyState())
 		dc.OnOpen(func() {
 			log.Printf("[mts] SFU-opened channel %q open — switching", dc.Label())
-			if s.dc == nil || s.dc.ReadyState() != webrtc.DataChannelStateOpen {
+			s.dcMu.Lock()
+			// Adopt the SFU-opened channel only while our own is not usable.
+			if s.dc == nil || (s.dc != dc && s.dc.ReadyState() != webrtc.DataChannelStateOpen) {
 				s.dc = dc
-				s.wg.Add(1)
-				go func() { defer s.wg.Done(); s.sendLoop() }()
 			}
+			s.dcMu.Unlock()
+			s.startSendLoopOnce()
 			s.wg.Add(1)
 			go func() { defer s.wg.Done(); s.dcKeepalive() }()
 			select {
@@ -199,13 +206,17 @@ func (s *Session) Connect(ctx context.Context) error {
 	// The web client joins with audio m-lines; the SFU's datachannel handling
 	// appears to depend on a media-bundled offer. Add a silent opus track.
 	if err := s.addSilentAudio(); err != nil {
+		_ = s.pc.Close()
 		return fmt.Errorf("mts audio track: %w", err)
 	}
 	s.dc.OnOpen(func() {
-		s.wg.Add(1)
-		go func() { defer s.wg.Done(); s.sendLoop() }()
+		s.startSendLoopOnce()
 		log.Printf("[mts] sendLoop started")
-		close(dcReady)
+		select {
+		case <-dcReady:
+		default:
+			close(dcReady)
+		}
 	})
 	// Only a transport that tunnels its bytes through THIS datachannel may let
 	// a close tear the session down. The media-plane transports (seichannel,
@@ -215,7 +226,15 @@ func (s *Session) Connect(ctx context.Context) error {
 	// resulting reconnect loop is what killed mts/telemost right after the
 	// first frame. The plane has its own liveness (KCP + the transport's
 	// keepalive), so an unused channel closing is not a session verdict.
+	ownDC := s.dc
 	s.dc.OnClose(func() {
+		s.dcMu.RLock()
+		replaced := s.dc != ownDC
+		s.dcMu.RUnlock()
+		if replaced {
+			log.Printf("[mts] dc OnClose on a replaced channel — ignoring")
+			return
+		}
 		if s.cfg.OnData == nil {
 			log.Printf("[mts] dc OnClose on an unused channel (media-plane transport) - keeping the session")
 			return
@@ -242,9 +261,11 @@ func (s *Session) Connect(ctx context.Context) error {
 
 	offer, err := s.pc.CreateOffer(nil)
 	if err != nil {
+		_ = s.pc.Close()
 		return fmt.Errorf("mts offer: %w", err)
 	}
 	if err := s.pc.SetLocalDescription(offer); err != nil {
+		_ = s.pc.Close()
 		return fmt.Errorf("mts local desc: %w", err)
 	}
 
@@ -256,6 +277,7 @@ func (s *Session) Connect(ctx context.Context) error {
 	// Join: POST the full SDP offer, read the SDP answer.
 	answerSDP, err := s.join(base, roomID, userID, pubToken, joinToken, s.pc.LocalDescription().SDP)
 	if err != nil {
+		_ = s.pc.Close()
 		return err
 	}
 	s.peerID = peerIDFromSDP(answerSDP)
@@ -265,6 +287,7 @@ func (s *Session) Connect(ctx context.Context) error {
 		log.Printf("[mts] ANSWER SDP:\n%s\n[mts] OFFER SDP:\n%s", answerSDP, s.pc.LocalDescription().SDP)
 	}
 	if err := s.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: answerSDP}); err != nil {
+		_ = s.pc.Close()
 		return fmt.Errorf("mts remote desc: %w", err)
 	}
 
@@ -308,6 +331,15 @@ func (s *Session) Connect(ctx context.Context) error {
 			if ctx.Err() != nil {
 				break
 			}
+			// Skip streams the discovery loop already opened a player for;
+			// a duplicate recvonly PC for one stream is wasted negotiation
+			// and a stray track feed.
+			s.subMu.Lock()
+			dup := s.playerStreams[stream] != nil
+			s.subMu.Unlock()
+			if dup {
+				continue
+			}
 			wg.Add(1)
 			go func(name string) {
 				defer wg.Done()
@@ -344,6 +376,11 @@ func (s *Session) Connect(ctx context.Context) error {
 
 func (s *Session) fetchICEServers(base, roomID string) []webrtc.ICEServer {
 	req, _ := http.NewRequest(http.MethodGet, base+"/rtc/room/"+roomID+"/ice-settings", nil)
+	// Closed session: skip the request; it would negotiate ICE for a PC that
+	// Close has already (or is about to) release.
+	if s.closed.Load() {
+		return nil
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		return nil
@@ -479,6 +516,7 @@ func (s *Session) discoverAndSubscribe(ctx context.Context, base string) {
 		}
 	}
 }
+
 // session whose cookie header the auth provider passed via Extra.
 func (s *Session) listConferencePublicKeys() ([]string, error) {
 	esid := s.cfg.Extra["eventSessionID"]
@@ -611,7 +649,8 @@ func (s *Session) subscribePlayer(ctx context.Context, base, roomID, stream stri
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		_ = pc.Close()
-		return fmt.Errorf("player status %d: %s", resp.StatusCode, strings.TrimSpace(string(body))[:min(200, len(body))])
+		msg := strings.TrimSpace(string(body))
+		return fmt.Errorf("player status %d: %s", resp.StatusCode, msg[:min(200, len(msg))])
 	}
 	if err = pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: string(body)}); err != nil {
 		_ = pc.Close()
@@ -619,6 +658,9 @@ func (s *Session) subscribePlayer(ctx context.Context, base, roomID, stream stri
 	}
 	s.subMu.Lock()
 	s.pcSubs = append(s.pcSubs, pc)
+	if _, ok := s.playerStreams[stream]; !ok {
+		s.playerStreams[stream] = pc
+	}
 	s.subMu.Unlock()
 	log.Printf("[mts] player subscribed: stream=%s answer=%d bytes", stream, len(body))
 	return nil
@@ -682,7 +724,10 @@ func (s *Session) AddVideoTrack(track webrtc.TrackLocal) error {
 
 // Send queues bytes for the datachannel.
 func (s *Session) Send(data []byte) error {
-	if s.dc == nil || s.dc.ReadyState() != webrtc.DataChannelStateOpen {
+	s.dcMu.RLock()
+	dc := s.dc
+	s.dcMu.RUnlock()
+	if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 		return errNotReady
 	}
 	select {
@@ -708,7 +753,13 @@ func (s *Session) sendLoop() {
 			if len(frame) > 0 {
 				pfx = fmt.Sprintf(" %x", frame[:min(4, len(frame))])
 			}
-			if err := s.dc.Send(frame); err != nil {
+			s.dcMu.RLock()
+			dc := s.dc
+			s.dcMu.RUnlock()
+			if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
+				continue // no open channel: drop until a swap or reconnect replaces it
+			}
+			if err := dc.Send(frame); err != nil {
 				log.Printf("[mts] dc.Send error: %v", err)
 				s.queueReconnect()
 				return
@@ -724,8 +775,11 @@ func (s *Session) Close() error {
 		return nil
 	}
 	close(s.closeCh)
-	if s.dc != nil {
-		_ = s.dc.Close()
+	s.dcMu.RLock()
+	dc := s.dc
+	s.dcMu.RUnlock()
+	if dc != nil {
+		_ = dc.Close()
 	}
 	if s.pc != nil {
 		_ = s.pc.Close()
@@ -736,6 +790,13 @@ func (s *Session) Close() error {
 			_ = pc.Close()
 		}
 	}
+	s.pcSubs = nil
+	for _, pc := range s.playerStreams {
+		if pc != nil {
+			_ = pc.Close()
+		}
+	}
+	s.playerStreams = nil
 	s.subMu.Unlock()
 	s.ended("closed")
 	return nil
@@ -755,7 +816,10 @@ func (s *Session) WatchConnection(ctx context.Context) {
 
 // CanSend reports whether the datachannel is open and the queue has room.
 func (s *Session) CanSend() bool {
-	return s.dc != nil && s.dc.ReadyState() == webrtc.DataChannelStateOpen && len(s.sendQueue) < 4000
+	s.dcMu.RLock()
+	dc := s.dc
+	s.dcMu.RUnlock()
+	return dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen && len(s.sendQueue) < 4000
 }
 
 // SubscriberCanSend mirrors CanSend (single PC).
@@ -763,10 +827,23 @@ func (s *Session) SubscriberCanSend() bool { return s.CanSend() }
 
 // GetBufferedAmount returns the datachannel buffered bytes.
 func (s *Session) GetBufferedAmount() uint64 {
-	if s.dc != nil {
-		return s.dc.BufferedAmount()
+	s.dcMu.RLock()
+	dc := s.dc
+	s.dcMu.RUnlock()
+	if dc != nil {
+		return dc.BufferedAmount()
 	}
 	return 0
+}
+
+// startSendLoopOnce launches the session's single send loop. Both our own
+// and an SFU-opened channel feed it; the loop resolves the current channel
+// under dcMu on every send, so a swap never requires a second loop.
+func (s *Session) startSendLoopOnce() {
+	s.sendLoopOnce.Do(func() {
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.sendLoop() }()
+	})
 }
 
 // Reconnect tears down and re-establishes the SFU connection.
@@ -781,6 +858,28 @@ func (s *Session) queueReconnect() {
 	}
 	if cb, ok := s.reconnectCb.Load().(func()); ok && cb != nil {
 		cb()
+		// For a datachannel transport the dead channel IS the transport: if
+		// the rebuild above did not produce an open channel, the queue is
+		// still drained with no working lane and no one will ever re-request
+		// (Send fails, CanSend fails). Requeue until a channel opens.
+		go func() {
+			t := time.NewTimer(3 * time.Second)
+			defer t.Stop()
+			select {
+			case <-s.closeCh:
+			case <-t.C:
+				s.dcMu.RLock()
+				dc := s.dc
+				s.dcMu.RUnlock()
+				if s.closed.Load() ||
+					(s.cfg.OnData == nil && !s.WantsVideo()) ||
+					(dc != nil && dc.ReadyState() == webrtc.DataChannelStateOpen) {
+					return
+				}
+				log.Printf("[mts] channel still closed after reconnect - requeuing")
+				s.queueReconnect()
+			}
+		}()
 	}
 }
 
@@ -891,11 +990,14 @@ func (s *Session) dcKeepalive() {
 		case <-s.closeCh:
 			return
 		case <-t.C:
-			if s.dc == nil || s.dc.ReadyState() != webrtc.DataChannelStateOpen {
+			s.dcMu.RLock()
+			dc := s.dc
+			s.dcMu.RUnlock()
+			if dc == nil || dc.ReadyState() != webrtc.DataChannelStateOpen {
 				continue
 			}
 			ping[18] = byte(time.Now().Second()%10 + 48)
-			if err := s.dc.Send(ping); err != nil {
+			if err := dc.Send(ping); err != nil {
 				return
 			}
 		}

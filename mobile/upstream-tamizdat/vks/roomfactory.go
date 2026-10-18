@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,19 +22,26 @@ import (
 // answers the DNS query with the room spec in a TXT record.
 //
 // Credentials: WB Stream needs the owner Bearer token (no exp, passed as
-// -vks-token); Jazz needs nothing (fully anonymous); Telemost and MTS need
-// account cookies and are assigned from the armed pool in v1.
-
+// -vks-token); Jazz needs nothing (fully anonymous); Telemost and MTS
+// need account cookies held in the mutable CredStore (loaded from
+// -vks-yandex-cookies / -vks-mts-cookies, rotatable at runtime).
+//
 // RoomCreator creates a fresh room on the given provider and returns its
 // Config. The provider name is one of: telemost, wbstream, jazz, mts.
+//
+// Returning ErrLoginRequired marks the provider login-required (beacon
+// flags tell clients to re-upload cookies); ErrNoDynamicRoom tells the
+// caller to fall back to an armed pool room.
 type RoomCreator func(ctx context.Context, provider string) (Config, error)
 
 // NewRoomCreator builds a RoomCreator from the server config: WB uses the
-// owner token; Jazz is anonymous; MTS uses the account cookie header for the
-// full create→start→(serve)→DELETE lifecycle (recipe verified live: the
-// gw-host + form-urlencoded + quoted x-device-id pattern); Telemost returns
-// ErrNoDynamicRoom so the beacon handler falls back to an armed pool room.
-func NewRoomCreator(keyHex, ownerToken, mtsCookieHeader string) RoomCreator {
+// owner token; Jazz is anonymous; MTS and Telemost read their CURRENT
+// account cookie headers from creds at CALL time (a CredStore can be
+// rotated by the refresher or replaced by the upload endpoint while the
+// server runs — capturing strings at construction would pin dead
+// cookies). Telemost rooms land in pool (created rooms persist for
+// reuse across restarts).
+func NewRoomCreator(keyHex, ownerToken string, creds *CredStore, pool *TelemostPool) RoomCreator {
 	return func(ctx context.Context, provider string) (Config, error) {
 		cfg := Config{Provider: provider, KeyHex: keyHex}
 		switch provider {
@@ -55,15 +63,46 @@ func NewRoomCreator(keyHex, ownerToken, mtsCookieHeader string) RoomCreator {
 			}
 			cfg.RoomURL = roomID + ":" + password
 			return cfg, nil
-		case "mts":
-			if mtsCookieHeader == "" {
+		case "telemost":
+			if creds == nil {
 				return cfg, ErrNoDynamicRoom
 			}
-			eventID, esid, err := createAndStartMTS(ctx, mtsCookieHeader)
+			cookieHeader := creds.CookieHeader("telemost")
+			if cookieHeader == "" {
+				return cfg, ErrNoDynamicRoom
+			}
+			roomURL, err := createTelemostRoom(ctx, cookieHeader)
+			if err != nil {
+				if errors.Is(err, ErrLoginRequired) {
+					creds.SetLoginRequired("telemost", true)
+					return cfg, fmt.Errorf("roomfactory telemost: %w", ErrLoginRequired)
+				}
+				return cfg, fmt.Errorf("roomfactory telemost: %w", err)
+			}
+			if pool != nil {
+				pool.Add(roomURL)
+			}
+			cfg.RoomURL = roomURL
+			return cfg, nil
+		case "mts":
+			if creds == nil {
+				return cfg, ErrNoDynamicRoom
+			}
+			cookieHeader := creds.CookieHeader("mts")
+			if cookieHeader == "" {
+				return cfg, ErrNoDynamicRoom
+			}
+			eventID, esid, err := createAndStartMTS(ctx, cookieHeader)
 			if err != nil {
 				// The one-active-session limit (403 Maximum simultaneous) is
 				// expected when a meeting is already running — fall back to
-				// the armed pool room in that case.
+				// the armed pool room in that case. A dead session (401/403
+				// auth on the first lifecycle call) instead flags
+				// login-required.
+				if isMTSAuthFailure(err) {
+					creds.SetLoginRequired("mts", true)
+					return cfg, fmt.Errorf("roomfactory mts: %w", ErrLoginRequired)
+				}
 				log.Printf("roomfactory mts: %v (falling back to pool)", err)
 				return cfg, ErrNoDynamicRoom
 			}
@@ -72,7 +111,7 @@ func NewRoomCreator(keyHex, ownerToken, mtsCookieHeader string) RoomCreator {
 			cfg.CleanupHook = func() {
 				dCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				defer cancel()
-				if err := deleteMTSEvent(dCtx, mtsCookieHeader, eventID, esid); err != nil {
+				if err := deleteMTSEvent(dCtx, creds.CookieHeader("mts"), eventID, esid); err != nil {
 					log.Printf("roomfactory mts: cleanup %s: %v", eventID, err)
 				} else {
 					log.Printf("roomfactory mts: cleanup %s deleted", eventID)
@@ -83,6 +122,19 @@ func NewRoomCreator(keyHex, ownerToken, mtsCookieHeader string) RoomCreator {
 			return cfg, ErrNoDynamicRoom
 		}
 	}
+}
+
+// isMTSAuthFailure reports whether an MTS create error is an auth
+// rejection (dead cookies) rather than the expected one-active-session
+// limit. The GW host answers a dead session with 401/403 on the create
+// call of the lifecycle.
+func isMTSAuthFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "create event: 401") ||
+		strings.Contains(msg, "create event: 403")
 }
 
 // ErrNoDynamicRoom signals that the provider cannot create rooms on the fly
@@ -182,16 +234,16 @@ func doJSON[T any](ctx context.Context, req *http.Request) (T, error) {
 // surfaces as an error — the caller falls back to the armed pool.
 func createAndStartMTS(ctx context.Context, cookieHeader string) (string, string, error) {
 	H := map[string]string{
-		"Cookie":     cookieHeader,
-		"Accept":     "application/json",
-		"Referer":    "https://my.mts-link.ru/",
-		"x-platform": "Web",
-		"x-user-id":  "180602801",
-		"x-device-id": `"9e89d185-39da-438d-9f3f-d2273aac5ef7"`,
-		"x-device":   "Chrome 153.0.0.0",
+		"Cookie":        cookieHeader,
+		"Accept":        "application/json",
+		"Referer":       "https://my.mts-link.ru/",
+		"x-platform":    "Web",
+		"x-user-id":     "180602801",
+		"x-device-id":   `"9e89d185-39da-438d-9f3f-d2273aac5ef7"`,
+		"x-device":      "Chrome 153.0.0.0",
 		"x-app-version": "3.9.206",
-		"x-os":       "Windows 10.0",
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+		"x-os":          "Windows 10.0",
+		"User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
 	}
 	// 1. create the event
 	body, code, err := mtsCall(ctx, http.MethodPost, "https://gw.mts-link.ru/api/event", "type=meeting", H)
@@ -199,7 +251,7 @@ func createAndStartMTS(ctx context.Context, cookieHeader string) (string, string
 		return "", "", fmt.Errorf("create event: %d %v %s", code, err, body[:min(80, len(body))])
 	}
 	var ev struct {
-		ID json.Number `json:"id"`
+		ID   json.Number `json:"id"`
 		Data struct {
 			ID json.Number `json:"id"`
 		} `json:"data"`
@@ -249,17 +301,17 @@ func createAndStartMTS(ctx context.Context, cookieHeader string) (string, string
 // DELETE on the GW host with the same form-urlencoded pattern -> 204.
 func deleteMTSEvent(ctx context.Context, cookieHeader, eventID, esid string) error {
 	H := map[string]string{
-		"Cookie":     cookieHeader,
-		"Accept":     "application/json",
-		"Referer":    "https://my.mts-link.ru/",
-		"x-platform": "Web",
-		"x-user-id":  "180602801",
-		"x-device-id": `"9e89d185-39da-438d-9f3f-d2273aac5ef7"`,
-		"x-device":   "Chrome 153.0.0.0",
+		"Cookie":        cookieHeader,
+		"Accept":        "application/json",
+		"Referer":       "https://my.mts-link.ru/",
+		"x-platform":    "Web",
+		"x-user-id":     "180602801",
+		"x-device-id":   `"9e89d185-39da-438d-9f3f-d2273aac5ef7"`,
+		"x-device":      "Chrome 153.0.0.0",
 		"x-app-version": "3.9.206",
-		"x-os":       "Windows 10.0",
-		"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-		"content-type": "application/x-www-form-urlencoded; charset=utf-8",
+		"x-os":          "Windows 10.0",
+		"User-Agent":    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
+		"content-type":  "application/x-www-form-urlencoded; charset=utf-8",
 	}
 	_, code, err := mtsCall(ctx, http.MethodDelete, "https://gw.mts-link.ru/api/event/"+eventID, "", H)
 	if err != nil {

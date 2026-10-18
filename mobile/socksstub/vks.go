@@ -7,7 +7,7 @@
 // is stream-only: UDP follows the carrier mode like TCP does, and neither
 // has an H2 or direct fallback outside Main mode.
 //
-// Public gomobile API (mirrors the vkturn surface):
+// Public gomobile API:
 //
 //	StartVKSUpstream(specs, keyHex, shortIDHex string, listenPort int) string
 //	StopVKSUpstream() string
@@ -66,7 +66,7 @@ func (logSinkWriter) Write(p []byte) (int, error) {
 }
 
 // StartVKSUpstream starts the VKS ladder and its local SOCKS5 listener.
-// specs is a comma-separated provider:room ladder (telemost:…,wbstream:…,
+// specs is a comma-separated provider:room ladder (telemost:…,
 // jazz:…,mts:…). keyHex is the shared olcRTC wire key; shortIDHex is the
 // tamizdat master_shortid. listenPort is the loopback SOCKS5 port.
 // wakeDNS (e.g. "77.88.8.8:53") and wakeZone (e.g. "wake.example.com"),
@@ -93,8 +93,8 @@ func StartVKSUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, liste
 	if listenPort < 1024 || listenPort > 65535 {
 		return vksStatusJSON("error", "", "listenPort must be 1024..65535")
 	}
-	if listenPort == 18443 || listenPort == 9000 {
-		return vksStatusJSON("error", "", "listenPort collides with an in-process listener (18443 socksstub / 9000 VK TURN relay)")
+	if listenPort == 18443 {
+		return vksStatusJSON("error", "", "listenPort collides with the in-process socksstub listener (18443)")
 	}
 	cfgs, err := vks.ParseSpecs(specs)
 	if err != nil {
@@ -157,6 +157,16 @@ func VKSUpstreamRunning() bool {
 	vksUp.mu.Lock()
 	defer vksUp.mu.Unlock()
 	return vksUp.running
+}
+
+// VKSNativeRunning reports whether the native room-transport client is
+// installed (armed). Surfaced through the extension status RPC so the
+// main app can render the whitelist carrier state.
+func VKSNativeRunning() bool {
+	rt.mu.Lock()
+	c := rt.vksNativeClient
+	rt.mu.Unlock()
+	return c != nil
 }
 
 // VKSUpstreamStatsJSON reports the runner state for the UI.

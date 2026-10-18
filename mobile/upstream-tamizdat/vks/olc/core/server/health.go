@@ -20,6 +20,15 @@ func (s *Server) startControlLoop(ctx context.Context, session *smux.Session, st
 		Transport: s.ln, Config: s.liveness, Health: s.health,
 		LogFields: func() string { return "role=server session=" + s.currentSessionID() },
 		OnDeath: func(error) {
+			// A control loop whose session was already replaced must not
+			// act: its death is the teardown of the old pair reaching it
+			// late, not a liveness failure. Firing the reconnect chain from
+			// such a zombie would tear down the freshly installed session
+			// (and the provider with it) and churn the tunnel.
+			if s.staleControlLoop(session) {
+				logger.Debugf("server: stale control loop died - session already replaced")
+				return
+			}
 			s.health.RecordReconnect()
 			logger.Infof("server reconnect reason=liveness - reinstalling smux session")
 			tunnelcore.ResetPeer(s.ln)
@@ -29,12 +38,10 @@ func (s *Server) startControlLoop(ctx context.Context, session *smux.Session, st
 			}
 		},
 	}
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
+	s.goTracked(func() {
 		defer func() { _ = stream.Close() }()
 		runner.Run(controlCtx, stream)
-	}()
+	})
 }
 
 // Status returns the latest server-side control health snapshot.

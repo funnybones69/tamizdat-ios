@@ -155,3 +155,45 @@ enum SamizdatURLCodec {
         return out
     }
 }
+
+/// Optional VKS parameters carried by the tamizdat:// profile link:
+///   - `vkskey`    — 64-hex olcRTC wire key for the room transport;
+///   - `wakedns`   — host:port of the whitelisted resolver for the
+///                   on-demand wake beacon (e.g. 77.88.8.8:53);
+///   - `wakezone`  — DNS zone the wake server's NS is authoritative for.
+/// All three are optional; a link carrying none of them relies on the
+/// manual overrides in Settings → Дополнительно → Параметры VKS.
+extension SamizdatURLCodec {
+    struct VKSParams: Equatable {
+        let vksKeyHex: String
+        let wakeDNS: String
+        let wakeZone: String
+    }
+
+    /// Parses the optional `vkskey` / `wakedns` / `wakezone` query params
+    /// from the PRIMARY tamizdat:// URL of a combined blob. Returns nil
+    /// when the blob is not parseable; an all-empty VKSParams when the
+    /// link carries none of the params. `vkskey` is normalised to
+    /// lowercase and rejected unless it is exactly 64 hex chars (a
+    /// malformed value behaves like "absent", not like an error — the
+    /// rest of the link stays usable).
+    static func vksParams(from combined: String) -> VKSParams? {
+        let primary = split(combined).primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: primary),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "tamizdat" || scheme == "samizdat" else {
+            return nil
+        }
+        func param(_ name: String) -> String {
+            (components.queryItems?.first { $0.name.lowercased() == name }?.value ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let rawKey = param("vkskey").lowercased()
+        let keyOK = rawKey.count == 64 && rawKey.allSatisfy { $0.isHexDigit }
+        return VKSParams(
+            vksKeyHex: keyOK ? rawKey : "",
+            wakeDNS: param("wakedns"),
+            wakeZone: param("wakezone")
+        )
+    }
+}

@@ -194,13 +194,19 @@ func (s *Server) dialUDPFlow(target udpDialTarget) (net.Conn, error) {
 
 func (s *Server) socks5UDPAssociate(endpoint udpwire.Endpoint) (net.Conn, error) {
 	proxyAddr := net.JoinHostPort(s.socksProxyAddr, strconv.Itoa(s.socksProxyPort))
-	dialer := &net.Dialer{Resolver: s.resolver}
+	dialer := &net.Dialer{Resolver: s.resolver, Timeout: socksHandshakeTimeout}
 	// "tcp", not "tcp4": the proxy address is operator configuration and may
 	// be an IPv6 literal; the UDP side picks its family from the target.
 	tcpConn, err := dialer.DialContext(s.udpBaseCtx(), "tcp", proxyAddr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dial udp proxy: %w", err)
 	}
+	// This whole exchange runs on the peer's KCP read-loop goroutine (via
+	// handleDatagram), so an unbounded reply read would park that peer's
+	// bulk-data delivery for the OS TCP timeout and hold its pending-flow
+	// slot; bound it like the stream-side socks handshake.
+	_ = tcpConn.SetDeadline(time.Now().Add(socksHandshakeTimeout))
+	defer func() { _ = tcpConn.SetDeadline(time.Time{}) }()
 	if err = s.socks5Authenticate(tcpConn); err != nil {
 		_ = tcpConn.Close()
 		return nil, err
@@ -284,13 +290,19 @@ func (s *Server) releaseUDPPendingFlow() {
 }
 
 func (c *socks5UDPConn) Read(p []byte) (int, error) {
-	buf := make([]byte, udpRelayBufferSize)
+	// Reuse the caller's buffer: decode the SOCKS header in place and copy
+	// the payload into p. readUDPFlow passes a full-size buffer each call;
+	// allocating a fresh 64 KiB per datagram was pure GC churn (DNS-heavy
+	// traffic meant megabytes per second of garbage).
 	for {
-		n, err := c.udpConn.Read(buf)
+		n, err := c.udpConn.Read(p)
 		if err != nil {
 			return 0, fmt.Errorf("socks5 udp read: %w", err)
 		}
-		_, payload, err := decodeSocks5UDPPacket(buf[:n])
+		if n == 0 {
+			continue
+		}
+		_, payload, err := decodeSocks5UDPPacket(p[:n])
 		if err != nil {
 			continue
 		}

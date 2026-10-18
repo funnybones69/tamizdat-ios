@@ -62,7 +62,13 @@ type Client struct {
 	controlStop context.CancelFunc
 	sessMu      sync.RWMutex
 	reconnectMu sync.Mutex
-	health      *runtime.HealthTracker
+	// reconnectPending coalesces reconnect events: at most one teardown+
+	// rebuild cycle is pending or running at a time. The jazz/mts engines
+	// invoke the reconnect callback synchronously from provider goroutines
+	// (including from inside Reconnect), so the callback must never block
+	// on reconnectMu, and churn storms must not queue one teardown per event.
+	reconnectPending atomic.Bool
+	health           *runtime.HealthTracker
 
 	// controlLastPong is independent corroboration for the transport's fast
 	// peer-restart heuristic, not a second session reconnect detector.
@@ -95,11 +101,11 @@ type HealthFunc func(control.Status)
 
 // Config holds runtime configuration for [Run], [RunWithReady], and [RunWithAddress].
 type Config struct {
-	Transport        string
-	Provider         string
-	RoomURL          string
-	ChannelID        string
-	KeyHex           string
+	Transport string
+	Provider  string
+	RoomURL   string
+	ChannelID string
+	KeyHex    string
 	// ExitOnReconnectExhaustion (tamizdat ladder): when handshake retries
 	// are exhausted, cancel the run so the host caller (provider ladder) can
 	// advance to the next profile instead of staying a zombie listener.
@@ -109,17 +115,17 @@ type Config struct {
 	Resolver                  *net.Resolver
 	SOCKSUser                 string
 	SOCKSPass                 string
-	TransportOptions transport.Options
-	Engine           string
-	URL              string
-	Token            string
-	ProviderToken    string
-	Liveness         control.Config
-	Traffic          transport.TrafficConfig
-	DeviceID         string
-	DeviceIDPath     string
-	Claims           map[string]any
-	OnHealth         HealthFunc
+	TransportOptions          transport.Options
+	Engine                    string
+	URL                       string
+	Token                     string
+	ProviderToken             string
+	Liveness                  control.Config
+	Traffic                   transport.TrafficConfig
+	DeviceID                  string
+	DeviceIDPath              string
+	Claims                    map[string]any
+	OnHealth                  HealthFunc
 	// UDPDisabled turns the SOCKS5 UDP ASSOCIATE relay off; UDPMaxFlows caps
 	// concurrent flows (0 means the default).
 	UDPDisabled bool
@@ -150,6 +156,12 @@ func RunWithAddress(ctx context.Context, cfg Config, onReady func(actualAddr str
 	deviceID, err := resolveDeviceID(cfg.DeviceID, cfg.DeviceIDPath)
 	if err != nil {
 		return fmt.Errorf("resolve device id: %w", err)
+	}
+	if len(cfg.SOCKSUser) > 255 || len(cfg.SOCKSPass) > 255 {
+		// The user/pass subnegotiation carries each field as one length byte,
+		// so credentials longer than 255 bytes can never authenticate. Failing
+		// here beats a listener that rejects every client with auth failed.
+		return fmt.Errorf("%w (user=%d pass=%d)", ErrSOCKSCredTooLong, len(cfg.SOCKSUser), len(cfg.SOCKSPass))
 	}
 	client := &Client{
 		keys: keys, deviceID: deviceID, claims: cfg.Claims, dnsServer: cfg.DNSServer,

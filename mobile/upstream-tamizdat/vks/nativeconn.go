@@ -27,6 +27,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,8 +37,6 @@ import (
 )
 
 const (
-	// dcMaxMessage caps one datachannel payload; TLS records up to 16KB are
-	// chunked across messages and reassemble in order on the receive side.
 	// dcMaxMessage caps ONE datachannel message, tag included. Every message is
 	// prefixed with the 4-byte session tag, and the SFU drops anything over
 	// 12 KiB, so a full-size payload chunk plus its tag would be 4 bytes too
@@ -45,6 +44,13 @@ const (
 	// trip the dead-session path.
 	dcMaxMessage = 12 * 1024
 	dcTagLen     = 4
+
+	// discoveryBudget bounds the client's TMZD_HELLO discovery wait. It must
+	// stay well below the join-grace window the on-demand server gives a
+	// freshly assigned room (watchIdle join grace = IdleTimeout, default
+	// 120 s), otherwise the client gives up and evicts the shared session
+	// before the server has finished joining the room the beacon minted.
+	discoveryBudget = 30 * time.Second
 
 	// Discovery magics: client → room, server → client peer.
 	tmzdHello  = "TMZD_HELLO"
@@ -88,17 +94,20 @@ func (c *dcConn) latchPeer(peerID string) {
 // dial's stale bytes, another session) is dropped.
 func (c *dcConn) feed(data []byte) {
 	c.mu.Lock()
-	if c.sid != nil {
-		if len(data) < 4 || string(data[:4]) != string(c.sid) {
-			c.mu.Unlock()
-			return // not our session — drop
-		}
-		data = data[4:]
+	defer c.mu.Unlock()
+	// A conn with no tag is pre-discovery broadcast state: nothing on the
+	// tagged lanes belongs to it. The old code admitted ANY frame when sid
+	// was nil (tag check skipped), so another dial's tagged bytes
+	// interleaved into this conn's buffer and corrupted both streams.
+	if c.sid == nil || c.closed {
+		return
 	}
-	c.rbuf = append(c.rbuf, data...)
+	if len(data) < 4 || string(data[:4]) != string(c.sid) {
+		return // not our session — drop
+	}
+	c.rbuf = append(c.rbuf, data[4:]...)
 	close(c.notify)
 	c.notify = make(chan struct{})
-	c.mu.Unlock()
 }
 
 func (c *dcConn) Read(p []byte) (int, error) {
@@ -141,10 +150,16 @@ func (c *dcConn) Write(p []byte) (int, error) {
 	peer := c.peer
 	sid := c.sid
 	c.mu.Unlock()
-
 	// Chunk into datachannel messages, each prefixed with the session tag so a
 	// retried dial's bytes never interleave into this session's stream.
-	chunk := dcMaxMessage - dcTagLen
+	//
+	// The carrier's own framing consumes part of the engine's
+	// maxDataChannelMessageSize (jazz: DataPacket envelope + 12-byte epoch
+	// header; mts: 12-byte epoch header; jazz/mts Send also DROPS anything
+	// larger outright, so an oversized chunk is a silent stall, not an error).
+	// Budget for the worst overhead we know (envelope ~12 + epoch 12) and
+	// keep tag+chunk inside it.
+	chunk := dcMaxMessage - dcTagLen - 24
 	for off := 0; off < len(p); off += chunk {
 		end := off + chunk
 		if end > len(p) {
@@ -275,6 +290,10 @@ type dcSession struct {
 
 	everHealthy atomic.Bool
 
+	// cancelWatch stops the session's WatchConnection goroutine; nil until
+	// the join succeeds.
+	cancelWatch context.CancelFunc
+
 	mu    sync.Mutex
 	dials map[string]*dcDial
 }
@@ -317,6 +336,9 @@ func (s *dcSession) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
 		s.dead.Store(true)
+		if s.cancelWatch != nil {
+			s.cancelWatch()
+		}
 		s.mu.Lock()
 		dials := make([]*dcDial, 0, len(s.dials))
 		for _, d := range s.dials {
@@ -497,9 +519,14 @@ func dropWakeSpec(key string) {
 }
 
 // resolveWakeSpec points cfg at the beacon-assigned room, reusing the cached
-// assignment when there is one. On beacon failure it leaves the statically
-// configured room in place.
-func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) {
+// assignment when there is one. It returns false when NO room was
+// assigned (the beacon answered with an empty spec — e.g. the provider's
+// cookies are dead on the server, or the room cap is hit): the dial must
+// fail fast so NativeDialLadder moves to the next provider instead of
+// dialing a stale static room. On a beacon transport failure (no answer
+// at all) it keeps the static room (the on-demand server may simply be
+// unreachable through this resolver).
+func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) bool {
 	// Single-flight per key. The check-then-beacon below used to be racy: the
 	// first real flow and the ping prober's first probe dial at the same
 	// moment, both found the cache empty and both sent a beacon. The on-demand
@@ -510,31 +537,60 @@ func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) {
 	lk.Lock()
 	defer lk.Unlock()
 	specCacheMu.Lock()
-	spec := specCache[key]
+	spec, cached := specCache[key]
 	specCacheMu.Unlock()
-	if spec == "" {
-		s, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
+	if !cached {
+		// The beacon runs detached from the caller's dial ctx: the RTT
+		// prober dials with a 3 s budget, and a beacon cancelled mid-flight
+		// by an expiring probe discarded the room the server had just
+		// minted (the next dial re-beaconed and got another one — the
+		// observed "one dial, three rooms" storm). The beacon carries its
+		// own bounded deadline; the caller can still stop waiting via its
+		// own ctx (it just fails this dial, the assignment stays cached).
+		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 12*time.Second)
+		defer bcancel()
+		s, _, err := SendWakeProvider(bctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
 		if err != nil {
-			return
+			// Swallowing this made a dead wake channel look like a
+			// configured static room that never answers: every dial fell
+			// back silently and timed out with no attributable cause.
+			log.Printf("[native] wake beacon for %s failed: %v (falling back to the static room)",
+				cfg.Provider, err)
+			return true
 		}
 		spec = s
 		specCacheMu.Lock()
 		specCache[key] = spec
 		specCacheMu.Unlock()
 	}
+	if strings.TrimSpace(spec) == "" {
+		// The server answered explicitly "no room for this provider". Cache
+		// the refusal too: re-beaconing per dial would hammer the NS while
+		// the server is in a login-required state, and the client has the
+		// flags to prompt for re-upload (LoginRequiredProviders).
+		log.Printf("[native] wake beacon for %s answered empty spec (login required: %v) — failing the dial",
+			cfg.Provider, LoginRequiredProviders())
+		return false
+	}
 	if p, r, ok := splitProviderRoom(spec); ok {
 		cfg.Provider, cfg.RoomURL = p, r
 	}
+	return true
 }
 
 // acquireDcSession returns the cached room session for cfg, joining at most
 // once per key at a time - a burst of SOCKS dials must not start N joins.
 func acquireDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 	key := dcKey(cfg)
-	epoch := dcEpoch.Load()
 	lk := dcJoinLock(key)
 	lk.Lock()
 	defer lk.Unlock()
+	// Snapshot the epoch AFTER taking the join lock: a shutdown that ran
+	// while this dial was parked on the lock must invalidate the join we
+	// are about to start, not just one already in flight (snapshotting
+	// earlier left exactly that window — a join started under a torn-down
+	// native path and cached as a ghost).
+	epoch := dcEpoch.Load()
 	if s := dcCached(key); s != nil {
 		return s, nil
 	}
@@ -572,7 +628,6 @@ func acquireDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error)
 func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 	session.RegisterDefaults() // registers the provider auth flows (jazz/mts/wb/telemost)
 	sessCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), dcJoinTimeout)
-	defer cancel()
 
 	s := newDcSession(nil)
 	// The carrier must match the provider, exactly as the olc path does.
@@ -594,14 +649,39 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		OnPeerData:    s.onPeerData,
 	})
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("native: open %s: %w", cfg.transportName(), err)
 	}
 	s.tr = tr
 	log.Printf("[native] join %s: connecting room %s", cfg.Provider, cfg.RoomURL)
 	if err := tr.Connect(sessCtx); err != nil {
+		cancel()
 		_ = tr.Close()
 		return nil, fmt.Errorf("native: connect: %w", err)
 	}
+	cancel() // join phase done; the session itself is context-free
+
+	// Own the session lifetime: WatchConnection parks until the engine
+	// session ends (SFU closes the conference / WS / PC). Without this the
+	// native path never learned the room died: the cached session stayed
+	// "live" forever, every dial re-joined the corpse, and the SFU-side
+	// zombie participant accumulated per churn cycle. The join timeout
+	// ctx must NOT be reused here (it is already spent) — the watcher runs
+	// under the session's own lifetime and ends via s.Close.
+	watchCtx, watchCancel := context.WithCancel(context.WithoutCancel(ctx))
+	s.cancelWatch = watchCancel
+	tr.SetEndedCallback(func(reason string) {
+		log.Printf("[native] join %s: room %s ended: %s — dropping the cached session", cfg.Provider, cfg.RoomURL, reason)
+		evictDcSession(cfg, s)
+	})
+	tr.SetShouldReconnect(func() bool { return !s.dead.Load() })
+	go func() {
+		tr.WatchConnection(watchCtx)
+		// WatchConnection returns when the engine session is over or the
+		// session was closed locally: either way the cached session must
+		// not be handed to new dials.
+		evictDcSession(cfg, s)
+	}()
 	log.Printf("[native] join %s: room %s ready (session cached)", cfg.Provider, cfg.RoomURL)
 	return s, nil
 }
@@ -646,10 +726,15 @@ func NativeDialLadder(ctx context.Context, cfgs []ClientConfig) (net.Conn, error
 func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	// On-demand: point at the beacon-assigned room, reusing the cached
 	// assignment so the server mints one room per (provider, key) rather than
-	// one per dial.
+	// one per dial. An empty spec (server-side login required / room cap)
+	// fails THIS dial fast so the ladder moves on instead of joining a
+	// stale static room.
 	wakeKey := wakeSpecKey(cfg)
 	if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-		resolveWakeSpec(ctx, &cfg, wakeKey)
+		if !resolveWakeSpec(ctx, &cfg, wakeKey) {
+			return nil, fmt.Errorf("native dial: no room assigned for %s (login required: %v)",
+				cfg.Provider, LoginRequiredProviders())
+		}
 	}
 	sess, err := acquireDcSession(ctx, cfg)
 	if err != nil {
@@ -691,24 +776,44 @@ func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 	})
 
 	// Broadcast the discovery probe (magic + session tag) until the server
-	// answers (retry while ctx).
+	// answers. The wait runs on its own budget, NOT the caller's ctx: the
+	// tamizdat pool's RTT prober dials every 1 s with a 3 s timeout, so a
+	// caller deadline that expires while the on-demand server is still
+	// joining the minted room used to evict the never-healthy session and
+	// drop the wake spec — the next dial re-beaconed, got a FRESH room, and
+	// the pool re-joined in a ~1 s churn loop that never converged.
 	hello := append([]byte(tmzdHello), sid...)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	budget := time.NewTimer(discoveryBudget)
+	defer budget.Stop()
 	_ = sendTo(sess.tr, "", hello)
 	for {
 		select {
 		case <-ctx.Done():
+			// Caller gave up (RTT probe 3s, pool dial deadline): close THIS
+			// dial's conn but do NOT evict the shared session or drop the
+			// wake spec — the on-demand server may still be joining, and a
+			// later dial reuses the room. Eviction on a caller deadline was
+			// the re-beacon churn loop (one fresh room per probe).
 			_ = conn.Close()
-			// Only a session that has never served a dial is treated as dead:
-			// one dial giving up must not tear down a room other dials are using.
-			if !sess.healthy() {
-				evictDcSession(cfg, sess)
-				if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-					dropWakeSpec(wakeKey)
-				}
-			}
 			return nil, ctx.Err()
+		case <-budget.C:
+			// The full discovery budget elapsed with no TMZD_SERVER: the
+			// server peer is gone (server restart, ghost eviction, wrong
+			// room). Evict UNCONDITIONALLY — a previously-healthy session
+			// whose server vanished (engine still connected, SFU fine) is
+			// the "reconnect to the same provider never re-handshakes"
+			// wedge: HELLO retries go unanswered forever while the session
+			// keeps its healthy flag. Closing it forces a fresh join (and
+			// a fresh beacon) on the next dial.
+			_ = conn.Close()
+			evictDcSession(cfg, sess)
+			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
+				dropWakeSpec(wakeKey)
+			}
+			return nil, fmt.Errorf("native dial %s: no server in room %s after %s (discovery timeout)",
+				cfg.Provider, cfg.RoomURL, discoveryBudget)
 		case peer := <-serverPeer:
 			sess.everHealthy.Store(true)
 			if peer != "broadcast" {
@@ -736,6 +841,12 @@ type dcListener struct {
 	closed  bool
 	closeCh chan struct{}
 	addr    net.Addr
+	// idle, when > 0, releases the room after this span with zero live
+	// conns (the native analogue of Server.watchIdle: the watch server
+	// arms woken rooms with IdleTimeout, but nothing implemented it on
+	// this path, so every woken room lived forever — the server-side half
+	// of the prod RSS growth and the room leak).
+	idle time.Duration
 }
 
 // nativeListen joins the room as the host and returns a net.Listener whose
@@ -747,6 +858,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		accept:  make(chan *dcConn, 16),
 		closeCh: make(chan struct{}),
 		addr:    dcAddr("server"),
+		idle:    cfg.IdleTimeout,
 	}
 	session.RegisterDefaults() // registers the provider auth flows (jazz/mts/wb/telemost)
 
@@ -779,8 +891,37 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		return nil, fmt.Errorf("native listen: open %s: %w", cfg.transportName(), err)
 	}
 	l.tr = tr
+	// If the caller's ctx dies while we are joining the room (or Connect
+	// fails outright), the engine websocket/PeerConnections created by
+	// transport.New must be closed here: nothing else owns tr yet. The
+	// old path returned without closing it — a WS+PC+ping-goroutine leak
+	// and a ghost participant on every failed watch-server wake.
 	if err := tr.Connect(ctx); err != nil {
+		_ = tr.Close()
 		return nil, fmt.Errorf("native listen: connect: %w", err)
+	}
+	// The watch server cancels this ctx to release the room on idle; the
+	// listener (and its engine session) must die with it, or the room is
+	// leaked live: Serve sits in Accept forever and watch.Wake's teardown
+	// goroutine never returns (CleanupHook never runs, room stays joined,
+	// RSS climbs with every woken room).
+	// The engine knows when the room actually dies (conference end, WS/PC
+	// close). The native path never listened: a room the SFU kicked us out
+	// of kept its listener "live" forever (watch marks it busy, Serve hangs
+	// in Accept, the wake cache hands the corpse to later dials).
+	tr.SetEndedCallback(func(reason string) {
+		log.Printf("[native] listen %s: room %s ended: %s — closing listener", cfg.Provider, cfg.RoomURL, reason)
+		_ = l.Close()
+	})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = l.Close()
+		case <-l.closeCh:
+		}
+	}()
+	if l.idle > 0 {
+		go l.watchIdle()
 	}
 	log.Printf("[native] listen %s: room %s connected, awaiting client discovery", cfg.Provider, cfg.RoomURL)
 	return l, nil
@@ -857,3 +998,48 @@ func (l *dcListener) Close() error {
 }
 
 func (l *dcListener) Addr() net.Addr { return l.addr }
+
+// liveConns reports how many accepted conns are still open. A conn that
+// closed but has not yet been deleted from the map (its onClose runs
+// asynchronously) does not count.
+func (l *dcListener) liveConns() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, c := range l.conns {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if !closed {
+			n++
+		}
+	}
+	return n
+}
+
+// watchIdle closes the listener once it has served zero live conns for the
+// whole idle span — the native counterpart of Server.watchIdle. Without it
+// a woken room (native serve) never released: Serve blocks in Accept
+// forever, the engine session/PCs/WS leak, and every re-wake stacks another
+// room on top.
+func (l *dcListener) watchIdle() {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	emptySince := time.Now()
+	for {
+		select {
+		case <-l.closeCh:
+			return
+		case <-t.C:
+			if l.liveConns() == 0 {
+				if time.Since(emptySince) >= l.idle {
+					log.Printf("[native] listen: room idle for %s — releasing", l.idle)
+					_ = l.Close()
+					return
+				}
+			} else {
+				emptySince = time.Now()
+			}
+		}
+	}
+}

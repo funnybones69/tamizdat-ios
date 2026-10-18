@@ -1,12 +1,12 @@
 import SwiftUI
-import UIKit
 
-/// Form for entering the Telegram Bot API token + chat ID used by the
-/// "Telegram" button in LogView. Stored in `UserDefaults` (not Keychain
-/// — these are debug session parameters, not user secrets, and we want them
-/// trivially clearable).
+/// Telegram для логов — экран в стиле дизайн-токенов (Geist, ThemeTokens).
+/// Токен бота + chat id используются кнопкой «Telegram» на экране логов.
+/// Хранится в UserDefaults (это отладочные креды, не секреты профиля —
+/// и их можно мгновенно очистить).
 struct TelegramSettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.themeTokens) private var theme
 
     @State private var botToken: String = TelegramReporter.botToken
     @State private var chatID:   String = TelegramReporter.chatID
@@ -17,82 +17,120 @@ struct TelegramSettingsView: View {
 
         var label: String {
             switch self {
-            case .idle:    return "Send test message"
-            case .sending: return "Sending…"
-            case .ok:      return "Sent ✓"
-            case .failed:  return "Failed"
+            case .idle:    return "Отправить тест"
+            case .sending: return "Отправка…"
+            case .ok:      return "Отправлено ✓"
+            case .failed:  return "Ошибка"
             }
         }
     }
 
     var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    SecureField("Bot token", text: $botToken)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
-                    TextField("Chat ID", text: $chatID)
-                        .keyboardType(.numbersAndPunctuation)
-                        .textInputAutocapitalization(.never)
-                        .disableAutocorrection(true)
-                } header: {
-                    Text("Telegram destination")
-                } footer: {
-                    Text("""
-                        Used by the "Telegram" button in Logs. Stored only on this device. \
-                        Get a token from @BotFather; chat ID is the destination user/group/channel ID. \
-                        For a private chat, send any message to your bot then visit \
-                        https://api.telegram.org/bot<TOKEN>/getUpdates to find the chat id.
-                        """)
-                        .font(.caption)
-                }
+        ZStack {
+            ThemeBackground(theme: theme)
 
-                if let status = footerStatus {
-                    Section {
-                        Text(status)
-                            .font(.caption)
-                            .foregroundStyle(testStatus == .ok ? .green : .red)
-                    }
-                }
+            ScrollView {
+                VStack(spacing: 0) {
+                    CardContainer(padding: 16) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack(spacing: 12) {
+                                IconCard(systemName: "paperplane.fill",
+                                         bg: theme.blueDim, fg: theme.blue)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Telegram для логов")
+                                        .font(.geist(.medium, size: 16))
+                                        .tracking(-0.16)
+                                        .foregroundStyle(theme.text)
+                                    Text("Токен бота и chat id для отладки")
+                                        .font(.geist(.regular, size: 12.5))
+                                        .foregroundStyle(theme.textDim)
+                                }
+                                Spacer()
+                            }
 
-                Section {
-                    Button {
-                        sendTest()
-                    } label: {
-                        Label(testStatus.label,
-                              systemImage: testStatus == .ok
-                                ? "checkmark.circle"
-                                : "paperplane")
-                    }
-                    .disabled(testStatus == .sending || !looksValid)
+                            telegramField("Токен бота", placeholder: "123456:ABC-DEF…", text: $botToken, secure: true)
+                            telegramField("Chat ID", placeholder: "-1001234567890", text: $chatID, secure: false)
 
-                    Button(role: .destructive) {
-                        TelegramReporter.botToken = ""
-                        TelegramReporter.chatID = ""
-                        botToken = ""
-                        chatID = ""
-                        testStatus = .idle
-                    } label: {
-                        Label("Clear", systemImage: "trash")
+                            Text("Используется кнопкой «Telegram» в логах. Хранится только на этом устройстве. Токен выдаёт @BotFather; для личного чата отправьте боту любое сообщение и возьмите chat id из https://api.telegram.org/bot<TOKEN>/getUpdates.")
+                                .font(.geistMono(.regular, size: 10))
+                                .foregroundStyle(theme.textDim)
+
+                            if let status = footerStatus {
+                                Text(status)
+                                    .font(.geistMono(.regular, size: 11))
+                                    .foregroundStyle(testStatus == .ok ? theme.mint : theme.red)
+                            }
+
+                            Button(action: sendTest) {
+                                Text(testStatus.label)
+                                    .font(.geist(.semibold, size: 13))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(theme.mint)
+                                    .foregroundStyle(theme.mintInk)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(testStatus == .sending || !looksValid)
+
+                            Button(action: clear) {
+                                Text("Очистить")
+                                    .font(.geist(.semibold, size: 13))
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(theme.chip)
+                                    .foregroundStyle(theme.red)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
-                }
-            }
-            .navigationTitle("Telegram")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        TelegramReporter.botToken = botToken
-                        TelegramReporter.chatID   = chatID
-                        dismiss()
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+
+                    Button(action: save) {
+                        Text("Сохранить")
+                            .font(.geist(.semibold, size: 13))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 10)
+                            .background(looksValid ? theme.mint : theme.chip)
+                            .foregroundStyle(looksValid ? theme.mintInk : theme.textMuted)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
                     }
+                    .buttonStyle(.plain)
                     .disabled(!looksValid)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+
+                    Color.clear.frame(height: 24)
                 }
             }
+        }
+        .preferredColorScheme(theme.isDark ? .dark : .light)
+        .navigationTitle("Telegram")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private func telegramField(_ label: String, placeholder: String, text: Binding<String>, secure: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.geist(.medium, size: 12))
+                .foregroundStyle(theme.textMuted)
+            Group {
+                if secure {
+                    SecureField(placeholder, text: text)
+                } else {
+                    TextField(placeholder, text: text)
+                }
+            }
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled(true)
+            .font(.geistMono(.regular, size: 12.5))
+            .foregroundStyle(theme.text)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(theme.chip)
+            .clipShape(RoundedRectangle(cornerRadius: 10))
         }
     }
 
@@ -107,7 +145,7 @@ struct TelegramSettingsView: View {
 
     private var footerStatus: String? {
         if case .failed(let msg) = testStatus { return msg }
-        if case .ok = testStatus { return "Test message delivered." }
+        if case .ok = testStatus { return "Тестовое сообщение доставлено." }
         return nil
     }
 
@@ -126,5 +164,19 @@ struct TelegramSettingsView: View {
                 testStatus = .failed(err.errorDescription ?? "?")
             }
         }
+    }
+
+    private func clear() {
+        TelegramReporter.botToken = ""
+        TelegramReporter.chatID = ""
+        botToken = ""
+        chatID = ""
+        testStatus = .idle
+    }
+
+    private func save() {
+        TelegramReporter.botToken = botToken
+        TelegramReporter.chatID   = chatID
+        dismiss()
     }
 }

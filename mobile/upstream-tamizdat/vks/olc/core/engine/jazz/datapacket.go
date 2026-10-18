@@ -64,7 +64,10 @@ func parseFields(data []byte, target int) ([]byte, bool) {
 		wireType := int(tagVal & 0x07)
 		fieldData, ok := handleWire(r, wireType, len(data))
 		if !ok {
-			return result, len(result) > 0
+			// Malformed wire data: the frame cannot be trusted, so the
+			// parse fails closed instead of returning an earlier partial
+			// field as if it were the packet.
+			return nil, false
 		}
 		if fieldNumber == target && wireType == 2 {
 			result = fieldData

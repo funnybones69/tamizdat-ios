@@ -36,6 +36,12 @@ const (
 	defaultConnectTimeout = 30 * time.Second
 	sampleBuilderMaxLate  = 128
 
+	// peerRestartGrace is how long the latched peer must be silent before a
+	// frame from a different epoch is read as the peer returning with a
+	// fresh epoch (a server restart re-handshake). The peer emits an access
+	// unit every frame tick even with no data, so a few missed beats is a
+	// confident "the latched peer is gone and a fresh one took its place".
+	peerRestartGrace = 6 * time.Second
 	// outboundQueueSize bounds KCP packets waiting for the paced writer.
 	outboundQueueSize = 1536
 	// inboundQueueSize bounds reassembled KCP datagrams inside kcpConn.
@@ -62,11 +68,33 @@ type streamTransport struct {
 	track  *webrtc.TrackLocalStaticSample
 	onData func([]byte)
 
+	// onPeerData is the server-mode per-peer callback. serverMode records
+	// which side of the link this is: the multi-peer (server) side keeps one
+	// session per remote epoch; the single-peer (client) side latches onto
+	// exactly one. Routing decisions read this flag instead of re-deriving
+	// the mode from a callback being nil.
+	onPeerData func(peerID string, data []byte)
+	serverMode bool
+
 	data       *kcpPlane
 	localEpoch atomic.Uint32
 	peerEpoch  atomic.Uint32
 
-	writeMu         sync.Mutex
+	// peerMu serializes latch updates (acceptPeerEpoch) against
+	// restartPlane, so a reconnect callback cannot interleave with an
+	// inbound frame's check-then-latch sequence. lastPeerFrameNano stamps
+	// the wall-clock time of the most recent frame accepted from the
+	// latched peer; a different epoch is only re-latched once that silence
+	// exceeds peerRestartGrace.
+	peerMu            sync.Mutex
+	lastPeerFrameNano atomic.Int64
+
+	// sampleWriter, when set, replaces the real track.WriteSample call.
+	// Tests inject a writer here to observe the exact byte stream that
+	// reaches the track and to run without a pion track. It must consume
+	// data before returning. Always invoked under writeMu.
+	sampleWriter func([]byte) bool
+	writeMu      sync.Mutex
 	closeCh         chan struct{}
 	writerDone      chan struct{}
 	closed          atomic.Bool
@@ -81,6 +109,14 @@ type streamTransport struct {
 	batchSize     int
 	bindingToken  uint32
 	shaper        *transport.Shaper
+
+	// peers holds one session per remote epoch in server mode. Each session
+	// owns an isolated KCP plane; the shared writer drains its packets
+	// multiplexed by the epoch headers. Idle sessions are reclaimed by
+	// sweepPeers; without that a client rotating its epoch on every
+	// reconnect would strand goroutines and queues for the lifetime of the
+	// process, and a hostile room could grow the table without bound.
+	peers peerTable
 }
 
 // New creates a seichannel transport backed by a provider.
@@ -120,6 +156,7 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	tr := newStreamTransport(stream, track, cfg, opts)
 
 	if err := stream.AddTrack(track); err != nil {
+		_ = stream.Close()
 		return nil, fmt.Errorf("attach local video track: %w", err)
 	}
 	stream.SetTrackHandler(tr.handleRemoteTrack)
@@ -139,6 +176,8 @@ func newStreamTransport(
 		stream:        stream,
 		track:         track,
 		onData:        cfg.OnData,
+		onPeerData:    cfg.OnPeerData,
+		serverMode:    cfg.OnPeerData != nil,
 		closeCh:       closeCh,
 		writerDone:    make(chan struct{}),
 		frameInterval: time.Second / time.Duration(opts.FPS),
@@ -152,9 +191,17 @@ func newStreamTransport(
 	return tr
 }
 
-// epochHeader builds the current outbound frame header: our epoch as src and
-// the latched peer epoch (0 = broadcast) as dst.
+// epochHeader builds the current outbound frame header for the shared plane:
+// our epoch as src and the latched peer epoch (0 = broadcast) as dst. In
+// server mode the shared plane serves room-wide traffic only (every
+// peer-addressed frame goes through the peer's own plane, which is stamped
+// with that peer's epoch at creation), so it always broadcasts - a latched
+// dst would send room frames to one client and starve the rest.
+
 func (p *streamTransport) epochHeader() [epochHdrLen]byte {
+	if p.serverMode {
+		return buildEpochHeaderTo(p.bindingToken, p.localEpoch.Load(), 0)
+	}
 	return buildEpochHeaderTo(p.bindingToken, p.localEpoch.Load(), p.peerEpoch.Load())
 }
 
@@ -176,9 +223,56 @@ func (p *streamTransport) Connect(ctx context.Context) error {
 	p.startWriter.Do(func() {
 		p.writerUp.Store(true)
 		go p.writerLoop()
+
+		// Only the multi-peer (server) side accumulates per-peer sessions,
+		// so only that side needs the reaper.
+		if p.serverMode {
+			go p.sweepPeers()
+		}
 	})
 
 	return nil
+}
+
+// SendTo transmits data to a specific peer identified by its epoch hex
+// string, through that peer's own KCP plane (which addresses its frames to
+// the peer's epoch). Mirrors the vp8channel peer routing surface so the olc
+// server's per-peer smux sessions work identically over both carriers.
+func (p *streamTransport) SendTo(peerID string, data []byte) error {
+	return p.shaper.Send(func(payload []byte) error {
+		return p.sendToPeer(peerID, payload)
+	}, data)
+}
+
+// sendToPeer resolves peerID and sends through that peer's KCP plane, when
+// the peer is known. An unknown peer fails with ErrTransportClosed - the
+// same shape vp8channel gives - so the upper layer can drop or retry.
+func (p *streamTransport) sendToPeer(peerID string, data []byte) error {
+	if p.closed.Load() {
+		return ErrTransportClosed
+	}
+	epoch, err := parsePeerID(peerID)
+	if err != nil {
+		return fmt.Errorf("seichannel: invalid peerID %q: %w", peerID, err)
+	}
+	sess := p.peers.get(epoch)
+	if sess == nil {
+		return ErrTransportClosed
+	}
+	if err := sess.data.send(data); err != nil {
+		if errors.Is(err, ErrKCPMessageTooLarge) {
+			return err
+		}
+		return fmt.Errorf("kcp send: %w", err)
+	}
+	return nil
+}
+
+// SupportsPeerRouting reports whether this transport can address individual
+// peers. Only the multi-peer (server) side can: the client side latches a
+// single peer.
+func (p *streamTransport) SupportsPeerRouting() bool {
+	return p.serverMode
 }
 
 // Send transmits data through the transport.
@@ -205,6 +299,7 @@ func (p *streamTransport) Close() error {
 	if p.closed.CompareAndSwap(false, true) {
 		close(p.closeCh)
 		p.data.close()
+		p.peers.closeAll()
 		if p.writerUp.Load() {
 			<-p.writerDone
 		}
@@ -238,10 +333,19 @@ func (p *streamTransport) ResetPeer() {
 }
 
 func (p *streamTransport) restartPlane() {
+	p.peerMu.Lock()
+	defer p.peerMu.Unlock()
 	p.peerReady.Store(false)
 	p.peerEpoch.Store(0)
+	p.lastPeerFrameNano.Store(0)
 	p.localEpoch.Store(randomEpoch())
 	p.data.restart(p.epochHeader())
+	// Per-peer sessions are deliberately kept, exactly like vp8channel: a
+	// peer plane's KCP state is keyed by the client's epoch, which a server
+	// restart does not change, so the session stays usable; stale planes
+	// (whose headers still carry the old local epoch as src) are reclaimed
+	// by the idle sweep, and a reconnecting client's frames mint fresh
+	// sessions under the new epoch.
 }
 
 // CanSend reports whether transport is ready for sending.
@@ -279,11 +383,7 @@ func (p *streamTransport) writerLoop() {
 		case <-p.closeCh:
 			return
 		case <-ticker.C:
-			var ok bool
-			scratch, pending, ok = p.writeTick(scratch, pending)
-			if !ok {
-				return
-			}
+			scratch, pending = p.writeTick(scratch, pending)
 		}
 	}
 }
@@ -292,51 +392,78 @@ func (p *streamTransport) writerLoop() {
 // queued, otherwise a bare decodable access unit that keeps the SFU's decoder
 // alive. A batch left over from the previous tick is written first so packets
 // are never dropped on the floor.
-func (p *streamTransport) writeTick(scratch []byte, pending *packetBuffer) ([]byte, *packetBuffer, bool) {
+//
+// A failed WriteSample does NOT stop the loop: the track writes fail during
+// every transient provider hiccup (PC reconnecting, SFU resetting the
+// transport), and the writer dying there strands every later KCP packet in
+// the outbound queue while the session looks alive from above - KCP keeps
+// retransmitting into a queue nobody drains. Instead the sample (and its
+// leftover batch) is retried on the next tick.
+func (p *streamTransport) writeTick(scratch []byte, pending *packetBuffer) ([]byte, *packetBuffer) {
 	var sample []byte
 	if pending != nil {
-		sample, pending = p.batchSampleFrom(nil, pending, sample)
+		sample, pending = p.batchSampleFrom(pending, sample)
 	} else {
 		select {
 		case first := <-p.data.out:
-			sample, pending = p.batchSampleFrom(nil, first, sample)
+			sample, pending = p.batchSampleFrom(first, sample)
 		default:
 			// Idle: a valid SPS+PPS+IDR access unit with no SEI.
 			scratch = buildVideoAccessUnitInto(scratch[:0], nil)
-			if !p.writeSample(scratch) {
-				return scratch, nil, false
-			}
-			return scratch, nil, true
+			p.writeSample(scratch)
+			return scratch, nil
 		}
 	}
 
 	scratch = buildVideoAccessUnitInto(scratch[:0], sample)
 	if !p.writeSample(scratch) {
-		if pending != nil {
-			pending.release()
-		}
-		return scratch, nil, false
+		// Keep the leftover batch for the next tick; the scratch is
+		// rebuilt from it, so nothing is lost.
+		return scratch, pending
 	}
-	return scratch, pending, true
+	return scratch, pending
 }
 
 // writeSample serializes every WriteSample call on the shared video track
-// behind a single mutex: pion's TrackLocalStaticSample.WriteSample is not safe
-// for concurrent use, and interleaved RTP sequence numbers make the receiver's
-// sample builder discard frames.
+// behind a single mutex: pion's TrackLocalStaticSample.WriteSample is not
+// safe for concurrent use, and interleaved RTP sequence numbers make the
+// receiver's sample builder discard frames. sampleWriter, when set, replaces
+// the real track write - tests inject a writer here to observe the exact
+// byte stream that reaches the track. It must consume data before
+// returning, matching TrackLocalStaticSample.WriteSample. Always invoked
+// under writeMu.
 func (p *streamTransport) writeSample(data []byte) bool {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+
+	if p.sampleWriter != nil {
+		return p.sampleWriter(data)
+	}
 	if err := p.track.WriteSample(media.Sample{Data: data, Duration: p.frameInterval}); err != nil {
 		return false
 	}
 	return true
 }
 
-// batchSampleFrom coalesces up to batchSize KCP packets into one SEI payload,
-// bounded by defaultMaxPayloadSize. A leftover buffer is returned so the next
-// tick writes it instead of dropping it.
-func (p *streamTransport) batchSampleFrom(_ []byte, first *packetBuffer, sample []byte) ([]byte, *packetBuffer) {
+// batchSampleFrom coalesces up to batchSize KCP packets from the shared
+// plane's queue into one SEI payload, bounded by defaultMaxPayloadSize. A
+// leftover buffer is returned so the next tick writes it instead of
+// dropping it.
+func (p *streamTransport) batchSampleFrom(first *packetBuffer, sample []byte) ([]byte, *packetBuffer) {
+	return p.batchSampleFromQueue(p.data.out, first, sample)
+}
+
+// batchSampleFromQueue is batchSampleFrom over any outbound queue. The
+// per-peer writer pumps drain their own queues through it, so a peer's
+// downlink batches exactly like the shared client->server path. Only
+// packets from the same queue are batched together: every packet in one
+// queue carries the same epoch header (the peer's), so the receiver's
+// header check applies to the whole batch.
+func (p *streamTransport) batchSampleFromQueue(
+	src <-chan *packetBuffer,
+	first *packetBuffer,
+	sample []byte,
+) ([]byte, *packetBuffer) {
 	if len(first.data) <= epochHdrLen || p.batchSize <= 1 {
 		out := append(sample, first.data...)
 		first.release()
@@ -350,7 +477,7 @@ func (p *streamTransport) batchSampleFrom(_ []byte, first *packetBuffer, sample 
 
 	for packets := 1; packets < p.batchSize; packets++ {
 		select {
-		case frame, ok := <-p.data.out:
+		case frame, ok := <-src:
 			if !ok {
 				return sample, nil
 			}
@@ -440,14 +567,18 @@ func (p *streamTransport) handleIncomingPayload(payload []byte) {
 		return // addressed to another participant
 	}
 
-	if p.peerEpoch.Load() != src {
-		p.peerEpoch.Store(src)
-		if rt := p.data.get(); rt != nil {
-			rt.setHeader(p.epochHeader())
-		}
-		if !p.peerReady.Load() {
-			logger.Infof("seichannel: peer latched epoch=0x%08x", src)
-		}
+	if p.serverMode {
+		// Server mode: every sender epoch is its own client. Route the
+		// KCP payload to that peer's plane - created on demand - and
+		// never mix packets from different epochs into one KCP state
+		// machine (their sequence spaces are unrelated). The dst filter
+		// above already dropped frames addressed to other participants.
+		p.handlePeerFrame(src, payload[epochHdrLen:])
+		return
+	}
+
+	if !p.acceptPeerEpoch(src, dst) {
+		return
 	}
 	p.peerReady.Store(true)
 	if n := p.diagAccepted.Add(1); n <= 10 {
@@ -459,4 +590,69 @@ func (p *streamTransport) handleIncomingPayload(payload []byte) {
 		return
 	}
 	splitKCPPayload(payload[epochHdrLen:], rt.deliver)
+}
+
+// acceptPeerEpoch updates the peer latch for a frame from epoch src and
+// reports whether its payload should be delivered.
+//
+// A returning peer carries a fresh epoch and a fresh KCP state machine whose
+// sequence numbering starts from zero; the old plane's receive sequence has
+// already advanced past it, so every packet the restarted peer sends is
+// silently discarded as a stale retransmit and the replacement handshake
+// never completes - the "read welcome timeout" after a server restart. The
+// KCP plane therefore has to be replaced together with the latch.
+//
+// A frame addressed to our epoch proves the sender knows this session, so it
+// re-latches immediately. A broadcast from a different epoch is only trusted
+// once the latched peer has been silent past peerRestartGrace, so an
+// unrelated participant sharing the room cannot steal the session while our
+// peer is live.
+func (p *streamTransport) acceptPeerEpoch(src, dst uint32) bool {
+	p.peerMu.Lock()
+	defer p.peerMu.Unlock()
+
+	prev := p.peerEpoch.Load()
+	switch {
+	case prev == src:
+		// Already latched; refresh the liveness stamp below.
+	case prev == 0:
+		p.latchPeerLocked(src)
+	default:
+		targeted := dst == p.localEpoch.Load()
+		last := p.lastPeerFrameNano.Load()
+		silent := last == 0 || time.Since(time.Unix(0, last)) >= peerRestartGrace
+		if !targeted && !silent {
+			if n := p.diagRejected.Add(1); n <= 5 {
+				logger.Infof("seichannel: foreign epoch %08x while peer %08x is live - dropped",
+					src, prev)
+			}
+			return false
+		}
+		logger.Infof("seichannel: peer restart detected old=0x%08x new=0x%08x - restarting KCP plane",
+			prev, src)
+		p.relatchPeerLocked(src)
+	}
+	p.lastPeerFrameNano.Store(time.Now().UnixNano())
+	return true
+}
+
+func (p *streamTransport) latchPeerLocked(src uint32) {
+	p.peerEpoch.Store(src)
+	if rt := p.data.get(); rt != nil {
+		rt.setHeader(p.epochHeader())
+	}
+	logger.Infof("seichannel: peer latched epoch=0x%08x", src)
+}
+
+// relatchPeerLocked installs src as the peer with a fresh KCP state machine,
+// dropping the old plane's queues and sequence state so the returning peer's
+// from-zero packets are not read as stale retransmits.
+func (p *streamTransport) relatchPeerLocked(src uint32) {
+	p.peerReady.Store(false)
+	p.peerEpoch.Store(0)
+	p.data.restart(p.epochHeader())
+	p.peerEpoch.Store(src)
+	if rt := p.data.get(); rt != nil {
+		rt.setHeader(p.epochHeader())
+	}
 }

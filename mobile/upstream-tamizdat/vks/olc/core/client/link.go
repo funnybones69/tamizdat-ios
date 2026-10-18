@@ -205,8 +205,37 @@ func tryHandshake(
 }
 
 func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
+	if ctx.Err() != nil {
+		return
+	}
+	if !c.reconnectPending.CompareAndSwap(false, true) {
+		// A teardown/rebuild is already running or queued. The engines that
+		// call this callback do so from provider goroutines (some
+		// synchronously from inside Reconnect), so blocking here would
+		// deadlock the client against itself. Coalesce instead: the cycle
+		// in flight tears down whatever session exists when it runs, which
+		// covers this event's intent.
+		return
+	}
+	// Run the cycle off the caller's goroutine. The engines invoke this
+	// callback synchronously from their own provider paths (mts/jazz
+	// queueReconnect call cb() inline), so doing the teardown - which
+	// closes the datachannel and can retrigger their reconnect machinery -
+	// on the caller's stack risks re-entrant deadlock.
+	c.goTracked(func() {
+		defer c.reconnectPending.Store(false)
+		c.runReconnectCycle(ctx, cfg, cancel, reason)
+		// If churn events arrived while this cycle ran, they were coalesced
+		// away by the pending flag. The session state after this cycle
+		// reflects the latest teardown, so no deferred re-run is needed.
+	})
+}
+
+// runReconnectCycle tears the old session down and rebuilds it. reconnectMu
+// serializes overlapping cycles; it is taken and released here, NOT in
+// handleReconnect, so the engine callback path never blocks on it.
+func (c *Client) runReconnectCycle(ctx context.Context, cfg Config, cancel context.CancelFunc, reason string) {
 	c.reconnectMu.Lock()
-	defer c.reconnectMu.Unlock()
 	c.health.RecordReconnect()
 	logger.Infof("client reconnect reason=%s - tearing down smux session", reason)
 	tunnelcore.ResetPeer(c.ln)
@@ -238,7 +267,20 @@ func (c *Client) handleReconnect(ctx context.Context, cfg Config, cancel context
 	c.session, c.controlSess = nil, nil
 	c.controlStrm, c.controlStop = nil, nil
 	c.sessionID = ""
+	// The old session's last pong is not evidence about the next one: without
+	// this reset, watchControlStaleness keeps vouching for a dead session
+	// (link healthy) through the whole rebuild, which blinds the transport's
+	// peer-restart corroborator exactly when it is needed. A zero time reads
+	// as "no pong yet" (time.Since(zero) exceeds any threshold).
+	c.controlLastPong.Store(time.Time{})
 	c.sessMu.Unlock()
+	// Released before the engine rebuild and retry loop: the liveness path
+	// calls c.ln.Reconnect below, and the jazz/mts engines answer that by
+	// synchronously invoking the reconnect callback - which re-enters
+	// handleReconnect. With reconnectMu held that re-entry deadlocked the
+	// whole client on its first liveness rebuild. The pending flag above
+	// makes the re-entry a no-op instead.
+	c.reconnectMu.Unlock()
 	if oldControlStop != nil {
 		oldControlStop()
 	}
@@ -288,8 +330,6 @@ func (c *Client) scheduleLivenessFallback(ctx context.Context, cfg Config, cance
 			return
 		}
 		logger.Warnf("client reconnect: no provider callback within %s - re-establishing session", delay)
-		c.reconnectMu.Lock()
-		defer c.reconnectMu.Unlock()
 		if ctx.Err() == nil && !c.sessionEstablished() {
 			c.retryHandshake(ctx, cfg, cancel, reconnectFallback)
 		}
@@ -307,10 +347,26 @@ func (c *Client) retryHandshake(ctx context.Context, cfg Config, cancel context.
 		initialDelay = 300 * time.Millisecond
 		maxDelay     = 5 * time.Second
 	)
+	// Only one retry loop may run at a time: two interleaved loops take
+	// turns tearing down the session the other just installed. The lock is
+	// released between attempts so a fresh reconnect event can still be
+	// serviced promptly instead of queueing behind this whole loop.
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
 	delay := initialDelay
 	maxAttempts := maxHandshakeAttempts(reason)
 	for attempt := 1; ; attempt++ {
 		if ctx.Err() != nil {
+			return
+		}
+		// A concurrent cycle (liveness fallback, another provider event) has
+		// rebuilt the session since this loop started waiting: a fresh
+		// attempt here would tear that healthy session down and re-handshake
+		// over it - the churn the coalescing in handleReconnect exists to
+		// prevent, and the fallback path would trigger exactly this by
+		// racing the provider callback it was waiting for.
+		if attempt > 1 && c.sessionEstablished() {
+			logger.Infof("client reconnect: session re-established by a concurrent attempt - aborting retry loop (reason=%s)", reason)
 			return
 		}
 		logger.Infof("client reconnect attempt=%d reason=%s", attempt, reason)
@@ -326,11 +382,14 @@ func (c *Client) retryHandshake(ctx context.Context, cfg Config, cancel context.
 			logger.Warnf("client reconnect: exhausted %d handshake attempts (reason=%s) - keeping listener up", attempt, reason)
 			return
 		}
+		c.reconnectMu.Unlock()
 		select {
 		case <-ctx.Done():
+			c.reconnectMu.Lock()
 			return
 		case <-time.After(delay):
 		}
+		c.reconnectMu.Lock()
 		if delay < maxDelay {
 			delay *= 2
 			if delay > maxDelay {
@@ -357,6 +416,16 @@ func (c *Client) tryReopenSession(
 	cancel context.CancelFunc,
 	attempt int,
 ) bool {
+	// A failed attempt may have latched the engine's peer binding onto the
+	// dead session's epoch (the handshake reply path latches on the first
+	// inbound frame). Without clearing it, every retry sends CLIENT_HELLO to
+	// the old dead epoch and drops the restarted server's fresh frames -
+	// the handshake never converges ("read welcome timeout" after a server
+	// restart). ResetPeer makes the next attempt a clean slate for engines
+	// that latch (jazz/mts/vp8channel/seichannel); it is a no-op elsewhere.
+	if attempt > 1 {
+		tunnelcore.ResetPeer(c.ln)
+	}
 	conn := muxconn.New(c.ln, c.keys)
 	controlConn := muxconn.NewControl(c.ln, c.keys)
 	c.sessMu.Lock()

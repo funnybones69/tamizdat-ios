@@ -86,15 +86,16 @@ func (ps *peerSession) sid() string {
 	return ps.sessionID
 }
 
-func (ps *peerSession) setHandshake(result handshakeResult) bool {
+func (ps *peerSession) setHandshake(result handshakeResult) (previous string, ok bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	if ps.closed {
-		return false
+		return "", false
 	}
+	previous = ps.sessionID
 	ps.sessionID = result.sessionID
 	ps.deviceID = result.deviceID
-	return true
+	return previous, true
 }
 
 func (ps *peerSession) attachData(conn *muxconn.Conn, session *smux.Session) bool {
@@ -142,6 +143,16 @@ func (ps *peerSession) setControl(stream *smux.Stream, stop context.CancelFunc) 
 	defer ps.mu.Unlock()
 	if ps.closed {
 		return false
+	}
+	// A peer re-handshaking replaces its control loop; the one already
+	// installed belongs to the previous session and must be stopped now.
+	// Dropping the reference instead leaves a zombie runner that dies
+	// later, calls removePeer, and tears down the fresh session.
+	if ps.controlStop != nil {
+		ps.controlStop()
+	}
+	if ps.controlStrm != nil {
+		_ = ps.controlStrm.Close()
 	}
 	ps.controlStrm = stream
 	ps.controlStop = stop
@@ -378,9 +389,18 @@ func (s *Server) acceptPeerHandshake(ctx context.Context, peer *peerSession) {
 			s.removePeer(peer, "handshake failed")
 			return
 		}
-		if !peer.setHandshake(handshakeResult{sessionID: sessionID, deviceID: hello.DeviceID}) {
+		previous, ok := peer.setHandshake(handshakeResult{sessionID: sessionID, deviceID: hello.DeviceID})
+		if !ok {
 			_ = stream.Close()
 			return
+		}
+		if previous != "" && previous != sessionID {
+			// The peer re-handshook (reconnect with a new identity): the
+			// old session ID's accounting must be closed out here, or its
+			// peerStats entry and the wrapper's room mapping leak for the
+			// server's lifetime.
+			s.onClose(previous, "rehandshake")
+			s.trackPeerClose(previous, "rehandshake")
 		}
 		peer.signalReady()
 		s.health.RecordSession(sessionID)
@@ -419,7 +439,6 @@ func (s *Server) servePeer(peer *peerSession) {
 		return
 	}
 	ctx := s.streamContext()
-	sessionID := peer.sid()
 	for {
 		if s.stopping() {
 			return
@@ -432,7 +451,10 @@ func (s *Server) servePeer(peer *peerSession) {
 			}
 			return
 		}
-		s.goTracked(func() { s.handleStream(ctx, stream, sessionID) })
+		// Read per stream: a peer that re-handshakes over the control plane
+		// swaps its session ID under the same peerSession, and attributing
+		// new streams to the stale ID bills the wrong (closed) session.
+		s.goTracked(func() { s.handleStream(ctx, stream, peer.sid()) })
 	}
 }
 
@@ -452,12 +474,11 @@ func (s *Server) establishPeerSession(peer *peerSession) bool {
 		return false
 	}
 	ctx := s.streamContext()
-	stream, result, ok := s.acceptHandshake(ctx, session)
+	stream, result, ok := s.acceptHandshake(ctx, session, peer)
 	if !ok {
-		s.removePeer(peer, "handshake failed")
 		return false
 	}
-	if !peer.setHandshake(result) {
+	if _, ok := peer.setHandshake(result); !ok {
 		_ = stream.Close()
 		return false
 	}

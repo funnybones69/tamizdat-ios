@@ -174,18 +174,6 @@ func (c *Client) socks5UserPassAuth(conn net.Conn) error {
 	return nil
 }
 
-// socks5Request reads a CONNECT request; any other command is refused.
-func (c *Client) socks5Request(conn net.Conn) (string, int, error) {
-	req, err := c.readSocks5Request(conn)
-	if err != nil {
-		return "", 0, err
-	}
-	if req.cmd != socksCmdConnect {
-		return "", 0, fmt.Errorf("%w: %d", ErrUnsupportedSOCKSCommand, req.cmd)
-	}
-	return req.addr, req.port, nil
-}
-
 // readSocks5Request reads one request: CONNECT or UDP ASSOCIATE.
 func (c *Client) readSocks5Request(conn net.Conn) (socksRequest, error) {
 	header := make([]byte, 4)

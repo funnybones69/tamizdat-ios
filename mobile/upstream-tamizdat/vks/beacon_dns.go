@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -126,14 +128,31 @@ func handleBeaconQuery(pc net.PacketConn, src net.Addr, msg []byte, zone string,
 							ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 							cfg, err := watch.AssignRoom(ctx, provider)
 							cancel()
+							// Provider flags ride in the same TXT RR: providers
+							// whose credentials are dead (login required) tell
+							// the client to re-upload cookies instead of a
+							// silent empty answer. When the assign fails for a
+							// login reason (or the room cap / a dead provider),
+							// the answer carries an EMPTY spec + flags, not a
+							// silent fallback.
+							watch.mu.Lock()
+							creds := watch.creds
+							watch.mu.Unlock()
+							flags := []string{}
+							if creds != nil {
+								if req := creds.LoginRequired(); len(req) > 0 {
+									flags = append(flags, "login="+strings.Join(req, ","))
+								}
+							}
 							if err != nil {
 								log.Printf("vks beacon dns: assign %s failed: %v", provider, err)
-							} else {
-								spec := cfg.Provider + ":" + cfg.RoomURL
-								log.Printf("vks beacon dns: assigned %s -> TXT %q", provider, spec)
-								respondTXT(pc, src, msg, qend, spec)
+								respondTXT(pc, src, msg, qend, "", flags)
 								return
 							}
+							spec := cfg.Provider + ":" + cfg.RoomURL
+							log.Printf("vks beacon dns: assigned %s -> TXT %q (flags %v)", provider, spec, flags)
+							respondTXT(pc, src, msg, qend, spec, flags)
+							return
 						}
 					}
 				}
@@ -146,16 +165,16 @@ func handleBeaconQuery(pc net.PacketConn, src net.Addr, msg []byte, zone string,
 	// Build a minimal valid response: echo ID+question, QR=1 AA=1, one A
 	// answer (127.0.0.1) for A queries so resolvers cache a benign result.
 	resp := make([]byte, 0, len(msg)+16)
-	resp = append(resp, msg[0], msg[1])             // ID
-	resp = append(resp, 0x84, 0x00)                 // QR=1, AA=1, RCODE=0
-	resp = append(resp, msg[4], msg[5])             // QDCOUNT
+	resp = append(resp, msg[0], msg[1]) // ID
+	resp = append(resp, 0x84, 0x00)     // QR=1, AA=1, RCODE=0
+	resp = append(resp, msg[4], msg[5]) // QDCOUNT
 	ancount := 0
-	if qtype == 1 {                                 // A
+	if qtype == 1 { // A
 		ancount = 1
 	}
 	resp = append(resp, byte(ancount>>8), byte(ancount))
-	resp = append(resp, 0x00, 0x00, 0x00, 0x00)     // NSCOUNT, ARCOUNT
-	resp = append(resp, msg[12:qend+4]...)          // question
+	resp = append(resp, 0x00, 0x00, 0x00, 0x00) // NSCOUNT, ARCOUNT
+	resp = append(resp, msg[12:qend+4]...)      // question
 	if ancount == 1 {
 		// name pointer to the question (0xC00C), TYPE A, CLASS IN, TTL 0
 		// (never cache — a cached A record would swallow later beacons),
@@ -192,6 +211,7 @@ func decodeQName(msg []byte, off int) (string, int, bool) {
 	}
 	return "", 0, false
 }
+
 // SendWake emits the wake beacon for a room through the given DNS server
 // (direct "host:53", or a whitelisted resolver). The client calls this just
 // before connecting so the on-demand server joins the room in time.
@@ -234,14 +254,37 @@ func buildAQuery(name string) []byte {
 	return msg
 }
 
-// respondTXT answers a DNS query with a TXT record carrying spec (the
-// beacon-assignment room answer). One character-string, TTL 0.
-func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec string) {
-	data := []byte(spec)
-	if len(data) > 200 {
-		data = data[:200] // DNS-safe cap
+// respondTXT answers a DNS query with a TXT record carrying the
+// beacon-assignment answer: the FIRST character-string is the room spec
+// ("" when no room was assigned — e.g. login required), the following
+// strings are `key=value` flags (e.g. "login=telemost,mts"). TTL 0.
+//
+// Old clients read only the first character-string (parseTXTAnswer's
+// legacy behavior), so the spec stays first and flags ride behind it in
+// the same RR — an old client sees its spec unchanged, a new client
+// reads both.
+func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec string, flags []string) {
+	if len(flags) > 5 {
+		flags = flags[:5]
 	}
-	resp := make([]byte, 0, len(msg)+32+len(data))
+	stringsOut := make([][]byte, 0, 1+len(flags))
+	d := []byte(spec)
+	if len(d) > 200 {
+		d = d[:200] // DNS-safe cap
+	}
+	stringsOut = append(stringsOut, d)
+	for _, f := range flags {
+		d := []byte(f)
+		if len(d) > 200 {
+			d = d[:200]
+		}
+		stringsOut = append(stringsOut, d)
+	}
+	rdlen := 0
+	for _, s := range stringsOut {
+		rdlen += 1 + len(s)
+	}
+	resp := make([]byte, 0, len(msg)+32+rdlen)
 	resp = append(resp, msg[0], msg[1])         // ID
 	resp = append(resp, 0x84, 0x00)             // QR=1, AA=1, RCODE=0
 	resp = append(resp, msg[4], msg[5])         // QDCOUNT
@@ -251,26 +294,35 @@ func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec stri
 	// name pointer, TYPE TXT (16), CLASS IN, TTL 0, RDLENGTH, RDATA
 	resp = append(resp, 0xC0, 0x0C, 0x00, 0x10, 0x00, 0x01,
 		0x00, 0x00, 0x00, 0x00)
-	rdlen := 1 + len(data)
 	resp = append(resp, byte(rdlen>>8), byte(rdlen))
-	resp = append(resp, byte(len(data)))
-	resp = append(resp, data...)
+	for _, s := range stringsOut {
+		resp = append(resp, byte(len(s)))
+		resp = append(resp, s...)
+	}
 	_, _ = pc.WriteTo(resp, src)
 }
 
 // SendWakeProvider asks the server to CREATE/ASSIGN a room on the given
-// provider and returns the assigned room spec ("provider:roomURL") from the
-// DNS TXT answer. This is the beacon-assignment flow: the client beacons a
-// provider key (HMAC of the shared key), the server creates a fresh room
-// (WB/Jazz) or assigns an armed one (Telemost/MTS) and answers in-band.
-// shortIDHex is the client's tamizdat user identity — carried as a beacon
-// label so the server can gate room creation on a valid user (auth gap fix).
-func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, shortIDHex string) (string, error) {
+// provider and returns the assigned room spec ("provider:roomURL") and
+// the answer's key=value flags from the DNS TXT answer. This is the
+// beacon-assignment flow: the client beacons a provider key (HMAC of the
+// shared key), the server creates a fresh room (WB/Jazz) or assigns an
+// armed/pool one (Telemost/MTS) and answers in-band. shortIDHex is the
+// client's tamizdat user identity — carried as a beacon label so the
+// server can gate room creation on a valid user (auth gap fix).
+//
+// The answer's first TXT character-string is the room spec ("" when the
+// server could not assign a room — e.g. login required); the strings
+// after it are flags (e.g. "login=telemost,mts"). On a successful
+// (ANCOUNT>=1) answer the package-level login-required set is refreshed
+// from the flags, so LoginRequiredProviders() reflects the server's view
+// (see nativeconn.go for the empty-spec fail-fast).
+func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, shortIDHex string) (string, []string, error) {
 	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
 	providerKey := ProviderWakeKey(keyHex, provider)
 	nonce := make([]byte, 4)
 	if _, err := rand.Read(nonce); err != nil {
-		return "", fmt.Errorf("wake nonce: %w", err)
+		return "", nil, fmt.Errorf("wake nonce: %w", err)
 	}
 	sid := strings.ToLower(strings.TrimSpace(shortIDHex))
 	if sid == "" {
@@ -281,19 +333,69 @@ func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, sh
 	d := net.Dialer{Timeout: 5 * time.Second}
 	c, err := d.DialContext(ctx, "udp", dnsServer)
 	if err != nil {
-		return "", fmt.Errorf("wake dial %s: %w", dnsServer, err)
+		return "", nil, fmt.Errorf("wake dial %s: %w", dnsServer, err)
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(12 * time.Second))
 	if _, err := c.Write(query); err != nil {
-		return "", fmt.Errorf("wake write: %w", err)
+		return "", nil, fmt.Errorf("wake write: %w", err)
 	}
 	buf := make([]byte, 512)
 	n, err := c.Read(buf)
 	if err != nil {
-		return "", fmt.Errorf("wake read: %w", err)
+		return "", nil, fmt.Errorf("wake read: %w", err)
 	}
-	return parseTXTAnswer(buf[:n])
+	flags, err := parseTXTAnswerAll(buf[:n])
+	if err == nil {
+		recordLoginFlags(flags)
+	}
+	if len(flags) > 0 {
+		return flags[0], flags, nil
+	}
+	return "", nil, err
+}
+
+// recordLoginFlags folds a beacon answer's "login=..." flag into the
+// package-level set (replaced wholesale on every successful answer).
+func recordLoginFlags(flags []string) {
+	var providers []string
+	for _, f := range flags {
+		k, v, ok := strings.Cut(f, "=")
+		if !ok || k != "login" {
+			continue
+		}
+		for _, p := range strings.Split(v, ",") {
+			p = strings.TrimSpace(strings.ToLower(p))
+			if p != "" {
+				providers = append(providers, p)
+			}
+		}
+	}
+	loginRequiredMu.Lock()
+	loginRequiredSet = providers
+	loginRequiredMu.Unlock()
+}
+
+// loginRequiredMu guards loginRequiredSet — the client-side copy of the
+// server's login-required providers, refreshed on every beacon answer.
+var (
+	loginRequiredMu  sync.Mutex
+	loginRequiredSet []string
+)
+
+// LoginRequiredProviders returns the sorted providers the server's last
+// beacon answer flagged as needing a login (dead cookies). The iOS app
+// surfaces this to prompt for a cookie re-upload; an empty result means
+// every provider is believed healthy.
+func LoginRequiredProviders() []string {
+	loginRequiredMu.Lock()
+	defer loginRequiredMu.Unlock()
+	if len(loginRequiredSet) == 0 {
+		return nil
+	}
+	out := append([]string(nil), loginRequiredSet...)
+	sort.Strings(out)
+	return out
 }
 
 // buildTXTQuery builds a minimal DNS TXT (type 16) query for name.
@@ -310,19 +412,33 @@ func buildTXTQuery(name string) []byte {
 	return msg
 }
 
-// parseTXTAnswer extracts the TXT character-string from a DNS response.
+// parseTXTAnswer extracts the FIRST TXT character-string from a DNS
+// response. Old-client contract: the room spec is always the first
+// string, so this keeps returning exactly what a pre-flags client saw
+// (spec, or "" for an empty first string).
 func parseTXTAnswer(msg []byte) (string, error) {
+	strs, err := parseTXTAnswerAll(msg)
+	if err != nil {
+		return "", err
+	}
+	return strs[0], nil
+}
+
+// parseTXTAnswerAll extracts every TXT character-string from the FIRST
+// answer record: [0] is the room spec (possibly empty — the server could
+// not assign a room), [1:] are the key=value flags.
+func parseTXTAnswerAll(msg []byte) ([]string, error) {
 	if len(msg) < 12 {
-		return "", fmt.Errorf("short response")
+		return nil, fmt.Errorf("short response")
 	}
 	ancount := int(msg[6])<<8 | int(msg[7])
 	if ancount < 1 {
-		return "", fmt.Errorf("no answer")
+		return nil, fmt.Errorf("no answer")
 	}
 	// skip the question
 	_, qend, ok := decodeQName(msg, 12)
 	if !ok || qend+4 > len(msg) {
-		return "", fmt.Errorf("bad question")
+		return nil, fmt.Errorf("bad question")
 	}
 	off := qend + 4
 	// first answer: name (possibly a pointer), then TYPE/CLASS/TTL/RDLENGTH/RDATA
@@ -331,24 +447,34 @@ func parseTXTAnswer(msg []byte) (string, error) {
 	} else {
 		_, off, ok = decodeQName(msg, off)
 		if !ok {
-			return "", fmt.Errorf("bad answer name")
+			return nil, fmt.Errorf("bad answer name")
 		}
 	}
 	if off+10 > len(msg) {
-		return "", fmt.Errorf("truncated answer")
+		return nil, fmt.Errorf("truncated answer")
 	}
 	qtype := int(msg[off])<<8 | int(msg[off+1])
 	if qtype != 16 {
-		return "", fmt.Errorf("not TXT (type %d)", qtype)
+		return nil, fmt.Errorf("not TXT (type %d)", qtype)
 	}
 	rdlen := int(msg[off+8])<<8 | int(msg[off+9])
 	off += 10
 	if off+rdlen > len(msg) || rdlen < 1 {
-		return "", fmt.Errorf("bad RDATA")
+		return nil, fmt.Errorf("bad RDATA")
 	}
-	strLen := int(msg[off])
-	if strLen+1 > rdlen {
-		return "", fmt.Errorf("bad TXT string")
+	var out []string
+	end := off + rdlen
+	for off < end && off < len(msg) {
+		strLen := int(msg[off])
+		off++
+		if off+strLen > end || off+strLen > len(msg) {
+			return nil, fmt.Errorf("bad TXT string")
+		}
+		out = append(out, string(msg[off:off+strLen]))
+		off += strLen
 	}
-	return string(msg[off+1 : off+1+strLen]), nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty TXT RDATA")
+	}
+	return out, nil
 }

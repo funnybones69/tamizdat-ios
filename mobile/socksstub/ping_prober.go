@@ -12,8 +12,9 @@
 //   - Every 10 s: HTTP HEAD via http.Client whose Transport.DialContext
 //     calls dialUpstream directly (NOT via the SOCKS5 loopback — direct
 //     measurement, dodges loopback overhead and avoids re-entering our own
-//     listener). This is important in VK TURN mode: probes must use the same
-//     TURN netstack as real traffic, not the dormant H2 client.
+//     listener). This is important under a whitelist carrier: probes
+//     must use the same carrier as real traffic, not the dormant H2
+//     client.
 //   - 5 s per-probe timeout.
 //   - Failed state := 2+ consecutive misses (single transient drop never
 //     trips it).
@@ -297,7 +298,7 @@ func probeOnceWithTimeout(ctx context.Context, client probeDialer, timeout time.
 		DialContext: func(c context.Context, _, _ string) (net.Conn, error) {
 			// network/address args ignored: we always dial the URL host:port
 			// through the currently active upstream. In VK TURN mode this must
-			// use VKTurnNetstack(), not the dormant H2 client.
+			// carrier, not the dormant H2 client.
 			return dialUpstream(c, hostport)
 		},
 		DialTLSContext: func(c context.Context, _, _ string) (net.Conn, error) {

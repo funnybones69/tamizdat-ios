@@ -131,8 +131,21 @@ type handshakeResult struct {
 func (s *Server) acceptHandshake(
 	ctx context.Context,
 	session *smux.Session,
+	peer *peerSession,
 ) (*smux.Stream, handshakeResult, bool) {
 	const maxStaleRetries = 3
+	// In peer-routing mode a failing handshake belongs to that one peer:
+	// its ID is minted by whoever joined the room, so a junk frame must
+	// cost the sender its own peer session - not a global reinstall that
+	// tears down every live client's tunnel.
+	fail := func(reason string) {
+		if peer != nil {
+			s.removePeer(peer, reason)
+			return
+		}
+		tunnelcore.ResetPeer(s.ln)
+		s.reinstallSession(ctx, session)
+	}
 	for retry := 0; retry <= maxStaleRetries; retry++ {
 		stream, err := session.AcceptStream()
 		if err != nil {
@@ -140,8 +153,7 @@ func (s *Server) acceptHandshake(
 				return nil, handshakeResult{}, false
 			}
 			logger.Infof("server: AcceptStream(control) error - reinstalling session: %v", err)
-			tunnelcore.ResetPeer(s.ln)
-			s.reinstallSession(ctx, session)
+			fail("handshake failed")
 			return nil, handshakeResult{}, false
 		}
 		_ = stream.SetDeadline(time.Now().Add(handshake.DefaultTimeout))
@@ -154,8 +166,7 @@ func (s *Server) acceptHandshake(
 				continue
 			}
 			logger.Warnf("handshake failed: %v", err)
-			tunnelcore.ResetPeer(s.ln)
-			s.reinstallSession(ctx, session)
+			fail("handshake failed")
 			return nil, handshakeResult{}, false
 		}
 		s.health.RecordSession(sessionID)
@@ -164,6 +175,10 @@ func (s *Server) acceptHandshake(
 		logger.Infof("session %s opened (device=%s)", sessionID, hello.DeviceID)
 		return stream, handshakeResult{sessionID: sessionID, deviceID: hello.DeviceID}, true
 	}
+	// Retry budget exhausted without a verdict: treat as failure so a
+	// peer session is released (its accept goroutine is gone; nothing
+	// else would drain it).
+	fail("handshake failed")
 	return nil, handshakeResult{}, false
 }
 
@@ -176,7 +191,7 @@ func (s *Server) localPeerID() string {
 }
 
 func (s *Server) acceptSingletonHandshake(ctx context.Context, session *smux.Session) bool {
-	stream, result, ok := s.acceptHandshake(ctx, session)
+	stream, result, ok := s.acceptHandshake(ctx, session, nil)
 	if !ok {
 		return false
 	}

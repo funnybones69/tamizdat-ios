@@ -21,8 +21,9 @@ func (s *Session) processSendQueue(dc *webrtc.DataChannel, workerID int, session
 		case <-s.closeCh:
 			return
 		case data := <-s.sendQueue:
-			if len(data) > s.trafficShape.MaxMessageSize {
-				logger.Debugf("oversized message size=%d limit=%d", len(data), s.trafficShape.MaxMessageSize)
+			shape := s.currentShape()
+			if len(data) > shape.MaxMessageSize {
+				logger.Debugf("oversized message size=%d limit=%d", len(data), shape.MaxMessageSize)
 				continue
 			}
 
@@ -40,8 +41,8 @@ func (s *Session) processSendQueue(dc *webrtc.DataChannel, workerID int, session
 				return
 			}
 
-			if s.trafficShape.MinDelay > 0 {
-				time.Sleep(s.calculateDelay())
+			if shape.MinDelay > 0 {
+				time.Sleep(s.calculateDelay(shape))
 			}
 		}
 	}
@@ -67,9 +68,9 @@ func (s *Session) waitBufferedAmount(
 	return time.Since(start), nil
 }
 
-func (s *Session) calculateDelay() time.Duration {
-	minDelay := s.trafficShape.MinDelay
-	maxDelay := s.trafficShape.MaxDelay
+func (s *Session) calculateDelay(shape TrafficShape) time.Duration {
+	minDelay := shape.MinDelay
+	maxDelay := shape.MaxDelay
 	if maxDelay <= minDelay {
 		return minDelay
 	}

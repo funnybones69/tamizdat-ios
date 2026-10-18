@@ -110,14 +110,13 @@ targets:
       - path: samizdat-ios/WhitelistProbeEngine.swift
       # Unprivileged ICMP echo socket used by WhitelistProbeEngine.
       - path: samizdat-ios/ICMPPinger.swift
-      # IPA-D65b: VK TURN session parameter cache (read-side only — the
-      # extension reads `TURNSession paramsStore.shared.isFresh` in its status
-      # RPC). The write side lives in the main app (WKWebView verification challenge
-      # handler + 5-step VK API client) and is intentionally NOT
-      # compiled into the extension.
-      - path: samizdat-ios/TURNCredsStore.swift
+      # IPA-D65b cleanup (VK TURN removal): TURNCredsStore no longer
+      # exists — the VKS carrier needs no credential cache in the
+      # extension.
       # VKS room-transport settings — read by the extension at startTunnel
-      # to raise the ladder in-process (next to the socksstub SOCKS5 bridge).
+      # to raise the ladder in-process (next to the socksstub SOCKS5
+      # bridge). Carries the provider order + per-provider flags + the
+      # link/override resolution shared with the app.
       - path: samizdat-ios/VKSPreferences.swift
     dependencies:
       - framework: Frameworks/HevSocks5Tunnel.xcframework

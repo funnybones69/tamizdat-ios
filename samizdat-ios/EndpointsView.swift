@@ -16,37 +16,27 @@ import SwiftUI
 /// `SamizdatURLCodec.compose / split` so the Network Extension reads
 /// the same blob shape it already understands.
 struct EndpointsView: View {
-    @Environment(\.dismiss) private var dismiss
     @Environment(\.themeTokens) private var theme
 
-    /// Called on dismiss with `true` if at least Main is stored, `false`
-    /// otherwise. Parent uses this to refresh hasConfig + hasBackup.
+    /// Called after every persist with `true` if a profile is stored.
+    /// Parent (SettingsView) refreshes its derived config state.
     var onClose: (Bool) -> Void
 
     @State private var primaryURL: String
     @State private var profiles: [String] = []
-    @State private var confirmingClear: Bool = false
     @State private var scanning: ScanTarget? = nil
     @State private var pasteError: String?
 
-    // IPA-D24: inline edit state for the active card. `editingActive`
-    // toggles the CodeBlock into a TextEditor; `editBufferMain` holds the
-    // mutable draft so Cancel can revert. `addingProfile`/`deletingProfile`
-    // drive the saved-profiles section.
-    @State private var editingActive: Bool = false
-    @State private var editBufferMain: String = ""
+    // Inline edit state for the new-profile row: `addingProfile` /
+    // `editBufferNewProfile` drive the saved-profiles section;
+    // `deletingProfile` drives the inline delete confirmation.
     @State private var addingProfile: Bool = false
     @State private var editBufferNewProfile: String = ""
     @State private var deletingProfile: String? = nil
 
     private enum ScanTarget: Identifiable {
-        case active, newProfile
-        var id: String {
-            switch self {
-            case .active: return "active"
-            case .newProfile: return "new-profile"
-            }
-        }
+        case newProfile
+        var id: String { "new-profile" }
     }
 
     init(onClose: @escaping (Bool) -> Void) {
@@ -72,59 +62,32 @@ struct EndpointsView: View {
         ZStack {
             ThemeBackground(theme: theme)
 
-            VStack(spacing: 0) {
-                // ── Header ────────────────────────────────────────
-                HStack {
-                    Chip(label: "Done") { closeAndPersist() }
-                    Spacer()
-                    Text("Proxies")
-                        .font(.geist(.semibold, size: 16))
-                        .foregroundStyle(theme.text)
-                    Spacer()
-                    // Balance the Done chip
-                    Color.clear.frame(width: 56, height: 1)
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 8)
-                .padding(.bottom, 6)
+            ScrollView {
+                VStack(spacing: 12) {
+                    profilesSection
 
-                // ── Large title ───────────────────────────────────
-                Text("Proxies")
-                    .font(.geist(.bold, size: 32))
-                    .tracking(-0.96)
-                    .foregroundStyle(theme.text)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 18)
-
-                // ── Cards ─────────────────────────────────────────
-                ScrollView {
-                    VStack(spacing: 12) {
-                        // Profiles-only: no separate Active card — the active
-                        // profile is marked inline in the list; picking a row
-                        // makes it active.
-                        profilesSection
-
-                        if let err = pasteError {
-                            HStack(spacing: 8) {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(theme.red)
-                                Text(err)
-                                    .font(.geist(.medium, size: 13))
-                                    .foregroundStyle(theme.text)
-                                Spacer()
-                            }
-                            .padding(12)
-                            .background(theme.redDim)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    if let err = pasteError {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(theme.red)
+                            Text(err)
+                                .font(.geist(.medium, size: 13))
+                                .foregroundStyle(theme.text)
+                            Spacer()
                         }
+                        .padding(12)
+                        .background(theme.redDim)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 24)
                 }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 24)
             }
         }
         .preferredColorScheme(theme.isDark ? .dark : .light)
+        .navigationTitle("Профиль")
+        .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $scanning) { target in
             QRScannerSheet { code in
                 applyScanned(code, to: target)
@@ -135,42 +98,10 @@ struct EndpointsView: View {
 
     // MARK: – Actions
 
-    private func pasteActive() {
-        guard let pasted = UIPasteboard.general.string?
-            .trimmingCharacters(in: .whitespacesAndNewlines), !pasted.isEmpty else { return }
-        applyToActive(pasted)
-    }
-
     private func pasteNewProfile() {
         guard let pasted = UIPasteboard.general.string?
             .trimmingCharacters(in: .whitespacesAndNewlines), !pasted.isEmpty else { return }
         addProfile(from: pasted)
-    }
-
-    private func applyToActive(_ s: String) {
-        guard validateActive(s) else { return }
-        pasteError = nil
-        persistImmediately()
-    }
-
-    private func applyScanned(_ s: String, to target: ScanTarget) {
-        switch target {
-        case .active:
-            applyToActive(s)
-        case .newProfile:
-            addProfile(from: s)
-        }
-    }
-
-    /// Validates the URL and makes it the active profile.
-    /// Sets pasteError on failure.
-    private func validateActive(_ s: String) -> Bool {
-        if let err = SamizdatBridge.validate(s) {
-            pasteError = "Active: \(err)"
-            return false
-        }
-        primaryURL = s
-        return true
     }
 
     /// Validates and appends a URL to the saved profiles.
@@ -184,23 +115,6 @@ struct EndpointsView: View {
         pasteError = nil
     }
 
-    /// IPA-D24: commit the inline-edited Active URL. Empty buffer is
-    /// treated as "clear" (skip URL validation, just persist).
-    private func saveEditedActive() {
-        let s = editBufferMain.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.isEmpty {
-            primaryURL = ""
-            editingActive = false
-            pasteError = nil
-            persistImmediately()
-            return
-        }
-        if validateActive(s) {
-            editingActive = false
-            pasteError = nil
-            persistImmediately()
-        }
-    }
 
     /// Commit the inline-entered new profile.
     private func saveNewProfile() {
@@ -240,11 +154,6 @@ struct EndpointsView: View {
         deletingProfile = nil
     }
 
-    private func clearActive() {
-        primaryURL = ""
-        confirmingClear = false
-        persistImmediately()
-    }
 
     /// IPA-D22: design says "changes apply immediately" (no Save
     /// button). The ACTIVE profile is written to Keychain on every
@@ -253,16 +162,16 @@ struct EndpointsView: View {
         let p = primaryURL.trimmingCharacters(in: .whitespacesAndNewlines)
         if p.isEmpty {
             ConfigStore.shared.delete()
-            VKCredsPreferences.applyDerivedH2PeerConfig(nil)
+            VKSPreferences.applyDerivedH2PeerConfig(nil)
             return
         }
         let combined = SamizdatURLCodec.compose(primary: p, backup: nil)
         ConfigStore.shared.save(combined)
-        VKCredsPreferences.applyDerivedH2PeerConfig(SamizdatURLCodec.h2PeerConfig(from: combined))
+        VKSPreferences.applyDerivedH2PeerConfig(SamizdatURLCodec.h2PeerConfig(from: combined))
         // Live-apply into the running tunnel (no-op while disconnected —
-        // the next connect reads ConfigStore anyway). The derived TURN peer
-        // above is already in the App Group, so the extension's rewire
-        // re-attaches TURN with the new peer.
+        // the next connect reads ConfigStore anyway). The derived VKS
+        // identity mirror is already in the App Group, so the extension's
+        // rewire picks it up.
         Task { await VPNProfileStore.shared.applyActiveConfigBlob(combined) }
     }
 
@@ -427,162 +336,10 @@ struct EndpointsView: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
-    private func closeAndPersist() {
-        persistImmediately()
-        let stored = ConfigStore.shared.load() ?? ""
-        onClose(!stored.isEmpty)
-        dismiss()
-    }
-}
-
-// MARK: – Endpoint card (per-side)
-
-private struct EndpointCard: View {
-    @Environment(\.themeTokens) private var theme
-
-    let label: String
-    let labelBg: Color
-    let labelFg: Color
-    let accent: Color
-    let url: String
-
-    let isConfirming: Bool
-    // IPA-D24: inline edit state, owned by the parent EndpointsView.
-    let isEditing: Bool
-    @Binding var editBuffer: String
-
-    let onPaste: () -> Void
-    let onScan: () -> Void
-    let onClearRequest: () -> Void
-    let onClearCancel: () -> Void
-    let onClearConfirm: () -> Void
-    let onEditStart: () -> Void
-    let onEditCancel: () -> Void
-    let onEditSave: () -> Void
-
-    var body: some View {
-        CardContainer(padding: 16) {
-            VStack(alignment: .leading, spacing: 12) {
-                // Label badge + parsed host
-                HStack {
-                    Text(label.uppercased())
-                        .font(.geist(.bold, size: 10.5))
-                        .tracking(0.84) // 0.08em at 10.5pt
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(labelBg))
-                        .foregroundStyle(labelFg)
-                    Spacer()
-                    if let host = parseHost(url) {
-                        Text(host)
-                            .font(.geistMono(.regular, size: 12))
-                            .foregroundStyle(theme.textMuted)
-                    }
-                }
-
-                if isEditing {
-                    // IPA-D24: TextEditor for manual URL editing. Mono
-                    // font matches the read-only CodeBlock style.
-                    TextEditor(text: $editBuffer)
-                        .font(.geistMono(.regular, size: 12))
-                        .foregroundStyle(theme.text)
-                        .scrollContentBackground(.hidden)
-                        .frame(minHeight: 100, maxHeight: 220)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(theme.chip)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.URL)
-                } else if url.isEmpty {
-                    // Empty state — same code-block frame, dim placeholder
-                    CodeBlock {
-                        Text("Not configured — paste, scan or edit a tamizdat:// link to set up the \(label.lowercased()) endpoint.")
-                            .foregroundStyle(theme.textMuted)
-                    }
-                } else {
-                    CodeBlock {
-                        URLBreakdownView(url: url, accent: accent)
-                    }
-                }
-
-                // Actions row OR inline confirmation strip OR edit Save/Cancel
-                if isEditing {
-                    HStack(spacing: 6) {
-                        ActionChip(systemName: "xmark",
-                                   label: "Cancel",
-                                   tint: theme.textDim,
-                                   action: onEditCancel)
-                        ActionChip(systemName: "checkmark",
-                                   label: "Done",
-                                   tint: theme.mint,
-                                   labelColor: theme.mint,
-                                   action: onEditSave)
-                    }
-                } else if isConfirming {
-                    HStack(spacing: 10) {
-                        Text("Clear this endpoint?")
-                            .font(.geist(.medium, size: 12.5))
-                            .foregroundStyle(theme.text)
-                        Spacer()
-                        Button(action: onClearCancel) {
-                            Text("Cancel")
-                                .font(.geist(.semibold, size: 12.5))
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .background(Capsule().fill(theme.chip))
-                                .foregroundStyle(theme.text)
-                        }
-                        .buttonStyle(.plain)
-                        Button(action: onClearConfirm) {
-                            Text("Clear")
-                                .font(.geist(.bold, size: 12.5))
-                                .padding(.horizontal, 12).padding(.vertical, 6)
-                                .background(Capsule().fill(theme.red))
-                                .foregroundStyle(Color.white)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .background(theme.redDim)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 12)
-                            .strokeBorder(theme.red, lineWidth: 0.5)
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                } else {
-                    HStack(spacing: 6) {
-                        ActionChip(systemName: "pencil",
-                                   label: "Edit",
-                                   tint: theme.blue,
-                                   action: onEditStart)
-                        ActionChip(systemName: "doc.on.clipboard",
-                                   label: "Paste",
-                                   tint: theme.blue,
-                                   action: onPaste)
-                        ActionChip(systemName: "qrcode.viewfinder",
-                                   label: "Scan",
-                                   tint: theme.blue,
-                                   action: onScan)
-                        ActionChip(systemName: "trash",
-                                   label: "Clear",
-                                   tint: theme.red,
-                                   labelColor: theme.red,
-                                   action: url.isEmpty ? {} : onClearRequest)
-                        .opacity(url.isEmpty ? 0.4 : 1.0)
-                        .disabled(url.isEmpty)
-                    }
-                }
-            }
-        }
-    }
-
-    /// Best-effort: parse the URL into a host:port to render on the
-    /// right of the label. Falls back to nil when unparseable.
-    private func parseHost(_ s: String) -> String? {
-        endpointHost(s)
-    }
+    /// Called by SettingsView when it needs a hasConfig refresh after
+    /// this pushed page's edits. The parent refreshes on pop anyway
+    /// (onConfigChanged is invoked on every persistImmediately), so the
+    /// page itself no longer owns a Done button.
 }
 
 /// Best-effort host:port parse for a tamizdat:// URL. Shared by the
@@ -626,115 +383,3 @@ private struct ActionChip: View {
     }
 }
 
-// MARK: – URL breakdown (key=value param dimming)
-
-/// Renders a tamizdat:// URL with the scheme + host in normal text and
-/// each query-parameter key in `theme.textDim`. Designed to break
-/// naturally across 3-4 lines via word-wrap on `&` boundaries.
-private struct URLBreakdownView: View {
-    @Environment(\.themeTokens) private var theme
-    let url: String
-    let accent: Color
-
-    var body: some View {
-        if let parts = parseParts(url) {
-            // Build a single AttributedString so wrapping behaves like
-            // a single Text. Each "&key=" segment colour-tints the key.
-            Text(buildAttributed(parts))
-                .frame(maxWidth: .infinity, alignment: .leading)
-        } else {
-            // Fall back to plain
-            Text(url)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    private struct Parts {
-        let scheme: String       // "tamizdat://"
-        let hostPort: String     // "<server-host>:443/"
-        let pairs: [(String, String)]  // [(sni, ya.ru), (pubkey, ...), ...]
-    }
-
-    private func parseParts(_ s: String) -> Parts? {
-        guard let qIdx = s.firstIndex(of: "?") else { return nil }
-        let scheme: String
-        var afterScheme: String
-        if s.hasPrefix("tamizdat://") {
-            scheme = "tamizdat://"
-            afterScheme = String(s.dropFirst("tamizdat://".count))
-        } else if s.hasPrefix("samizdat://") {
-            scheme = "samizdat://"
-            afterScheme = String(s.dropFirst("samizdat://".count))
-        } else {
-            scheme = ""
-            afterScheme = s
-        }
-        // Split host/port from query
-        let _ = qIdx // silence
-        let beforeQuery = String(s[..<qIdx])
-        let queryStr = String(s[s.index(after: qIdx)...])
-        let host: String
-        if scheme.isEmpty {
-            host = beforeQuery
-        } else {
-            host = String(beforeQuery.dropFirst(scheme.count))
-        }
-        let _ = afterScheme
-
-        var pairs: [(String, String)] = []
-        for chunk in queryStr.split(separator: "&", omittingEmptySubsequences: true) {
-            let parts = chunk.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            if parts.count == 2 {
-                pairs.append((String(parts[0]), String(parts[1])))
-            } else {
-                pairs.append((String(parts[0]), ""))
-            }
-        }
-        return Parts(scheme: scheme, hostPort: host + "/?", pairs: pairs)
-    }
-
-    private func buildAttributed(_ parts: Parts) -> AttributedString {
-        var out = AttributedString()
-
-        // scheme
-        var schemeStr = AttributedString(parts.scheme)
-        schemeStr.foregroundColor = accent
-        out.append(schemeStr)
-
-        // host
-        var hostStr = AttributedString(parts.hostPort)
-        hostStr.foregroundColor = theme.text
-        out.append(hostStr)
-
-        for (i, pair) in parts.pairs.enumerated() {
-            let key = pair.0
-            let value = pair.1
-            // Special-case: `backup=…b64…` — render as one dim line so
-            // the long base64 chunk is visually grouped.
-            var keyPart = AttributedString("\(key)=")
-            keyPart.foregroundColor = theme.textDim
-            var valuePart = AttributedString(elidedValue(key: key, value: value))
-            valuePart.foregroundColor = theme.text
-            out.append(keyPart)
-            out.append(valuePart)
-            if i != parts.pairs.count - 1 {
-                var amp = AttributedString("&")
-                amp.foregroundColor = theme.textDim
-                out.append(amp)
-            }
-        }
-        return out
-    }
-
-    /// Truncate visually-long values (pubkey, backup, …) with an ellipsis
-    /// in the middle so the code-block stays a digestible 3-4 lines tall.
-    private func elidedValue(key: String, value: String) -> String {
-        let collapsable: Set<String> = ["pubkey", "backup"]
-        guard collapsable.contains(key.lowercased()), value.count > 26 else {
-            return value
-        }
-        let head = value.prefix(10)
-        let tail = value.suffix(10)
-        return "\(head)…\(tail)"
-    }
-}

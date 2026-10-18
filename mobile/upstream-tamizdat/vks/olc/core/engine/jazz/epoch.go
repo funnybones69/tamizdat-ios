@@ -1,6 +1,7 @@
 package jazz
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"sync"
@@ -84,7 +85,7 @@ func (es *epochState) parseFrame(payload []byte) (sender, receiver uint32, body 
 		return 0, 0, nil, false
 	}
 	off := len(jazzMagic)
-	if payload[off-1] != jazzMagic[3] || payload[0] != jazzMagic[0] {
+	if !bytes.Equal(payload[:off], jazzMagic[:]) {
 		return 0, 0, nil, false
 	}
 	sender = binary.BigEndian.Uint32(payload[off : off+4])
@@ -116,7 +117,13 @@ func (es *epochState) accept(from string, payload []byte) ([]byte, uint32, bool)
 		if receiver != 0 {
 			es.latched.Store(true)
 		}
-		if es.peerEpoch.Load() == 0 {
+		prev := es.peerEpoch.Load()
+		if prev == 0 {
+			es.peerEpoch.Store(sender)
+		} else if prev != sender {
+			// The targeted frame (receiver == our local epoch) proves the
+			// server side returned; re-target it, otherwise every reply is
+			// addressed to a dead epoch the peer never reads.
 			es.peerEpoch.Store(sender)
 		}
 	} else {

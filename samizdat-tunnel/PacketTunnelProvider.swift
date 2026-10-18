@@ -50,10 +50,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let socksPort: UInt16 = 18443
 
     private var swiftHeartbeatTimer: DispatchSourceTimer?
-    /// Serial queue for provider messages whose handling can block for
-    /// many seconds (VK TURN allocate). Keeps handleAppMessage responsive
-    /// for the 500 ms "status" polls.
-    private let turnIpcQueue = DispatchQueue(label: "com.anarki.samizdat-test.turnipc", qos: .userInitiated)
     // IPA-D18: emit heartbeat log line only every 5 ticks (every ~150 s
     // at the new 30 s cadence) to drop file-write rate from 3600/hour
     // to ~24/hour. Pressure events are still logged immediately.
@@ -173,29 +169,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         set { blobLock.withLock { $0.serverIP = newValue } }
     }
 
+    /// The carrier the effective endpoint rides. VK TURN is gone: the
+    /// whitelist endpoint always rides VKS rooms; Main always rides H2.
     private enum EffectiveUpstream: String {
         case h2
         case vks
-        case turn
     }
 
     private struct UpstreamPolicy {
         let endpointMode: EndpointMode
         let effectiveEndpoint: EndpointMode
-        let whitelistModeRaw: String
         let upstream: EffectiveUpstream
 
-        var usesTURN: Bool { upstream == .turn }
         var usesVKS: Bool { upstream == .vks }
     }
 
     private let rewireQueue = DispatchQueue(label: "com.anarki.samizdat-test.rewire", qos: .userInitiated)
     private let rewireGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
-    private static let turnTunnelGenerationLock = OSAllocatedUnfairLock<Int>(initialState: 0)
-    // nil = no retry; otherwise the generation that currently owns the slot.
-    // A newer tunnel may replace a stale retry without waiting for its Task to
-    // observe cancellation, and stale defer blocks cannot clear the new owner.
-    private static let turnAttachRetryGenerationLock = OSAllocatedUnfairLock<Int?>(initialState: nil)
     private var rewireGeneration: Int {
         get { rewireGenerationLock.withLock { $0 } }
         set { rewireGenerationLock.withLock { $0 = newValue } }
@@ -243,7 +233,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // Start writing into App Group log file immediately so we have a
         // timeline even if hev fails to launch.
         openLogSink()
-        Self.turnTunnelGenerationLock.withLock { $0 += 1 }
         appendExtLog("info: PacketTunnelProvider startTunnel (Path 3 / hev)")
 
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
@@ -264,7 +253,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.backupBlob = split.backup
         let mode = EndpointModeStore.current
         let activeBlob = Self.pick(mode: mode, primary: split.primary, backup: split.backup)
-        let policy = Self.upstreamPolicy(mode: mode, backup: split.backup)
+        let policy = self.upstreamPolicy(mode: mode, backup: split.backup)
         appendExtLog("info: endpoint mode = \(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue) (backup configured: \(split.backup != nil))")
 
         // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
@@ -343,7 +332,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // no-op against the default.
         SocksstubSetPoolVariant("v1")
         // Carrier selection. Main rides H2; the whitelist endpoint rides its
-        // selected carrier (VKS or VK TURN). dialUpstream switches on this and
+        // selected carrier (VKS). dialUpstream switches on this and
         // refuses to fall back to H2 outside Main — a whitelist carrier that is
         // down must surface, not be papered over with the H2 path.
         SocksstubSetUpstreamMode(Self.upstreamModeRaw(policy))
@@ -365,306 +354,37 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return false
         }
 
-        // TURN/H2 policy is derived from the effective endpoint, not from
-        // WhitelistMode alone. WhitelistMode.vkTurn only applies when the
-        // effective endpoint is the backup/Whitelist endpoint; Main always
-        // uses H2 and must clear any stale VK TURN netstack before flows
-        // reconnect.
-        log("info: [vkturn] upstream policy mode=\(policy.endpointMode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw) desired=\(policy.upstream.rawValue)")
-        ExtLog.info("[vkturn] upstream policy mode=\(policy.endpointMode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw) desired=\(policy.upstream.rawValue)")
-        if policy.usesTURN {
-            log("info: [vkturn] effective Whitelist + WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            ExtLog.info("[vkturn] effective Whitelist + WhitelistMode=vkTurn → calling attachVKTurnUpstream")
-            Self.attachVKTurnUpstream()
-            log("info: [vkturn] attachVKTurnUpstream returned (sync part finished)")
-            ExtLog.info("[vkturn] attachVKTurnUpstream returned (sync part finished)")
-        } else {
-            SocksstubStopVKTurnUpstream()
-            let carrier = Self.upstreamModeRaw(policy)
-            log("info: [vkturn] VK TURN not selected — carrier=\(carrier) (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
-            ExtLog.info("[vkturn] VK TURN not selected — carrier=\(carrier) (effective=\(policy.effectiveEndpoint.rawValue), whitelistMode=\(policy.whitelistModeRaw))")
-        }
-
         // VKS room transports: the ladder runs in THIS process — the same
         // Go runtime as the socksstub SOCKS5 bridge — so `dialUpstream`
         // can chain TCP flows through its loopback listener. The ladder
-        // starts ONLY under the whitelist endpoint with WhitelistMode=VKS
-        // (VKS is whitelist-only; the main mode rides plain H2). The app
-        // writes the settings into the App Group; changes apply on the
-        // next connect (or on an endpoint-switch rewire).
-        if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured {
+        // starts ONLY under the whitelist endpoint (VKS is
+        // whitelist-only; the main mode rides plain H2). The app writes
+        // the settings into the App Group; changes apply on the next
+        // connect (or on an endpoint-switch rewire / refreshVKSLadder
+        // provider message).
+        if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: configBlob) {
             // NATIVE VKS transport: the tamizdat session (utls+masq+shortid,
             // the SAME stack as h2) runs over the room datachannel — no
             // olcRTC epoch/keyHex/smux, single key (shortid). The socksstub
             // forwards via the Client's DialContext.
             let vksStatus = SocksstubStartVKSNativeUpstream(
-                VKSPreferences.ladderSpec,
-                VKSPreferences.keyHex,
+                VKSPreferences.ladderSpec(profileBlob: configBlob),
+                VKSPreferences.resolvedKeyHex(profileBlob: configBlob),
                 VKSPreferences.beaconShortIDHex(profileBlob: configBlob),
-                VKSPreferences.wakeDNS,
-                VKSPreferences.wakeZone,
+                VKSPreferences.wakeDNS(profileBlob: configBlob),
+                VKSPreferences.wakeZone(profileBlob: configBlob),
                 VKSPreferences.listenPort
             )
-            let vksServerLabel = VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server
-            log("info: [vks] NATIVE upstream start requested: \(vksStatus) server=\(vksServerLabel)")
-            ExtLog.info("[vks] NATIVE upstream start requested: \(vksStatus) server=\(vksServerLabel)")
+            log("info: [vks] NATIVE upstream start requested: \(vksStatus)")
+            ExtLog.info("[vks] NATIVE upstream start requested: \(vksStatus)")
         } else {
             _ = SocksstubStopVKSUpstream()
             _ = SocksstubStopVKSNativeUpstream()
-            let vksReason = policy.usesVKS ? "disabled or not configured" : "whitelist carrier is not VKS"
+            let vksReason = policy.usesVKS ? "disabled or not configured" : "endpoint is not whitelist"
             log("info: [vks] chain inactive (\(vksReason))")
             ExtLog.info("[vks] chain inactive (\(vksReason))")
         }
         return true
-    }
-
-    /// Spin up the VK TURN runner if the operator selected it.
-    /// All inputs come from App Group UserDefaults — the user fills
-    /// them in Settings → VK TURN before flipping the picker on.
-    /// Traffic still flows over the existing hev path; this only logs
-    /// the WireGuard config it receives so the operator can verify
-    /// reachability. WireGuardKit attach is Phase 2D-followup.
-    ///
-    /// Logging changed from a captured `(String) -> Void` closure to
-    /// direct `ExtLog.*` calls. The closure path (which fans out to
-    /// `FileHandle.write` + `synchronize`) was eating every line we
-    /// emitted around `SocksstubStartVKTurnUpstream`. That gomobile
-    /// call used to block while VK Allocate / DTLS / GETCONF ran, and
-    /// Foundation's buffered handle silently dropped post-block lines.
-    /// `ExtLog` open/write/fsync/close every call, so the timeline
-    /// survives the block.
-    @discardableResult
-    private static func attachVKTurnUpstream(scheduleDrainRetry: Bool = true) -> String {
-        ExtLog.info("[vkturn] attach: entering helper")
-
-        // Read runtime values from App Group UserDefaults — these keys
-        // are written by the main app. VKSession paramsPreferences/TURNSession paramsStore
-        // are included in the extension target for read-side helpers, but
-        // the WKWebView refresh writer remains main-app-only.
-        let groupID = "group.com.anarki.samizdat-test"
-        let defaults = UserDefaults(suiteName: groupID)
-        let derivedPeer = defaults?.string(forKey: "tamizdat.vkPeerAddr") ?? ""
-        let explicitPeer = defaults?.string(forKey: "tamizdat.vkturn.server") ?? ""
-        let peer = explicitPeer.isEmpty ? derivedPeer : explicitPeer
-        let password = defaults?.string(forKey: "tamizdat.vkConnectPassword") ?? ""
-        let deviceID = defaults?.string(forKey: "tamizdat.vkDeviceID") ?? "no-device-id"
-        let workers = VKCredsPreferences.workers
-        let roomCount = VKCredsPreferences.roomHashes.count
-        ExtLog.info("[vkturn] attach: peer=\"\(peer)\" passwordLen=\(password.count) deviceIDLen=\(deviceID.count) rooms=\(roomCount) workersPerRoom=20")
-
-        guard !peer.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// server not mirrored yet. Open Settings → Proxies and save Main URI.")
-            return "missingPeer"
-        }
-        guard !password.isEmpty else {
-            ExtLog.warn("[vkturn] attach SKIPPED — Main tamizdat:// shortid not mirrored yet. Re-save Main URI in Settings → Proxies.")
-            return "missingPassword"
-        }
-        if SocksstubTURNUpstreamRunning() {
-            let ready = !SocksstubTURNUpstreamWGConfig().isEmpty
-            ExtLog.info("[vkturn] attach deduplicated — runner already \(ready ? "ready" : "waiting for GETCONF") generation=\(SocksstubTURNUpstreamGeneration())")
-            return "already running"
-        }
-
-        // Prefer the atomic multi-room bundle. Legacy single-room JSON remains
-        // readable so existing installs can refresh once after upgrading.
-        let roomBundleJSON = defaults?.string(forKey: TURNCredsStore.roomJSONKey)
-        let legacyCredsJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
-        guard (roomBundleJSON?.isEmpty == false) || (legacyCredsJSON?.isEmpty == false) else {
-            ExtLog.warn("[vkturn] attach SKIPPED — no complete credential bundle in App Group")
-            return "noCreds"
-        }
-        let credsJSON = legacyCredsJSON ?? ""
-        ExtLog.info("[vkturn] attach: credential payload present mode=\(roomBundleJSON?.isEmpty == false ? "multi-room" : "legacy")")
-
-        // Safety margin gate. The pre-fix code hard-coded 3480 s
-        // (lifetime 3600 minus 120 s cushion), but VK has shipped
-        // shorter-lived session params in the past — and a future TTL change
-        // would have silently let us call `SocksstubStartVKTurnUpstream`
-        // against session params that were already past expiry. That gomobile
-        // function does a synchronous VK Allocate against the TURN
-        // server, which can sleep up to 15 s before failing 401, so
-        // we want to bail clean here and let the foreground/BG
-        // refresher grab fresh session params instead.
-        //
-        // Now: parse `lifetime_sec` out of the session paramsJSON we already
-        // loaded above (wire shape `{username, password, turn_servers,
-        // lifetime_sec}` from TURNSession paramsStore.vkSession paramsAsJSON) and gate
-        // on `age >= lifetime - 120 s`. lifetime_sec <= 0 falls back
-        // to the historic 3480 s value so older entries (pre-refresh
-        // schema) still age-check cleanly.
-        if roomBundleJSON?.isEmpty != false {
-            let cushionSec: TimeInterval = 120
-            let lifetimeSec: TimeInterval = {
-            guard let data = credsJSON.data(using: .utf8) else { return 0 }
-            struct LifetimeShape: Decodable { let lifetime_sec: Int? }
-            guard let parsed = try? JSONDecoder().decode(LifetimeShape.self, from: data),
-                  let life = parsed.lifetime_sec, life > 0 else {
-                return 0
-            }
-            return TimeInterval(life)
-        }()
-        let safeBound: TimeInterval = lifetimeSec > 0 ? (lifetimeSec - cushionSec) : 3480
-
-        // Key written by `TURNSession paramsStore.save(_:)` alongside the JSON
-        // payload — see step C of feat/turn-autonomous-refresh.
-        if let acquiredAt = defaults?.object(forKey: "tamizdat.vkTURNCredsAcquiredAt") as? Date {
-            let age = Date().timeIntervalSince(acquiredAt)
-            ExtLog.info("[vkturn] attach: creds age=\(Int(age))s (lifetime=\(Int(lifetimeSec))s, cushion=\(Int(cushionSec))s)")
-            if age >= safeBound {
-                ExtLog.warn("[vkturn] attach SKIPPED — creds стары (age=\(Int(age))s ≥ \(Int(safeBound))s). Wait for refresh, then reconnect.")
-                return "staleCreds"
-            }
-        } else {
-            ExtLog.warn("[vkturn] attach: no vkTURNCredsAcquiredAt stamp — proceeding without age check (legacy creds?)")
-        }
-
-        }
-
-        ExtLog.info("[vkturn] attach: BEFORE runner start peer=\(peer), listenPort=9000, rooms=\(roomCount)")
-        let beforeMs = Date()
-        let err: String
-        if let bundle = roomBundleJSON, !bundle.isEmpty {
-            err = SocksstubStartVKTurnMultiRoomUpstream(bundle, peer, password, deviceID, 9000, VKCredsPreferences.workersPerRoom)
-        } else {
-            err = SocksstubStartVKTurnUpstream(credsJSON, peer, password, deviceID, 9000, workers)
-        }
-        let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
-        ExtLog.info("[vkturn] attach: AFTER runner start dur=\(durMs)ms err=\"\(err)\"")
-        if err == "already running" {
-            ExtLog.info("[vkturn] attach deduplicated by Go singleton")
-            return err
-        }
-        if err == "previous runner still draining" {
-            ExtLog.info("[vkturn] attach pending — previous runner still draining")
-            if scheduleDrainRetry {
-                scheduleVKTurnAttachAfterDrain()
-            }
-            return err
-        }
-        if !err.isEmpty {
-            ExtLog.error("[vkturn] runner start returned: \"\(err)\"")
-            return err
-        }
-        let generation = SocksstubTURNUpstreamGeneration()
-        ExtLog.info("[vkturn] runner OK generation=\(generation), polling for WG config + netstack (up to 60 s)")
-
-        Task.detached(priority: .utility) {
-            ExtLog.info("[vkturn] async polling task started generation=\(generation)")
-            struct TurnStatsShape: Decodable { let error: String? }
-            var attempts = 0
-            for _ in 0..<240 { // 240 * 250 ms = 60 s
-                attempts += 1
-                let currentGeneration = SocksstubTURNUpstreamGeneration()
-                if currentGeneration != generation {
-                    ExtLog.info("[vkturn] polling stopped — stale generation=\(generation) current=\(currentGeneration)")
-                    return
-                }
-                let wg = SocksstubTURNUpstreamWGConfig()
-                let running = SocksstubTURNUpstreamRunning()
-                if !wg.isEmpty {
-                    ExtLog.info("[vkturn] WG config received after \(attempts*250)ms (\(wg.count) chars; content redacted)")
-                    ExtLog.info("[vkturn] SocksstubTURNUpstreamRunning = \(running). Traffic should now flow via netstack.")
-                    return
-                }
-                let stats = SocksstubTURNUpstreamStatsJSON()
-                if let data = stats.data(using: .utf8),
-                   let shape = try? JSONDecoder().decode(TurnStatsShape.self, from: data),
-                   let error = shape.error,
-                   !error.isEmpty {
-                    ExtLog.error("[vkturn] async attach failed generation=\(generation): \(error)")
-                    return
-                }
-                if !running {
-                    ExtLog.warn("[vkturn] polling stopped — runner exited before GETCONF generation=\(generation)")
-                    return
-                }
-                if attempts % 8 == 0 { // every 2 sec
-                    ExtLog.info("[vkturn] still waiting for WG config (running=\(running), \(attempts*250)ms)")
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
-            ExtLog.warn("[vkturn] WG config NOT received within 60 s. running=\(SocksstubTURNUpstreamRunning()) stats=\(SocksstubTURNUpstreamStatsJSON())")
-        }
-        return ""
-    }
-
-    private static func scheduleVKTurnAttachAfterDrain() {
-        let capturedTunnelGeneration = turnTunnelGenerationLock.withLock { $0 }
-        let shouldSchedule = turnAttachRetryGenerationLock.withLock { owner -> Bool in
-            if owner == capturedTunnelGeneration { return false }
-            owner = capturedTunnelGeneration
-            return true
-        }
-        guard shouldSchedule else {
-            ExtLog.info("[vkturn] drain retry already scheduled generation=\(capturedTunnelGeneration)")
-            return
-        }
-
-        Task.detached(priority: .utility) {
-            defer {
-                turnAttachRetryGenerationLock.withLock { owner in
-                    if owner == capturedTunnelGeneration {
-                        owner = nil
-                    }
-                }
-            }
-            for attempt in 1...120 { // up to 60 s; never blocks NE stop watchdog
-                guard turnTunnelGenerationLock.withLock({ $0 }) == capturedTunnelGeneration else {
-                    ExtLog.info("[vkturn] drain retry cancelled — tunnel generation changed")
-                    return
-                }
-                let policy = upstreamPolicy(mode: EndpointModeStore.current, backup: nil)
-                guard policy.usesTURN else {
-                    ExtLog.info("[vkturn] drain retry cancelled — current policy no longer uses TURN")
-                    return
-                }
-                if !SocksstubTURNUpstreamDraining() {
-                    let result = attachVKTurnUpstream(scheduleDrainRetry: false)
-                    ExtLog.info("[vkturn] drain retry attempt=\(attempt) result=\(result.isEmpty ? "started" : result)")
-                    if result == "previous runner still draining" {
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        continue
-                    }
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 500_000_000)
-            }
-            ExtLog.error("[vkturn] drain retry timed out after 60 s")
-        }
-    }
-
-    private static func refreshVKTurnCredsFromAppGroup() -> String {
-        let groupID = "group.com.anarki.samizdat-test"
-        let defaults = UserDefaults(suiteName: groupID)
-        let roomBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)
-        let legacyJSON = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")
-
-        let beforeMs = Date()
-        let err: String
-        let mode: String
-        if let roomBundle, !roomBundle.isEmpty {
-            mode = "multi-room"
-            err = SocksstubUpdateVKTurnRoomCreds(roomBundle)
-        } else if let legacyJSON, !legacyJSON.isEmpty {
-            mode = "legacy"
-            err = SocksstubUpdateVKTurnCreds(legacyJSON)
-        } else {
-            ExtLog.warn("[vkturn] refresh creds SKIPPED — no credential payload in App Group")
-            return "noCreds"
-        }
-
-        let durMs = Int(Date().timeIntervalSince(beforeMs) * 1000)
-        if err.isEmpty {
-            ExtLog.info("[vkturn] refresh creds OK mode=\(mode) dur=\(durMs)ms")
-            return "ok"
-        }
-        if err == "not running" {
-            ExtLog.info("[vkturn] refresh creds: runner not running mode=\(mode) dur=\(durMs)ms")
-            return err
-        }
-        ExtLog.warn("[vkturn] refresh creds failed mode=\(mode) err=\"\(err)\" dur=\(durMs)ms")
-        return err
     }
 
     override func stopTunnel(with reason: NEProviderStopReason,
@@ -680,7 +400,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         autoRewireBridge = nil
         // Invalidate any rewire still queued/running on rewireQueue so it
         // observes a superseded generation and bails before re-calling
-        // SocksstubSetSamizdatConfig / re-attaching TURN after teardown.
+        // SocksstubSetSamizdatConfig / re-arming the VKS carrier after teardown.
         _ = nextRewireGeneration()
         whitelistDetector?.stop()
         whitelistDetector = nil
@@ -696,11 +416,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // "first update = baseline, no rewire" fingerprint instead of
         // comparing a hot restart against the previous session's kind.
         lastPathInterfaceID = nil
-        // NE stop must return promptly: cancel/reset synchronously, but drain
-        // TURN workers/allocations in Go background. Replacement starts remain
-        // gated until that drain completes.
-        Self.turnTunnelGenerationLock.withLock { $0 += 1 }
-        SocksstubStopVKTurnUpstreamAsync()
+        // Tear down the VKS room transport before quitting hev so room
+        // sessions (SFU websocket, PeerConnections, pings) don't outlive
+        // the tunnel.
         _ = SocksstubStopVKSUpstream()
         _ = SocksstubStopVKSNativeUpstream()
         // Ensure the async hev start block has begun before quitting it.
@@ -824,48 +542,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return "\(typeName)[\(names)]"
     }
 
-    /// A ping miss in TURN mode must not rebuild the dormant H2 client and
-    /// close all live SOCKS flows. That old behavior reset TCP every ~11–15 s,
-    /// reducing throughput; while GETCONF was pending it also spawned duplicate
-    /// attach pollers and eventually caused rapid runner restart/quota churn.
-    /// Physical NWPath changes and explicit user reconnects remain separate,
-    /// authoritative lifecycle triggers.
-    /// Whitelist carriers (VKS / VK TURN) are the path the operator requires in
-    /// every non-Main mode, and a rewire is destructive: it stops the carrier
-    /// and force-closes every live flow. A prober miss must therefore surface
-    /// in the UI state instead of driving a rewire loop. Main keeps auto-rewire.
+    /// Whitelist carriers are the path the operator requires in every
+    /// non-Main mode, and a rewire is destructive: it stops the carrier
+    /// and force-closes every live flow. A prober miss must therefore
+    /// surface in the UI state instead of driving a rewire loop.
+    /// Main keeps auto-rewire.
     private func shouldSuppressPingRewireForWhitelistCarrier() -> Bool {
-        let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
-        guard policy.usesTURN else {
-            // Same invariant as TURN below: a rewire stops the carrier and
-            // force-closes every live flow, so a prober miss must never request
-            // one while a whitelist carrier owns the data path.
-            if policy.upstream != .h2 {
-                appendExtLog("info: auto-rewire ignored — whitelist carrier owns upstream; preserving live flows")
-                return true
-            }
-            return false
+        let policy = self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+        if policy.upstream != .h2 {
+            appendExtLog("info: auto-rewire ignored — whitelist carrier owns upstream; preserving live flows")
+            return true
         }
-
-        let running = SocksstubTURNUpstreamRunning()
-        let ready = !SocksstubTURNUpstreamWGConfig().isEmpty
-        if ready {
-            appendExtLog("info: auto-rewire ignored — TURN data plane owns upstream; preserving live flows")
-        } else if running {
-            appendExtLog("info: auto-rewire ignored — TURN runner is waiting for GETCONF; preserving attach generation")
-        } else {
-            let freshness = Self.vkTurnCredsFreshness()
-            appendExtLog("warn: auto-rewire ignored — TURN runner is stopped (\(freshness.reason)); waiting for explicit refresh/reconnect")
-        }
-        return true
-    }
-
-    private static func vkTurnCredsFreshness() -> (isFresh: Bool, reason: String) {
-        if TURNCredsStore.shared.roomsAreFresh {
-            let rooms = VKCredsPreferences.roomHashes.count
-            return (true, "multi-room credentials fresh rooms=\(rooms)")
-        }
-        return (false, "multi-room credentials missing, incomplete, or stale")
+        return false
     }
 
     /// Rebuilds the samizdat client by re-calling SocksstubSetSamizdatConfig
@@ -884,7 +572,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return
             }
             let mode = EndpointModeStore.current
-            let policy = Self.upstreamPolicy(mode: mode, backup: self.backupBlob)
+            let policy = self.upstreamPolicy(mode: mode, backup: self.backupBlob)
             let blob = Self.pick(mode: mode, primary: self.primaryBlob, backup: self.backupBlob)
             guard !blob.isEmpty else {
                 self.appendExtLog("warn: rewire gen=\(generation) skipped — empty config blob")
@@ -898,46 +586,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // previous carrier.
             SocksstubSetUpstreamMode(Self.upstreamModeRaw(policy))
 
-            // Every authoritative rewire owns the current data-plane lifecycle.
-            // H2 must clear a stale TURN netstack; TURN must drain and recreate
-            // its relay sockets on the new NWPath instead of "rewiring" only
-            // the dormant H2 client. Ping-prober callbacks never reach here in
-            // TURN mode, so this cannot create the old 11-second restart loop.
-            SocksstubStopVKTurnUpstream()
-            guard self.rewireGeneration == generation else {
-                self.appendExtLog("info: rewire gen=\(generation) stopped after TURN drain — superseded")
-                return
-            }
+            // Every authoritative rewire owns the current data-plane
+            // lifecycle. The VKS carrier follows the whitelist policy on
+            // rewires (mode/endpoint flips), not only at startTunnel —
+            // and it must land on the SAME native room transport
+            // startTunnel uses, or a mid-session flip would silently
+            // switch carriers. Main/H2 rewires stop the room transport
+            // via the else-branch below.
 
-            var err: NSError?
-            SocksstubSetSamizdatConfig(blob, &err)
-            if let err {
-                self.appendExtLog("error: rewire gen=\(generation) SetSamizdatConfig: \(err.localizedDescription)")
-                self.finishRewireGeneration(generation)
-                return
-            }
-            guard self.rewireGeneration == generation else {
-                self.appendExtLog("info: rewire gen=\(generation) skipped after config — superseded before attach")
-                return
-            }
-
-            if policy.usesTURN {
-                Self.attachVKTurnUpstream()
-            }
-            // Mirror for VKS: the carrier follows the whitelist policy on rewires
-            // (mode/endpoint flips), not only at startTunnel — and it must land
-            // on the SAME native room transport startTunnel uses, or a
-            // mid-session flip would silently switch the carrier.
-            if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured {
+            if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: blob) {
                 let vksStatus = SocksstubStartVKSNativeUpstream(
-                    VKSPreferences.ladderSpec,
-                    VKSPreferences.keyHex,
+                    VKSPreferences.ladderSpec(profileBlob: blob),
+                    VKSPreferences.resolvedKeyHex(profileBlob: blob),
                     VKSPreferences.beaconShortIDHex(profileBlob: blob),
-                    VKSPreferences.wakeDNS,
-                    VKSPreferences.wakeZone,
+                    VKSPreferences.wakeDNS(profileBlob: blob),
+                    VKSPreferences.wakeZone(profileBlob: blob),
                     VKSPreferences.listenPort
                 )
-                self.appendExtLog("info: [vks] rewire start requested: \(vksStatus) server=\(VKSPreferences.server.isEmpty ? "-" : VKSPreferences.server)")
+                self.appendExtLog("info: [vks] rewire start requested: \(vksStatus)")
             } else {
                 _ = SocksstubStopVKSUpstream()
                 _ = SocksstubStopVKSNativeUpstream()
@@ -949,7 +615,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // IPA-D17: after the new upstream policy is in place,
             // force-close every loopback SOCKS5 flow that hev opened over
             // the OLD path. Apps see RST → reconnect immediately on the
-            // fresh H2 or TURN path instead of hanging on dead streams.
+            // fresh carrier instead of hanging on dead streams.
             let closed = SocksstubCloseAllFlows()
             self.appendExtLog("info: rewire gen=\(generation) force-closed \(closed) stale flows")
             self.finishRewireGeneration(generation)
@@ -969,21 +635,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private static func whitelistModeRaw() -> String {
-        UserDefaults(suiteName: appGroupID)?
-            .string(forKey: "tamizdat.whitelistMode") ?? "vks"
+    /// The whitelist target is the VKS ladder: enabled + configured
+    /// (at least one enabled provider + a resolvable key — from the
+    /// link or Settings). The params come from the combined blob.
+    private func whitelistTargetConfigured(backup: String?) -> Bool {
+        VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: combinedConfigBlob)
     }
 
-    private static func whitelistTargetConfigured(backup: String?, whitelistModeRaw: String) -> Bool {
-        // H2 whitelist needs an explicit backup tamizdat:// URI. VK TURN does
-        // not: peer host + password are derived from the Main URI and TURN
-        // session params live in App Group storage. Treating nil backup as "primary"
-        // here made manual Restricted+Relay silently run H2/Main.
-        whitelistModeRaw == "vkTurn" || (whitelistModeRaw == "vks" && VKSPreferences.isConfigured)
-    }
-
-    private static func effectiveEndpoint(mode: EndpointMode, backup: String?, whitelistModeRaw: String) -> EndpointMode {
-        let hasWhitelistTarget = whitelistTargetConfigured(backup: backup, whitelistModeRaw: whitelistModeRaw)
+    private func effectiveEndpoint(mode: EndpointMode, backup: String?) -> EndpointMode {
+        let hasWhitelistTarget = whitelistTargetConfigured(backup: backup)
         switch mode {
         case .primary:
             return .primary
@@ -995,30 +655,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private static func upstreamPolicy(mode: EndpointMode, backup: String?) -> UpstreamPolicy {
-        let whitelist = whitelistModeRaw()
-        let effective = effectiveEndpoint(mode: mode, backup: backup, whitelistModeRaw: whitelist)
-        let upstream: EffectiveUpstream
-        if effective == .backup, whitelist == "vkTurn" {
-            upstream = .turn
-        } else if effective == .backup, whitelist == "vks" {
-            upstream = .vks
-        } else {
-            upstream = .h2
-        }
-        return UpstreamPolicy(endpointMode: mode, effectiveEndpoint: effective, whitelistModeRaw: whitelist, upstream: upstream)
+    private func upstreamPolicy(mode: EndpointMode, backup: String?) -> UpstreamPolicy {
+        let effective = effectiveEndpoint(mode: mode, backup: backup)
+        // VK TURN is gone: the whitelist endpoint always rides VKS.
+        let upstream: EffectiveUpstream = (effective == .backup) ? .vks : .h2
+        return UpstreamPolicy(endpointMode: mode, effectiveEndpoint: effective, upstream: upstream)
     }
 
     /// Maps the effective carrier onto the Go-side dial mode. Main rides H2;
-    /// the whitelist endpoint rides its selected carrier (VKS or VK TURN).
+    /// the whitelist endpoint rides the VKS room transport.
     /// dialUpstream switches on this and never falls back to H2 outside Main.
     private static func upstreamModeRaw(_ policy: UpstreamPolicy) -> String {
         switch policy.upstream {
         case .vks: return "vks"
-        case .turn: return "turn"
-        case .h2: return "main"
+        case .h2:  return "main"
         }
     }
+
+
 
     /// Picks the appropriate blob for a given mode. In manual modes
     /// (.primary/.backup) it follows the user's pick. In .auto mode it
@@ -1041,13 +695,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: – WhitelistDetector lifecycle
 
     /// Starts the detector iff EndpointModeStore.current == .auto AND a
-    /// whitelist target is configured: H2 backup URI or VK TURN via Main URI.
-    /// Idempotent — calling again while the detector is already running is a no-op.
+    /// whitelist target is configured (the VKS ladder). Idempotent —
+    /// calling again while the detector is already running is a no-op.
     private func startWhitelistDetectorIfNeeded() {
         let mode = EndpointModeStore.current
-        let whitelistRaw = Self.whitelistModeRaw()
-        let hasWhitelistTarget = Self.whitelistTargetConfigured(backup: backupBlob, whitelistModeRaw: whitelistRaw)
-        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(backupBlob != nil) whitelistMode=\(whitelistRaw) hasWhitelistTarget=\(hasWhitelistTarget) running=\(whitelistDetector != nil)")
+        let hasWhitelistTarget = whitelistTargetConfigured(backup: backupBlob)
+        appendExtLog("info: detector lifecycle check: mode=\(mode.rawValue) hasBackup=\(backupBlob != nil) hasWhitelistTarget=\(hasWhitelistTarget) running=\(whitelistDetector != nil)")
         guard mode == .auto else {
             // Mode is not auto → stop if it was running, paint badge as unknown
             // so the UI doesn't keep showing a stale verdict.
@@ -1060,10 +713,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         guard hasWhitelistTarget else {
-            // Auto requested but there is no target to fail over TO.
-            // H2 mode needs a saved backup URI; TURN mode is valid without
-            // one because it derives peer/password from the Main URI.
-            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist target configured (set Whitelist mode=TURN or save backup URL)")
+            // Auto requested but there is no VKS ladder to fail over TO.
+            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist target configured (enable VKS or save a profile with vkskey)")
             if whitelistDetector != nil {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
@@ -1164,74 +815,32 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             appendExtLog("info: app requested whitelist probes refresh → foreign=\(WhitelistProbePreferences.testHost) domestic=\(WhitelistProbePreferences.whitelistHost)")
             whitelistDetector?.applyConfig()
             completionHandler?("whitelistProbesRefreshed".data(using: .utf8))
-        case "refreshVKTurnCreds":
-            appendExtLog("info: app requested VK TURN creds refresh")
-            // attachVKTurnUpstream performs a synchronous VK Allocate that
-            // can block up to 15 s. handleAppMessage is delivered on the
-            // provider's serial IPC queue — running the attach there stalls
-            // every other provider message (the 500 ms "status" polls freeze).
-            // Hop to a background queue; completionHandler may be invoked
-            // from any queue.
-            turnIpcQueue.async { [weak self] in
-                guard let self else {
-                    completionHandler?(Data())
-                    return
-                }
-                let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob)
-                guard policy.usesTURN else {
-                    SocksstubStopVKTurnUpstream()
-                    self.appendExtLog("info: VK TURN creds refresh ignored by policy — effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw), H2 active")
-                    completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
-                    return
-                }
-
-                let result = Self.refreshVKTurnCredsFromAppGroup()
-                if result == "not running" {
-                    // If the tunnel started before VK session params existed,
-                    // attachVKTurnUpstream() skipped. A later successful
-                    // refresh should start the runner immediately, but only
-                    // while the effective endpoint is Restricted+Relay.
-                    self.appendExtLog("info: VK TURN creds refreshed while runner was stopped; starting attach path")
-                    let attachResult = Self.attachVKTurnUpstream()
-                    let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
-                    completionHandler?(response.data(using: .utf8))
-                } else {
-                    completionHandler?(result.data(using: .utf8))
-                }
+        case "refreshVKSLadder":
+            // Settings → Каналы whitelist changed (provider order /
+            // enable flags). Re-read the App Group ladder spec and
+            // re-arm the native room transport if VKS owns the data
+            // path; stop it otherwise. Runs on the provider IPC queue —
+            // SocksstubStartVKSNativeUpstream is non-blocking (the
+            // room join runs in the Go background).
+            let policy = self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
+            let blob = Self.pick(mode: EndpointModeStore.current, primary: primaryBlob, backup: backupBlob)
+            appendExtLog("info: app requested VKS ladder refresh → effective=\(policy.effectiveEndpoint.rawValue) ladder=\(VKSPreferences.ladderSpec(profileBlob: blob))")
+            if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: blob) {
+                let vksStatus = SocksstubStartVKSNativeUpstream(
+                    VKSPreferences.ladderSpec(profileBlob: blob),
+                    VKSPreferences.resolvedKeyHex(profileBlob: blob),
+                    VKSPreferences.beaconShortIDHex(profileBlob: blob),
+                    VKSPreferences.wakeDNS(profileBlob: blob),
+                    VKSPreferences.wakeZone(profileBlob: blob),
+                    VKSPreferences.listenPort
+                )
+                appendExtLog("info: [vks] ladder refresh re-armed: \(vksStatus)")
+            } else {
+                _ = SocksstubStopVKSUpstream()
+                _ = SocksstubStopVKSNativeUpstream()
+                appendExtLog("info: [vks] ladder refresh — carrier inactive, room transport stopped")
             }
-        case "restartVKTurnUpstream":
-            // Settings → VK TURN workers changed. Workers are only read
-            // at runner construction, so apply them by stopping the
-            // current TURN runner and starting a fresh attach if TURN is
-            // the active policy. H2/Main users just keep the saved value
-            // for the next Restricted+Relay connect.
-            // Runs on turnIpcQueue: attachVKTurnUpstream blocks up to 15 s
-            // (VK Allocate) and must not stall the IPC queue ("status").
-            turnIpcQueue.async { [weak self] in
-                guard let self else {
-                    completionHandler?(Data())
-                    return
-                }
-                let policy = Self.upstreamPolicy(mode: EndpointModeStore.current, backup: self.backupBlob)
-                self.appendExtLog("info: app requested VK TURN restart → rooms=\(VKCredsPreferences.roomHashes.count) workersPerRoom=20 effective=\(policy.effectiveEndpoint.rawValue) whitelistMode=\(policy.whitelistModeRaw)")
-                guard policy.usesTURN else {
-                    SocksstubStopVKTurnUpstream()
-                    completionHandler?("turnDisabled:\(policy.effectiveEndpoint.rawValue)".data(using: .utf8))
-                    return
-                }
-                SocksstubStopVKTurnUpstream()
-                let defaults = UserDefaults(suiteName: "group.com.anarki.samizdat-test")
-                let hasBundle = defaults?.string(forKey: TURNCredsStore.roomJSONKey)?.isEmpty == false
-                let hasLegacy = defaults?.string(forKey: "tamizdat.vkTURNCredsJSON")?.isEmpty == false
-                guard hasBundle || hasLegacy else {
-                    self.appendExtLog("warn: VK TURN restart skipped — no credential payload in App Group")
-                    completionHandler?("noCreds".data(using: .utf8))
-                    return
-                }
-                let attachResult = Self.attachVKTurnUpstream()
-                let response = attachResult == "previous runner still draining" ? "attachPendingDrain" : (attachResult.isEmpty ? "attachStarted" : attachResult)
-                completionHandler?(response.data(using: .utf8))
-            }
+            completionHandler?("vksLadderRefreshed".data(using: .utf8))
         case "status":
             // IPA-Z (D21 update): main-screen lamp polls this every 500 ms.
             // Snapshot is built from in-process Socksstub*() getters which
@@ -1262,10 +871,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 uptime = 0
             }
             let mode = EndpointModeStore.current
-            let policy = Self.upstreamPolicy(mode: mode, backup: backupBlob)
-            let turnRunning = SocksstubTURNUpstreamRunning()
-            let turnNetstackReady = !SocksstubTURNUpstreamWGConfig().isEmpty
-            let actualUpstream = turnNetstackReady ? "turn" : "h2"
+            let policy = self.upstreamPolicy(mode: mode, backup: backupBlob)
+            let vksRunning = SocksstubVKSUpstreamRunning() || SocksstubVKSNativeRunning()
+            let actualUpstream = vksRunning ? "vks" : "h2"
             let payload: [String: Any] = [
                 "realShape":   SocksstubRealShapeMode(),
                 "lockedFlows": Int(SocksstubLockedRealtimeFlows()),
@@ -1287,18 +895,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 "effectiveEndpoint": policy.effectiveEndpoint.rawValue,
                 "desiredUpstream": policy.upstream.rawValue,
                 "upstreamKind": actualUpstream,
-                "turnRunning": turnRunning ? 1 : 0,
-                "turnNetstackReady": turnNetstackReady ? 1 : 0,
-                "turnWorkers": VKCredsPreferences.workers,
-                // VK TURN relay session parameter status. IPA-D65b: the main
-                // app now acquires session params itself via WKWebView verification challenge
-                // solving and writes them to App Group UserDefaults
-                // (`TURNSession paramsStore`). The extension only READS the
-                // cache here — no VK API touch from inside the NE.
-                // The legacy `SocksstubTURNSession paramsSnapshot()` is kept on
-                // the Go side as a no-op fallback for now but is no
-                // longer the source of truth.
-                "hasTURNCreds": TURNCredsStore.shared.isFresh,
+                "vksRunning":  vksRunning ? 1 : 0,
             ]
             let json = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
             completionHandler?(json)

@@ -29,18 +29,32 @@ type WatchServer struct {
 	idle    time.Duration
 	keyHex  string
 	creator RoomCreator
+	// telemostPool, when set, feeds AssignRoom's telemost branch with
+	// previously created (persistent, reusable) rooms and records newly
+	// created ones for reuse across restarts.
+	telemostPool *TelemostPool
+	// maxRooms caps the number of simultaneously joined rooms (0 =
+	// unlimited). At the cap AssignRoom shares a busy telemost room or
+	// fails over — it never joins a new room.
+	maxRooms int
+	// creds is the mutable provider credential store (telemost/mts
+	// cookies); the beacon handler reads its login-required set for the
+	// TXT flags.
+	creds *CredStore
 	// nativeServe, when set, serves a woken room via the NATIVE transport
-	// (TLS+masq over the datachannel, shortid-only — no olcRTC) instead of the
-	// olcRTC RunServer. Wired by the cmd when the native serve is enabled.
+	// (TLS+masq over the datachannel, shortid-only — no olcRTC) instead of
+	// the olcRTC RunServer. Wired by the cmd when the native serve is
+	// enabled.
 	nativeServe func(ctx context.Context, cfg Config) error
 	// validateShortID, when set, gates the provider beacon: the beacon carries
 	// the client's shortid and the room is only created/assigned when the
 	// shortid is a valid user (closes the unauthenticated-amplification gap).
 	validateShortID func(shortIDHex string) bool
 
-	mu     sync.Mutex
-	rooms  map[string]Config            // roomKey -> room it may serve
-	active map[string]context.CancelFunc // roomKey -> cancel of the live join
+	mu      sync.Mutex
+	rooms   map[string]Config             // roomKey -> room it may serve
+	active  map[string]context.CancelFunc // roomKey -> cancel of the live join
+	dynamic map[string]bool               // roomKey -> came from the creator, not the armed pool
 }
 
 // NewWatchServer builds an on-demand server over the given room configs.
@@ -49,10 +63,11 @@ func NewWatchServer(rooms []Config, hooks ServerHooks, idle time.Duration) *Watc
 		idle = 120 * time.Second
 	}
 	w := &WatchServer{
-		hooks:  hooks,
-		idle:   idle,
-		rooms:  map[string]Config{},
-		active: map[string]context.CancelFunc{},
+		hooks:   hooks,
+		idle:    idle,
+		rooms:   map[string]Config{},
+		active:  map[string]context.CancelFunc{},
+		dynamic: map[string]bool{},
 	}
 	for _, cfg := range rooms {
 		cfg.IdleTimeout = idle
@@ -90,6 +105,32 @@ func (w *WatchServer) SetShortIDValidator(fn func(shortIDHex string) bool) {
 	w.mu.Unlock()
 }
 
+// SetTelemostPool installs the reusable telemost room pool: idle pool
+// rooms are assigned before creating a new one, and created rooms land
+// there for reuse across restarts.
+func (w *WatchServer) SetTelemostPool(pool *TelemostPool) {
+	w.mu.Lock()
+	w.telemostPool = pool
+	w.mu.Unlock()
+}
+
+// SetMaxRooms caps the number of simultaneously joined rooms (0 =
+// unlimited). At the cap AssignRoom shares a busy telemost room or
+// returns an error (client failover) — it never joins a new room.
+func (w *WatchServer) SetMaxRooms(n int) {
+	w.mu.Lock()
+	w.maxRooms = n
+	w.mu.Unlock()
+}
+
+// SetCredStore installs the mutable credential store whose
+// login-required set is advertised in the beacon TXT flags.
+func (w *WatchServer) SetCredStore(creds *CredStore) {
+	w.mu.Lock()
+	w.creds = creds
+	w.mu.Unlock()
+}
+
 // matchProviderKey maps a beacon selector to a provider name when the
 // selector equals that provider's ProviderWakeKey (HMAC of the shared key).
 func (w *WatchServer) matchProviderKey(selector string) string {
@@ -106,6 +147,7 @@ func (w *WatchServer) matchProviderKey(selector string) string {
 	}
 	return ""
 }
+
 // roomKey derives the stable, DNS-safe selector for a room from the shared
 // wire key. A client proves it knows the key by beaconing this value; a
 // random DNS querier cannot guess a valid roomKey, so noise and strangers
@@ -144,6 +186,7 @@ func (w *WatchServer) Serve(cfg Config) string {
 	w.mu.Lock()
 	if _, exists := w.rooms[roomKey]; !exists {
 		w.rooms[roomKey] = cfg
+		w.dynamic[roomKey] = true
 	}
 	w.mu.Unlock()
 	w.Wake(roomKey)
@@ -158,6 +201,7 @@ func (w *WatchServer) Wake(roomKey string) {
 	w.mu.Lock()
 	cfg, known := w.rooms[roomKey]
 	_, live := w.active[roomKey]
+	dynamic := w.dynamic[roomKey]
 	if !known || live {
 		w.mu.Unlock()
 		return
@@ -174,6 +218,15 @@ func (w *WatchServer) Wake(roomKey string) {
 		defer func() {
 			w.mu.Lock()
 			delete(w.active, roomKey)
+			// A dynamic room (beacon-created, not in the armed startup set)
+			// is dead once released: its MTS meeting is deleted by
+			// CleanupHook, its WB/Jazz room is abandoned. Keeping it in
+			// w.rooms made the map grow without bound on a long-lived
+			// server and let AssignRoom hand out a room whose meeting no
+			// longer exists.
+			if dynamic {
+				delete(w.rooms, roomKey)
+			}
 			w.mu.Unlock()
 			cancel()
 			log.Printf("vks watch: room %s released (idle)", cfg.RoomURL)
@@ -194,28 +247,63 @@ func (w *WatchServer) Wake(roomKey string) {
 }
 
 // AssignRoom is the beacon-assignment entry point: given a provider name it
-// returns a room the client should join. It first tries the dynamic RoomCreator
-// (WB/Jazz create a FRESH room — full bandwidth per client); when the creator
-// cannot handle the provider (telemost/mts need account cookies) it falls
-// back to an IDLE room from the statically armed pool of that provider; if
-// every armed room of the provider is busy it wakes the least harmful one
-// (shared bandwidth — still a working tunnel). The returned config has the
-// room already armed and waking.
+// returns a room the client should join.
+//
+// Telemost: rooms are REUSABLE (anonymous join, no deletion), so an idle
+// pool room (armed -vks-watch rooms + previously created rooms from the
+// TelemostPool) is handed out first; a new one is created only when all
+// are busy. WB/Jazz: the RoomCreator mints a FRESH room (full bandwidth
+// per client). MTS: creator lifecycle, falling back to the armed pool.
+//
+// Room cap: when -vks-max-rooms N (N > 0) and the live room count is at
+// N, no NEW room is joined — for telemost a busy pool room is shared
+// (vp8channel carries many peers per room); for other providers an error
+// comes back so the client fails over to the next provider.
+//
+// Errors: ErrLoginRequired (wrapped) when the provider's cookies are
+// dead — the beacon answers with an empty spec plus login flags, never a
+// silent fallback.
 func (w *WatchServer) AssignRoom(ctx context.Context, provider string) (Config, error) {
 	w.mu.Lock()
 	creator := w.creator
 	keyHex := w.keyHex
+	maxRooms := w.maxRooms
 	w.mu.Unlock()
 
 	if keyHex == "" {
 		return Config{}, fmt.Errorf("vks watch: no key configured")
 	}
+
+	// Telemost: reuse an idle pool room before creating anything.
+	if provider == "telemost" {
+		if cfg, ok := w.assignTelemostFromPool(maxRooms); ok {
+			return cfg, nil
+		}
+	}
+
 	if creator != nil {
+		// Room cap: a full server must not join a new room. Telemost
+		// still gets a busy pool room (shared, see below); the others
+		// fail over.
+		if maxRooms > 0 && w.ActiveRooms() >= maxRooms {
+			if provider == "telemost" {
+				if cfg, ok := w.shareBusyTelemost(); ok {
+					return cfg, nil
+				}
+			}
+			return Config{}, fmt.Errorf("vks watch: room cap %d reached for %s", maxRooms, provider)
+		}
 		cfg, err := creator(ctx, provider)
 		if err == nil {
 			cfg.IdleTimeout = w.idle
+			if provider == "telemost" {
+				w.rememberTelemostRoom(cfg.RoomURL)
+			}
 			w.Serve(cfg)
 			return cfg, nil
+		}
+		if errors.Is(err, ErrLoginRequired) {
+			return Config{}, err
 		}
 		if !errors.Is(err, ErrNoDynamicRoom) {
 			return Config{}, err
@@ -224,6 +312,16 @@ func (w *WatchServer) AssignRoom(ctx context.Context, provider string) (Config, 
 	// Fall back: pick a room of this provider from the armed pool.
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Room cap applies here too: at the cap a busy armed room of the
+	// provider is SHARED (it is already joined — no new room), but an
+	// idle one must not be woken (that would be a new join). For
+	// non-telemost providers the cap means fail-over.
+	if maxRooms > 0 && len(w.active) >= maxRooms {
+		if busyK := w.busyRoomOf(provider); busyK != "" && provider == "telemost" {
+			return w.rooms[busyK], nil
+		}
+		return Config{}, fmt.Errorf("vks watch: room cap %d reached for %s", maxRooms, provider)
+	}
 	var idleK, busyK string
 	var idleCfg Config
 	for k, cfg := range w.rooms {
@@ -243,11 +341,96 @@ func (w *WatchServer) AssignRoom(ctx context.Context, provider string) (Config, 
 		return idleCfg, nil
 	}
 	if busyK != "" {
-		// All armed rooms of this provider are busy — wake one (shared).
+		// All armed rooms of the provider are busy — wake one (shared).
 		go w.Wake(busyK)
 		return w.rooms[busyK], nil
 	}
 	return Config{}, fmt.Errorf("vks watch: provider %q has no armed rooms and no creator", provider)
+}
+
+// busyRoomOf returns the roomKey of any LIVE room of the provider, or "".
+// Call with w.mu held.
+func (w *WatchServer) busyRoomOf(provider string) string {
+	for k, cfg := range w.rooms {
+		if cfg.Provider != provider {
+			continue
+		}
+		if _, live := w.active[k]; live {
+			return k
+		}
+	}
+	return ""
+}
+
+// assignTelemostFromPool returns an idle telemost room (armed or from the
+// reusable pool) with its wake already scheduled. ok=false when no idle
+// telemost room exists (the caller creates one — subject to the room cap).
+func (w *WatchServer) assignTelemostFromPool(maxRooms int) (Config, bool) {
+	// Fold pool rooms into the armed set once: they behave exactly like
+	// -vks-watch telemost rooms (anonymous join, wake on demand, released
+	// back to idle — never deleted).
+	w.mu.Lock()
+	if w.telemostPool != nil {
+		for _, roomURL := range w.telemostPool.Rooms() {
+			key := w.roomKey(Config{KeyHex: w.keyHex, Provider: "telemost", RoomURL: roomURL})
+			if _, known := w.rooms[key]; !known {
+				cfg := Config{Provider: "telemost", RoomURL: roomURL, KeyHex: w.keyHex, IdleTimeout: w.idle}
+				w.rooms[key] = cfg
+				w.dynamic[key] = false // pool rooms persist — never dropped on release
+			}
+		}
+	}
+	w.mu.Unlock()
+	return w.pickIdleRoom("telemost", maxRooms)
+}
+
+// rememberTelemostRoom adds a freshly created telemost room to the
+// persistent pool (dedup by URL).
+func (w *WatchServer) rememberTelemostRoom(roomURL string) {
+	w.mu.Lock()
+	pool := w.telemostPool
+	w.mu.Unlock()
+	if pool != nil {
+		pool.Add(roomURL)
+	}
+}
+
+// shareBusyTelemost returns a live telemost room for sharing (vp8channel
+// supports many peers per room). ok=false when no live telemost room
+// exists — the caller then errors out (cap + no pool room).
+func (w *WatchServer) shareBusyTelemost() (Config, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k, cfg := range w.rooms {
+		if cfg.Provider != "telemost" {
+			continue
+		}
+		if _, live := w.active[k]; live {
+			return cfg, true
+		}
+	}
+	return Config{}, false
+}
+
+// pickIdleRoom returns one not-live room of the provider, waking it.
+// Under the room cap it refuses instead (ok=false) — the cap means "join
+// nothing new", including waking an idle armed room.
+func (w *WatchServer) pickIdleRoom(provider string, maxRooms int) (Config, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if maxRooms > 0 && len(w.active) >= maxRooms {
+		return Config{}, false
+	}
+	for k, cfg := range w.rooms {
+		if cfg.Provider != provider {
+			continue
+		}
+		if _, live := w.active[k]; !live {
+			go w.Wake(k)
+			return cfg, true
+		}
+	}
+	return Config{}, false
 }
 
 // ActiveRooms reports the number of rooms currently joined (diagnostics).

@@ -194,8 +194,15 @@ func (r *kcpRuntime) send(msg []byte) error {
 
 func (r *kcpRuntime) close() {
 	r.closeOnce.Do(func() {
-		_ = r.sess.Close()
+		// conn first, sess second. kcp-go's UDPSession.Close runs a final
+		// flush that pushes everything still unacknowledged into the outbound
+		// channel - for a restart those are stale-conv segments (the fresh
+		// session reuses the static conv id) that the peer would ingest into
+		// the wrong KCP state machine. With the conn already closed every
+		// WriteTo of that flush fails fast, so the flush goes nowhere. The
+		// plane's drain then reclaims whatever was queued before the close.
 		_ = r.conn.Close()
+		_ = r.sess.Close()
 	})
 }
 
@@ -280,16 +287,23 @@ func (p *kcpPlane) restart(hdr [epochHdrLen]byte) {
 		return
 	}
 
-	p.drain()
-
 	p.mu.Lock()
 	old := p.rt
 	p.rt = nil
 	p.mu.Unlock()
 
+	// Close the old session BEFORE draining. kcp-go's UDPSession.Close runs
+	// a final flush of everything still queued, and that flush lands in this
+	// same shared out channel. Draining first (the old order) let the old
+	// session's segments queue AFTER the drain and ride the wire next to the
+	// fresh session's - same conv id, so the peer read them as duplicate or
+	// stale sequence numbers on the very stream the new session was starting,
+	// corrupting the re-handshake that follows every reset.
 	if old != nil {
 		old.close()
 	}
+
+	p.drain()
 
 	rt, err := startKCP(p.out, p.onData, hdr, p.sndWnd)
 	if err != nil {

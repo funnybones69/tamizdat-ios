@@ -1,5 +1,9 @@
 package vp8channel
 
+import (
+	"github.com/funnybones69/tamizdat/vks/olc/core/logger"
+)
+
 // Control-plane implementation: transport.ControlPlane for the single-peer
 // (client) side and transport.PeerControlPlane for the multi-peer (server)
 // side. Control traffic runs on its own KCP session so handshake and liveness
@@ -100,6 +104,31 @@ func (p *streamTransport) handleControlFrame(src, dst uint32, kcpPayload []byte)
 	// so a non-targeted control frame is never legitimately ours.
 	if dst != p.controlEpochValue() {
 		return
+	}
+
+	// Latch the peer's control epoch and restart the planes when a
+	// previously latched epoch changes. Both sides use the static conv id,
+	// so a restarted server's fresh KCP reaches ours as duplicate/stale
+	// sequence numbers that are silently dropped - and our stale sequence
+	// numbers are likewise dropped by the server's fresh per-peer session:
+	// neither plane ever resynchronises, and the client's re-handshake
+	// times out waiting for a welcome nobody will ever reassemble ("read
+	// welcome timeout" after a server restart). A control frame addressed
+	// specifically to us (the dst filter above) from a NEW control epoch is
+	// the unambiguous signal the peer restarted; restartPlanes rotates our
+	// epoch and replaces both KCP state machines, the same recovery ResetPeer
+	// runs, so the upper layer's next handshake attempt lands on clean state
+	// instead of waiting out the liveness window. The transition from a zero
+	// latch only latches (the planes were just restarted by Connect or
+	// restartPlanes, so no stale state can exist), which keeps an in-flight
+	// CLIENT_HELLO from being dropped. The CAS makes the restart fire once
+	// per epoch change however many track readers race here.
+	if old := p.peerControlEpoch.Load(); old != src {
+		if p.peerControlEpoch.CompareAndSwap(old, src) && old != 0 {
+			logger.Infof("vp8channel: peer control epoch changed old=0x%08x new=0x%08x - restarting KCP planes",
+				old, src)
+			p.restartPlanes()
+		}
 	}
 
 	deliverKCPPayload(p.control.get(), kcpPayload)

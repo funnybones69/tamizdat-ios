@@ -154,7 +154,10 @@ type Session struct {
 	ackMu      sync.Mutex
 	ackWaiters map[string]chan struct{}
 
+	// trafficShape is written by SetTrafficShape while the send workers read
+	// it, so both sides hold shapeMu.
 	trafficShape TrafficShape
+	shapeMu      sync.RWMutex
 
 	subscriberReady atomic.Bool
 	publisherReady  atomic.Bool
@@ -344,7 +347,16 @@ func (s *Session) SetTrafficShape(shape TrafficShape) {
 	if shape.MaxDelay < shape.MinDelay {
 		shape.MaxDelay = shape.MinDelay
 	}
+	s.shapeMu.Lock()
 	s.trafficShape = shape
+	s.shapeMu.Unlock()
+}
+
+// currentShape returns the traffic shape under its read lock.
+func (s *Session) currentShape() TrafficShape {
+	s.shapeMu.RLock()
+	defer s.shapeMu.RUnlock()
+	return s.trafficShape
 }
 
 // Send queues data for transmission.

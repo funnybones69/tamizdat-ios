@@ -8,51 +8,70 @@ import Foundation
 /// writes the values into the App Group; the extension reads them at
 /// `startTunnel`, so changes apply on the next VPN connect.
 ///
-/// Room shapes per provider (matching `vks.ParseSpecs`):
-///   - telemost: full room URL (`https://telemost.yandex.ru/j/…`)
-///   - wbstream: room id (guests join; an owner server creates the room)
-///   - jazz:     `roomId:password`
-///   - mts:      full room link (`https://my.mts-link.ru/j/…`)
+/// Values resolve in this order:
+///   1. an explicit operator override saved from Settings → Дополнительно
+///      (empty field = "use the link");
+///   2. the `vkskey` / `wakedns` / `wakezone` query params of the active
+///      tamizdat:// profile link (see `SamizdatURLCodec.vksParams`);
+///   3. `defaultWakeDNS` when neither the override nor the link carries a
+///      wake DNS server.
 ///
-/// Ladder order is fixed — telemost → wbstream → jazz → mts: the first
-/// configured provider goes first and failover walks the rest.
+/// The room itself is NOT chosen here: the client stores only the
+/// providers — the server creates/assigns the room via the beacon TXT
+/// answer. Provider ORDER (the ladder) is user-controlled: the first
+/// entry is the primary the native transport dials, the rest are
+/// failover candidates.
+///
+/// VKS always uses the H2 profile's server (the native path already
+/// derives pubkey/SNI from the active profile blob), so there is no
+/// server field here.
 enum VKSPreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
 
     private static let enabledKey = "tamizdat.vks.enabled"
-    private static let telemostKey = "tamizdat.vks.telemostRoom"
-    private static let wbstreamKey = "tamizdat.vks.wbstreamRoom"
-    private static let jazzKey = "tamizdat.vks.jazzRoom"
-    private static let mtsKey = "tamizdat.vks.mtsRoom"
     private static let keyHexKey = "tamizdat.vks.keyHex"
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
     private static let wakeDNSKey = "tamizdat.vks.wakeDNS"
     private static let wakeZoneKey = "tamizdat.vks.wakeZone"
-    private static let portKey = "tamizdat.vks.listenPort"
-    private static let serverKey = "tamizdat.vks.server"
-    private static let telemostEnabledKey = "tamizdat.vks.telemostEnabled"
-    private static let wbstreamEnabledKey = "tamizdat.vks.wbstreamEnabled"
-    private static let jazzEnabledKey = "tamizdat.vks.jazzEnabled"
-    private static let mtsEnabledKey = "tamizdat.vks.mtsEnabled"
+    private static let orderKey = "tamizdat.vks.order"
 
-    static let defaultListenPort = 11080
+    /// Fixed local SOCKS5 listen port for the VKS ladder listener.
+    /// Not user-configurable any more; must stay clear of the
+    /// in-process socksstub port (18443).
+    static let listenPort = 11080
+
+    /// Default wake DNS server when neither the operator override nor
+    /// the profile link carries one.
+    static let defaultWakeDNS = "77.88.8.8:53"
+
+    /// All providers the ladder understands, in canonical order.
+    static let allProviders = ["telemost", "jazz", "mts"]
+
+    /// Operator-facing name of a provider id ("telemost" → "Telemost").
+    /// Unknown ids fall back to the raw id.
+    static func providerDisplayName(_ provider: String) -> String {
+        switch provider {
+        case "telemost": return "Telemost"
+        case "jazz":     return "Jazz"
+        case "mts":      return "MTS"
+        default:         return provider
+        }
+    }
 
     private static var defaults: UserDefaults? {
         UserDefaults(suiteName: appGroupID)
     }
 
     // -- TEST-BUILD DEFAULTS ---------------------------------------------
-    // Nothing deployment-specific is baked into this repository: the VKS wire
-    // key and the master shortid are per-deployment secrets, and the room and
-    // wake zone identify the operator's own infrastructure. Fill them in from
-    // the VKS card (they live in the App Group defaults) or pass them to the
-    // e2e tools on the command line.
-    static let testDefaultWbstreamRoom = ""
+    // Nothing deployment-specific is baked into this repository: the VKS
+    // wire key and the master shortid are per-deployment secrets, and the
+    // wake zone identifies the operator's own infrastructure. Fill them
+    // in from Settings → Дополнительно → Параметры VKS (they live in the
+    // App Group defaults) or pass them via the profile link.
     static let testDefaultKeyHex = ""
     static let testDefaultShortIDHex = ""
-    static let testDefaultWakeDNS = ""
-    static let testDefaultWakeZone = ""
 
+    /// Master switch for the VKS carrier under the whitelist endpoint.
     static var enabled: Bool {
         get {
             if defaults?.object(forKey: enabledKey) == nil { return true }
@@ -61,59 +80,45 @@ enum VKSPreferences {
         set { defaults?.set(newValue, forKey: enabledKey) }
     }
 
-    /// Per-provider switches: a disabled provider is left out of the
-    /// ladder even when its room is filled, so a single provider can be
-    /// exercised in isolation.
-    static var telemostEnabled: Bool {
+    /// Ladder order — provider ids from `allProviders`. Unknown ids read
+    /// from storage are dropped; missing ones are appended in canonical
+    /// order so every provider always has a slot.
+    static var providerOrder: [String] {
         get {
-            guard let d = defaults, d.object(forKey: telemostEnabledKey) != nil else { return true }
-            return d.bool(forKey: telemostEnabledKey)
+            let stored = defaults?.stringArray(forKey: orderKey) ?? []
+            let known = stored.filter { allProviders.contains($0) }
+            var out = known
+            for p in allProviders where !out.contains(p) {
+                out.append(p)
+            }
+            return out
         }
-        set { defaults?.set(newValue, forKey: telemostEnabledKey) }
-    }
-
-    static var wbstreamEnabled: Bool {
-        get {
-            guard let d = defaults, d.object(forKey: wbstreamEnabledKey) != nil else { return true }
-            return d.bool(forKey: wbstreamEnabledKey)
+        set {
+            let known = newValue.filter { allProviders.contains($0) }
+            var out = known
+            for p in allProviders where !out.contains(p) {
+                out.append(p)
+            }
+            defaults?.set(out, forKey: orderKey)
         }
-        set { defaults?.set(newValue, forKey: wbstreamEnabledKey) }
     }
 
-    static var jazzEnabled: Bool {
-        get {
-            guard let d = defaults, d.object(forKey: jazzEnabledKey) != nil else { return true }
-            return d.bool(forKey: jazzEnabledKey)
-        }
-        set { defaults?.set(newValue, forKey: jazzEnabledKey) }
+    /// Per-provider enabled flag. A disabled provider is left out of the
+    /// ladder even when it is first in the order, so a single provider
+    /// can be exercised in isolation.
+    static func providerEnabled(_ provider: String) -> Bool {
+        get { providerEnabledValue(provider) }
     }
 
-    static var mtsEnabled: Bool {
-        get {
-            guard let d = defaults, d.object(forKey: mtsEnabledKey) != nil else { return true }
-            return d.bool(forKey: mtsEnabledKey)
-        }
-        set { defaults?.set(newValue, forKey: mtsEnabledKey) }
+    private static func providerEnabledValue(_ provider: String) -> Bool {
+        let key = "tamizdat.vks.\(provider)Enabled"
+        guard let d = defaults, d.object(forKey: key) != nil else { return true }
+        return d.bool(forKey: key)
     }
 
-    static var telemostRoom: String {
-        get { defaults?.string(forKey: telemostKey) ?? "" }
-        set { defaults?.set(trim(newValue), forKey: telemostKey) }
-    }
-
-    static var wbstreamRoom: String {
-        get { defaults?.string(forKey: wbstreamKey) ?? testDefaultWbstreamRoom }
-        set { defaults?.set(trim(newValue), forKey: wbstreamKey) }
-    }
-
-    static var jazzRoom: String {
-        get { defaults?.string(forKey: jazzKey) ?? "" }
-        set { defaults?.set(trim(newValue), forKey: jazzKey) }
-    }
-
-    static var mtsRoom: String {
-        get { defaults?.string(forKey: mtsKey) ?? "" }
-        set { defaults?.set(trim(newValue), forKey: mtsKey) }
+    static func setProviderEnabled(_ provider: String, _ value: Bool) {
+        let key = "tamizdat.vks.\(provider)Enabled"
+        defaults?.set(value, forKey: key)
     }
 
     static var keyHex: String {
@@ -122,8 +127,8 @@ enum VKSPreferences {
     }
 
     /// The stored override, ignoring empty AND the shipped test placeholder:
-    /// a saved placeholder is not an operator choice (the server rejects it as
-    /// "bad shortid"), so it must behave exactly like "unset". Without this,
+    /// a saved placeholder is not an operator choice (the server rejects it
+    /// as "bad shortid"), so it must behave exactly like "unset". Without this,
     /// merely opening Settings once persists the placeholder over the profile
     /// identity and every provider beacon is rejected.
     private static func explicitShortID() -> String {
@@ -141,8 +146,8 @@ enum VKSPreferences {
 
     /// The VKS beacon MUST carry the caller's real user shortid: the server
     /// shortid-proofs provider beacons and REJECTS any shortid that is not a
-    /// valid user. Never resolve to the placeholder — derive from the Main
-    /// profile URI (the identity the H2 tunnel authenticates with).
+    /// valid user. Never resolve to the placeholder — derive from the active
+    /// profile link (the identity the H2 tunnel authenticates with).
     static var shortIDHex: String {
         get {
             let explicit = explicitShortID()
@@ -151,7 +156,7 @@ enum VKSPreferences {
             // Group. This file is compiled into the extension target too,
             // where ConfigStore is unavailable — the mirror is the shared
             // source both targets can read.
-            let mirrored = firstShortID(VKCredsPreferences.connectPassword)
+            let mirrored = firstShortID(VKSPreferences.connectPasswordMirror)
             if !mirrored.isEmpty { return mirrored }
             return testDefaultShortIDHex
         }
@@ -169,95 +174,115 @@ enum VKSPreferences {
             let s = firstShortID(peer.shortID)
             if !s.isEmpty { return s }
         }
-        let mirrored = firstShortID(VKCredsPreferences.connectPassword)
+        let mirrored = firstShortID(connectPasswordMirror)
         if !mirrored.isEmpty { return mirrored }
         return testDefaultShortIDHex
     }
 
-    /// Explicit server for the VKS carrier (host:port). Empty = no value
-    /// (deliberately no default).
-    static var server: String {
-        get { defaults?.string(forKey: serverKey) ?? "" }
-        set { defaults?.set(trim(newValue), forKey: serverKey) }
-    }
-
-    static var listenPort: Int {
-        get {
-            let value = defaults?.integer(forKey: portKey) ?? 0
-            return value > 0 ? value : defaultListenPort
-        }
-        set { defaults?.set(newValue, forKey: portKey) }
-    }
-
-    /// On-demand wake beacon: the DNS server to send the wake query
-    /// through (a whitelisted resolver, e.g. "77.88.8.8:53"). Empty
-    /// disables the beacon (the server must then already be in the room).
-    static var wakeDNS: String {
-        get { defaults?.string(forKey: wakeDNSKey) ?? testDefaultWakeDNS }
+    /// Explicit operator override for the wake DNS server. Writing an
+    /// empty string clears the override (falls back to the link param /
+    /// default). The resolved value comes from `wakeDNS(profileBlob:)`.
+    static var wakeDNSOverride: String {
+        get { defaults?.string(forKey: wakeDNSKey) ?? "" }
         set { defaults?.set(trim(newValue), forKey: wakeDNSKey) }
     }
 
-    /// On-demand wake beacon: the zone the server's NS is authoritative
-    /// for (e.g. "wake.example.com").
-    static var wakeZone: String {
-        get { defaults?.string(forKey: wakeZoneKey) ?? testDefaultWakeZone }
+    /// Explicit operator override for the wake zone. Writing an empty
+    /// string clears the override. The resolved value comes from
+    /// `wakeZone(profileBlob:)`.
+    static var wakeZoneOverride: String {
+        get { defaults?.string(forKey: wakeZoneKey) ?? "" }
         set { defaults?.set(trim(newValue), forKey: wakeZoneKey) }
     }
-    /// Assembled `provider:room,` ladder spec. A provider is included when
-    /// its switch is on. Beacon-assignment: the client stores only the
-    /// provider — the server creates/assigns the room via the TXT answer; an
-    /// explicit room is an optional override/fallback (used when the provider
-    /// beacon fails). An empty room emits a "stub" placeholder the server's
+
+    /// On-demand wake beacon: the DNS server to send the wake query
+    /// through (a whitelisted resolver, e.g. "77.88.8.8:53"). Resolution:
+    /// explicit override → link's `wakedns` param → `defaultWakeDNS`.
+    static func wakeDNS(profileBlob: String?) -> String {
+        let explicit = defaults?.string(forKey: wakeDNSKey) ?? ""
+        if !explicit.isEmpty { return explicit }
+        if let blob = profileBlob, let params = SamizdatURLCodec.vksParams(from: blob),
+           !params.wakeDNS.isEmpty {
+            return params.wakeDNS
+        }
+        return defaultWakeDNS
+    }
+
+    /// On-demand wake beacon: the zone the server's NS is authoritative
+    /// for (e.g. "wake.example.com"). Resolution: explicit override →
+    /// link's `wakezone` param → "" (beacon disabled).
+    static func wakeZone(profileBlob: String?) -> String {
+        let explicit = defaults?.string(forKey: wakeZoneKey) ?? ""
+        if !explicit.isEmpty { return explicit }
+        if let blob = profileBlob, let params = SamizdatURLCodec.vksParams(from: blob),
+           !params.wakeZone.isEmpty {
+            return params.wakeZone
+        }
+        return ""
+    }
+
+    /// The key the native VKS transport arms its room sessions with.
+    /// Resolution: explicit override → link's `vkskey` param (64 hex).
+    static func resolvedKeyHex(profileBlob: String?) -> String {
+        let explicit = keyHex
+        if !explicit.isEmpty { return explicit }
+        if let blob = profileBlob, let params = SamizdatURLCodec.vksParams(from: blob),
+           !params.vksKeyHex.isEmpty {
+            return params.vksKeyHex
+        }
+        return testDefaultKeyHex
+    }
+
+    /// Assembled `provider:room,` ladder spec over the user's order. A
+    /// disabled provider is left out. Beacon-assignment: the client stores
+    /// only the provider — the server creates/assigns the room via the TXT
+    /// answer, so every room slot is the "stub" placeholder the server's
     /// assignment replaces.
-    ///
-    /// ORDER MATTERS: the native VKS transport dials a SINGLE provider — the
-    /// first entry (socksstub's StartVKSNativeUpstream takes cfgs[0]) — so the
-    /// first entry has to be one the server can provision on demand. jazz
-    /// creates its rooms ANONYMOUSLY through the server's room factory, while
-    /// telemost/wbstream/mts need an account-hosted room that can be absent or
-    /// over limit (a Telemost room, once OVERLIMIT, just fails every beacon).
-    /// jazz therefore leads; the rest stay as failover entries.
-    static var ladderSpec: String {
+    static func ladderSpec(profileBlob: String?) -> String {
         var parts: [String] = []
-        if jazzEnabled { parts.append("jazz:\(jazzRoom.isEmpty ? "stub" : jazzRoom)") }
-        if telemostEnabled { parts.append("telemost:\(telemostRoom.isEmpty ? "stub" : telemostRoom)") }
-        if wbstreamEnabled { parts.append("wbstream:\(wbstreamRoom.isEmpty ? "stub" : wbstreamRoom)") }
-        if mtsEnabled { parts.append("mts:\(mtsRoom.isEmpty ? "stub" : mtsRoom)") }
+        for p in providerOrder where providerEnabled(p) {
+            parts.append("\(p):stub")
+        }
         return parts.joined(separator: ",")
     }
 
     static var providerCount: Int {
-        var count = 0
-        if telemostEnabled { count += 1 }
-        if wbstreamEnabled { count += 1 }
-        if jazzEnabled { count += 1 }
-        if mtsEnabled { count += 1 }
-        return count
+        providerOrder.filter { providerEnabled($0) }.count
     }
 
-    static var isConfigured: Bool {
-        !ladderSpec.isEmpty && keyLooksValid && !shortIDHex.isEmpty
+    /// True when the VKS ladder can be raised: at least one enabled
+    /// provider and a valid wire key. A profile link carrying `vkskey`
+    /// is enough — the key no longer has to come from Settings.
+    static func isConfigured(profileBlob: String?) -> Bool {
+        !ladderSpec(profileBlob: profileBlob).isEmpty && keyLooksValid(profileBlob: profileBlob)
     }
 
     /// 64 hex characters — the olcRTC wire-key shape.
-    static var keyLooksValid: Bool {
-        keyHex.count == 64 && keyHex.allSatisfy { $0.isHexDigit }
+    static func keyLooksValid(profileBlob: String?) -> Bool {
+        let key = resolvedKeyHex(profileBlob: profileBlob)
+        return key.count == 64 && key.allSatisfy { $0.isHexDigit }
     }
 
-    /// Restore all VKS settings to their defaults.
-    static func reset() {
-        enabled = false
-        telemostEnabled = true
-        wbstreamEnabled = true
-        jazzEnabled = true
-        mtsEnabled = true
-        telemostRoom = ""
-        wbstreamRoom = ""
-        jazzRoom = ""
-        mtsRoom = ""
-        keyHex = ""
-        shortIDHex = ""
-        listenPort = defaultListenPort
+    /// Mirror of the active profile's shortid, written by the main app so
+    /// the extension (which cannot reach Keychain) can read the identity.
+    /// Kept here (in VKSPreferences) because it is VKS that consumes it.
+    private static let connectPasswordMirrorKey = "tamizdat.vkConnectPassword"
+    private static var connectPasswordMirror: String {
+        defaults?.string(forKey: connectPasswordMirrorKey) ?? ""
+    }
+
+    /// Written by the main app after every profile change so the extension
+    /// sees the H2 identity without Keychain access. Passing nil clears
+    /// the mirror so stale values cannot survive after the profile is
+    /// removed.
+    @discardableResult
+    static func applyDerivedH2PeerConfig(_ config: SamizdatURLCodec.H2PeerConfig?) -> Bool {
+        guard let config else {
+            defaults?.set("", forKey: connectPasswordMirrorKey)
+            return false
+        }
+        defaults?.set(config.shortID, forKey: connectPasswordMirrorKey)
+        return true
     }
 
     private static func trim(_ raw: String) -> String {

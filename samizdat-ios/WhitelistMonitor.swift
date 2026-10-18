@@ -51,7 +51,7 @@ final class WhitelistMonitor: ObservableObject {
         let build = (Bundle.main.object(forInfoDictionaryKey: "IPAArtifactName") as? String)
             ?? (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
             ?? "unknown"
-        TURNLog.info("whitelist", "monitor started build=\(build) method=icmp_echo threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
+        AppLog.info("whitelist", "monitor started build=\(build) method=icmp_echo threshold=\(WhitelistProbePreferences.successesNeeded) interval=\(Int(Self.cycleInterval))s blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
         task = Task { [weak self] in
             while !Task.isCancelled {
                 let delay = await self?.runCycle(generation: gen) ?? Self.cycleInterval
@@ -66,7 +66,7 @@ final class WhitelistMonitor: ObservableObject {
         task = nil
         pathMonitor?.cancel()
         pathMonitor = nil
-        TURNLog.info("whitelist", "monitor stopped")
+        AppLog.info("whitelist", "monitor stopped")
     }
 
     // MARK: – cycle
@@ -88,11 +88,11 @@ final class WhitelistMonitor: ObservableObject {
         lastPathSummary = pathSelection.summary
         lastConfigSignature = configSignature
 
-        TURNLog.info("whitelist", "monitor ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
+        AppLog.info("whitelist", "monitor ping start active=\(WhitelistStatusStore.activeEndpoint.rawValue) status=\(WhitelistStatusStore.current.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold) path={\(pathSelection.summary)} blocked=\(WhitelistProbePreferences.testHost) allowed=\(WhitelistProbePreferences.whitelistHost)")
         let result = await WhitelistProbeEngine.runAsync(interfaceIndex: pathSelection.interfaceIndex)
         guard gen == generation, !Task.isCancelled else { return Self.cycleInterval }
         for line in WhitelistProbeEngine.detailedLogLines(result) {
-            TURNLog.info("whitelist", "monitor probe \(line)")
+            AppLog.info("whitelist", "monitor probe \(line)")
         }
 
         switch result.classification {
@@ -124,7 +124,7 @@ final class WhitelistMonitor: ObservableObject {
             WhitelistStatusStore.current = .error
         }
 
-        TURNLog.info("whitelist", "monitor result=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
+        AppLog.info("whitelist", "monitor result=\(result.classification.rawValue) status=\(WhitelistStatusStore.current.rawValue) active=\(WhitelistStatusStore.activeEndpoint.rawValue) whitelistCount=\(whitelistCount)/\(threshold) freeCount=\(freeCount)/\(threshold)")
         let switchPending = (WhitelistStatusStore.activeEndpoint == .primary && whitelistCount > 0)
             || (WhitelistStatusStore.activeEndpoint == .backup && freeCount > 0)
         return switchPending ? 5 : Self.cycleInterval
@@ -134,6 +134,80 @@ final class WhitelistMonitor: ObservableObject {
         whitelistCount = 0
         freeCount = 0
         WhitelistStatusStore.resetDetectionProgress()
-        TURNLog.info("whitelist", "monitor progress reset — \(reason)")
+        AppLog.info("whitelist", "monitor progress reset — \(reason)")
+    }
+}
+
+/// Shared file-logger for the main app. Writes timestamped lines to the
+/// same App Group file the extension uses (`extension-log.txt`) so the
+/// in-app `LogView` shows app-side events alongside the extension stream.
+///
+/// Format mirrors the extension's log lines:
+///   `HH:mm:ss.SSS <level>: <tag>: <message>`
+/// where `<level>` is one of `info`, `warn`, `error`, `crit`.
+enum AppLog {
+    static let appGroupID = "group.com.anarki.samizdat-test"
+    static let fileName = "extension-log.txt"
+
+    // Serializes the whole write path. DateFormatter is NOT
+    // thread-safe (concurrent string(from:) can crash), and the
+    // open/seek/write sequence is not atomic either — without
+    // O_APPEND, two handles that both seeked to EOF overwrite each
+    // other's bytes. AppLog is called from the main actor and from
+    // URLSession delegate queues concurrently.
+    private static let writeLock = NSLock()
+
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.timeZone = .autoupdatingCurrent
+        return f
+    }()
+
+    /// Ensure `extension-log.txt` exists in the App Group container,
+    /// then return a FileHandle positioned at end-of-file. The handle
+    /// is recreated on every write — opening a new fd per line is cheap
+    /// (microseconds) and avoids stale-fd issues if iOS reclaims the
+    /// container while we hold it.
+    private static func handle() -> FileHandle? {
+        let fm = FileManager.default
+        guard let container = fm.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupID
+        ) else {
+            return nil
+        }
+        let url = container.appendingPathComponent(fileName)
+        if !fm.fileExists(atPath: url.path) {
+            fm.createFile(atPath: url.path, contents: nil, attributes: nil)
+        }
+        guard let h = try? FileHandle(forWritingTo: url) else {
+            return nil
+        }
+        // Seek to end for append behaviour without O_APPEND on the fd.
+        _ = try? h.seekToEnd()
+        return h
+    }
+
+    static func info(_ tag: String, _ message: String) {
+        write(level: "info", tag: tag, message: message)
+    }
+
+    static func warn(_ tag: String, _ message: String) {
+        write(level: "warn", tag: tag, message: message)
+    }
+
+    static func error(_ tag: String, _ message: String) {
+        write(level: "error", tag: tag, message: message)
+    }
+
+    private static func write(level: String, tag: String, message: String) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        let line = "\(timeFormatter.string(from: Date())) \(level): \(tag): \(message)\n"
+        guard let h = handle() else { return }
+        defer { try? h.close() }
+        _ = try? h.write(contentsOf: Data(line.utf8))
+        try? h.synchronize()
     }
 }

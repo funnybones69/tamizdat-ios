@@ -126,6 +126,7 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 	tr := newStreamTransport(stream, track, codec, cfg, opts)
 
 	if err := stream.AddTrack(track); err != nil {
+		_ = stream.Close()
 		return nil, fmt.Errorf("attach local video track: %w", err)
 	}
 	stream.SetTrackHandler(tr.handleRemoteTrack)
@@ -429,7 +430,16 @@ func (p *streamTransport) popDecoderFrames(decoder *goDecoder) {
 	}
 }
 
+// readDecoderInput feeds the RTP reader into the decoder. It owns the
+// decoder's lifetime: when the remote track ends (ReadRTP error - peer
+// churn, SFU re-publish) the decoder must be closed so popDecoderFrames
+// unblocks from PopFrame and frees its decoder-table slot; otherwise each
+// replaced track strands one decoder goroutine until the transport dies and
+// maxRemoteDecoders slots exhaust, after which every new peer track is
+// ignored.
 func (p *streamTransport) readDecoderInput(track *webrtc.TrackRemote, decoder *goDecoder, codec codecSpec) {
+	defer decoder.Close()
+
 	sb := samplebuilder.New(sampleBuilderMaxLate, codec.depacketizer(), track.Codec().ClockRate)
 	for {
 		select {

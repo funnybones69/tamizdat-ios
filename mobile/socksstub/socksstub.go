@@ -30,7 +30,6 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -88,7 +87,6 @@ type upstreamClient interface {
 	LockedRealtimeCount() int32
 	LiteTransportAlive() int32
 	RTTProbeSnapshot() samizdat.RTTProbeStats
-	ServerPushedTURNCreds() *samizdat.TURNCredsEntry
 }
 
 type runtimeState struct {
@@ -822,7 +820,7 @@ func SetPoolVariant(variant string) {
 func SetUpstreamMode(mode string) {
 	m := strings.ToLower(strings.TrimSpace(mode))
 	switch m {
-	case "vks", "turn", "main":
+	case "vks", "main":
 	default:
 		m = "main"
 	}
@@ -849,31 +847,6 @@ func currentPoolVariant() string {
 		return "v1"
 	}
 	return v
-}
-
-// TURNCredsSnapshot returns a JSON string with the current VK TURN
-// relay credentials pushed by the server, or an empty string if no
-// credentials are available yet. The JSON shape matches TURNCredsEntry:
-//
-//	{"username":"...","password":"...","urls":["host:port",...],"lifetime":86400}
-//
-// Swift reads this to surface TURN status in the UI.
-func TURNCredsSnapshot() string {
-	rt.mu.Lock()
-	cli := rt.samizdatClient
-	rt.mu.Unlock()
-	if cli == nil {
-		return ""
-	}
-	creds := cli.ServerPushedTURNCreds()
-	if creds == nil {
-		return ""
-	}
-	data, err := json.Marshal(creds)
-	if err != nil {
-		return ""
-	}
-	return string(data)
 }
 
 // Logs returns the recent in-memory log buffer joined with newlines.
@@ -1120,8 +1093,6 @@ func dialUpstream(ctx context.Context, dest string) (net.Conn, error) {
 	switch CurrentUpstreamMode() {
 	case "vks":
 		return dialWhitelistVKS(ctx, dest)
-	case "turn":
-		return dialWhitelistTURN(ctx, dest)
 	default:
 		return dialMainH2(ctx, dest)
 	}
@@ -1154,13 +1125,6 @@ func dialWhitelistVKS(ctx context.Context, dest string) (net.Conn, error) {
 	return nil, errors.New("vks carrier unavailable — H2 fallback refused (whitelist mode)")
 }
 
-// dialWhitelistTURN rides VK TURN only, with no H2 fallback.
-func dialWhitelistTURN(ctx context.Context, dest string) (net.Conn, error) {
-	if n := VKTurnNetstack(); n != nil {
-		return n.DialContext(ctx, "tcp", dest)
-	}
-	return nil, errors.New("vk turn carrier unavailable — H2 fallback refused (whitelist mode)")
-}
 
 // dialMainH2 is the Main-endpoint path: the samizdat H2 tunnel, else direct.
 func dialMainH2(ctx context.Context, dest string) (net.Conn, error) {
@@ -1181,8 +1145,6 @@ func dialUpstreamUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	switch CurrentUpstreamMode() {
 	case "vks":
 		return dialWhitelistVKSUDP(ctx, dest)
-	case "turn":
-		return dialWhitelistTURNUDP(ctx, dest)
 	default:
 		return dialMainUDP(ctx, dest)
 	}
@@ -1206,21 +1168,6 @@ func dialWhitelistVKSUDP(ctx context.Context, dest string) (net.PacketConn, erro
 	return nil, errors.New("vks udp carrier unavailable — H2 fallback refused (whitelist mode)")
 }
 
-// dialWhitelistTURNUDP rides the VK TURN netstack only, with no H2 fallback.
-func dialWhitelistTURNUDP(ctx context.Context, dest string) (net.PacketConn, error) {
-	n := VKTurnNetstack()
-	if n == nil {
-		return nil, errors.New("vk turn udp carrier unavailable — H2 fallback refused (whitelist mode)")
-	}
-	c, err := n.Dial("udp", dest)
-	if err != nil {
-		return nil, err
-	}
-	// gvisor's gonet.UDPConn satisfies net.Conn but not net.PacketConn.
-	// connectedNetConnUDPAdapter promotes a connected net.Conn into the
-	// PacketConn interface our callers expect.
-	return newConnectedNetConnUDPAdapter(c, dest), nil
-}
 
 // dialMainUDP is the Main-endpoint lane: samizdat UDP-over-H2, else a direct
 // UDP socket.
@@ -1241,35 +1188,6 @@ func dialMainUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	return newConnectedUDPAdapter(c.(*net.UDPConn), dest), nil
 }
 
-// connectedNetConnUDPAdapter promotes any connected net.Conn (e.g.
-// gvisor's *gonet.UDPConn) into a net.PacketConn whose remote is the
-// dial target. Used by dialUpstreamUDP when the VK TURN netstack is
-// the upstream — gvisor doesn't expose net.PacketConn directly.
-type connectedNetConnUDPAdapter struct {
-	conn   net.Conn
-	target net.Addr
-}
-
-func newConnectedNetConnUDPAdapter(c net.Conn, dest string) *connectedNetConnUDPAdapter {
-	return &connectedNetConnUDPAdapter{conn: c, target: &udpDestAddr{s: dest}}
-}
-
-func (a *connectedNetConnUDPAdapter) ReadFrom(p []byte) (int, net.Addr, error) {
-	n, err := a.conn.Read(p)
-	return n, a.target, err
-}
-func (a *connectedNetConnUDPAdapter) WriteTo(p []byte, _ net.Addr) (int, error) {
-	return a.conn.Write(p)
-}
-func (a *connectedNetConnUDPAdapter) Close() error                  { return a.conn.Close() }
-func (a *connectedNetConnUDPAdapter) LocalAddr() net.Addr           { return a.conn.LocalAddr() }
-func (a *connectedNetConnUDPAdapter) SetDeadline(t time.Time) error { return a.conn.SetDeadline(t) }
-func (a *connectedNetConnUDPAdapter) SetReadDeadline(t time.Time) error {
-	return a.conn.SetReadDeadline(t)
-}
-func (a *connectedNetConnUDPAdapter) SetWriteDeadline(t time.Time) error {
-	return a.conn.SetWriteDeadline(t)
-}
 
 // connectedUDPAdapter wraps a "connected" *net.UDPConn so it satisfies
 // net.PacketConn with the connected peer as the constant remote addr.

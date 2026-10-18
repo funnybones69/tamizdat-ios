@@ -1,6 +1,7 @@
 package mts
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"sync"
@@ -25,6 +26,10 @@ var mtsMagic = [4]byte{'O', 'L', 'M', '1'}
 const (
 	epochHeaderLen = 8
 	maxPeerEpochs  = 256
+	// staleLatchGrace is how long the latched peer must be silent before a
+	// frame from a different epoch is treated as the peer returning with a
+	// fresh epoch (a reconnect) instead of an unrelated participant.
+	staleLatchGrace = 15 * time.Second
 )
 
 // epochState is the peer-addressing bookkeeping shared by the engine paths.
@@ -35,6 +40,7 @@ type epochState struct {
 	peerEpochs    map[string]uint32 // server-mode per-peer epochs
 	requireTarget bool
 	latched       atomic.Bool
+	lastPeerNano  atomic.Int64 // unix-nano of the last accepted peer frame
 }
 
 func newEpochState(requireTarget bool) *epochState {
@@ -77,7 +83,7 @@ func (es *epochState) parseFrame(payload []byte) (sender, receiver uint32, body 
 		return 0, 0, nil, false
 	}
 	off := len(mtsMagic)
-	if payload[off-1] != mtsMagic[3] || payload[0] != mtsMagic[0] {
+	if !bytes.Equal(payload[:off], mtsMagic[:]) {
 		return 0, 0, nil, false
 	}
 	sender = binary.BigEndian.Uint32(payload[off : off+4])
@@ -109,18 +115,35 @@ func (es *epochState) accept(from string, payload []byte) ([]byte, uint32, bool)
 		if receiver != 0 {
 			es.latched.Store(true)
 		}
-		if es.peerEpoch.Load() == 0 {
+		prev := es.peerEpoch.Load()
+		if prev == 0 {
+			es.peerEpoch.Store(sender)
+		} else if prev != sender {
+			// The targeted frame (receiver == our local epoch) proves the
+			// server side returned; re-target it, otherwise every reply is
+			// addressed to a dead epoch the peer never reads.
 			es.peerEpoch.Store(sender)
 		}
 	} else {
 		// server: latch the first sender (single-peer datachannel flow) and
 		// target all replies at it; frames from OTHER senders are dropped so
 		// a second joining client cannot corrupt the established session.
-		if es.peerEpoch.Load() == 0 {
+		// A sender different from the latch is accepted once the latch has
+		// been silent past staleLatchGrace: that is the client returning
+		// with a fresh epoch after a reconnect, and locking it out strands
+		// the tunnel on a dead epoch ("read welcome timeout" on re-handshake).
+		latched := es.peerEpoch.Load()
+		switch {
+		case latched == 0:
 			es.peerEpoch.Store(sender)
 			es.latched.Store(true)
-		} else if sender != es.peerEpoch.Load() {
-			return nil, 0, false
+		case sender != latched:
+			silentFor := time.Since(time.Unix(0, es.lastPeerNano.Load()))
+			if silentFor < staleLatchGrace {
+				return nil, 0, false
+			}
+			es.peerEpoch.Store(sender)
+			es.latched.Store(true)
 		}
 		if from != "" {
 			es.peerEpochsMu.Lock()
@@ -132,6 +155,7 @@ func (es *epochState) accept(from string, payload []byte) ([]byte, uint32, bool)
 			es.peerEpochsMu.Unlock()
 		}
 	}
+	es.lastPeerNano.Store(time.Now().UnixNano())
 	return body, sender, true
 }
 
@@ -150,6 +174,7 @@ func (es *epochState) targetFor(from string) uint32 {
 func (es *epochState) reset() {
 	es.peerEpoch.Store(0)
 	es.latched.Store(false)
+	es.lastPeerNano.Store(0)
 	es.peerEpochsMu.Lock()
 	es.peerEpochs = map[string]uint32{}
 	es.peerEpochsMu.Unlock()

@@ -1,13 +1,16 @@
 import Foundation
 import SwiftUI
 
-/// IPA-D22: Home screen — full SwiftUI rewrite per the 2026 design
-/// handoff at `C:\var-tmp\ios-redesign\design_handoff_samizdat_vpn_2026\`.
+/// Home screen.
 ///
 /// Top bar (SZ-mark + Tamizdat wordmark + Logs/Settings buttons),
 /// large 220px ShieldMark hero, status label + mint Ping chip,
-/// 3 stat tiles (Mode/Uptime/Data), Auto-detect whitelist row when
-/// backup configured, big 60pt Connect/Disconnect button, mono caption.
+/// 3 stat tiles (Mode/Uptime/Data), big 60pt Connect/Disconnect
+/// button, mono caption.
+///
+/// The endpoint mode picker (Auto / Main / Whitelist) lives in Settings;
+/// the home screen shows the current mode as a status line under the
+/// hero ("Whitelist · через Telemost" while the VKS carrier is up).
 ///
 /// State machine: 6 states `off / connecting / connected /
 /// reconnecting / failed / error`. Phase C iOS-notify observer
@@ -19,27 +22,14 @@ struct ContentView: View {
     @StateObject private var lampStore = TamizdatStatusStore()
     @StateObject private var serverNotif = ServerNotificationObserver()
     @StateObject private var exitIP = ExitIPStore()
-    // IPA-D28: main-app WhitelistMonitor — runs while VPN is OFF +
-    // auto mode + foreground, so WhitelistStatusStore.activeEndpoint
-    // is already correct by the time the user taps Connect.
+    // Main-app WhitelistMonitor — runs while VPN is OFF + auto mode +
+    // foreground, so WhitelistStatusStore.activeEndpoint is already
+    // correct by the time the user taps Connect.
     @StateObject private var whitelistMonitor = WhitelistMonitor()
-    // IPA-D65b: VK TURN refresh state. We observe `manualChallenge`
-    // so a slider-fallback escalation from the hidden WKWebView
-    // surfaces a sheet here. `@ObservedObject` is correct here —
-    // the singleton owns itself; this view just subscribes.
-    @ObservedObject private var turnRefresher = TURNCredsRefresher.shared
 
     @State private var showSettings = false
     @State private var showLogs = false
-    @State private var showEndpoints = false
     @State private var hasConfig = ConfigStore.shared.load() != nil
-    @State private var hasBackupConfigured = ContentView.checkBackupConfigured()
-
-    @State private var isAutoMode: Bool = (EndpointModeStore.current == .auto)
-    @State private var manualEndpoint: EndpointMode = {
-        let cur = EndpointModeStore.current
-        return cur == .auto ? .primary : cur
-    }()
 
     @State private var whitelistStatus: WhitelistStatus = .unknown
     @State private var whitelistActiveEndpoint: EndpointMode = .primary
@@ -48,26 +38,17 @@ struct ContentView: View {
     @State private var isPreparingVPN = false
     @State private var vpnProfileError: String?
 
-    /// IPA-D25 fix6: optimistic "we just asked for a switch" flag.
-    /// Set immediately when the user taps the manual segment or flips
-    /// the auto toggle, so the shield flips to amber "Reconnecting…"
-    /// without waiting for the 500 ms status-poll cycle to pick up the
-    /// extension's isRewiring flag. Auto-clears after 3 s (long enough
-    /// for the real rewire to complete on most networks; the status
-    /// poll then takes over). Operator: "должен быть моментальный
-    /// рестарт".
+    /// Optimistic "we just asked for a switch" flag. Set immediately
+    /// when the user flips the mode in Settings, so the shield flips to
+    /// amber "Reconnecting…" without waiting for the 500 ms status-poll
+    /// cycle to pick up the extension's isRewiring flag. Auto-clears
+    /// after 3 s (long enough for the real rewire to complete on most
+    /// networks; the status poll then takes over).
     @State private var pendingSwitch: Bool = false
     @State private var pendingSwitchClearTask: Task<Void, Never>?
 
-    private static func checkBackupConfigured() -> Bool {
-        guard ConfigStore.shared.load() != nil else { return false }
-        // The whitelist carrier is VKS or TURN; H2-under-whitelist is gone.
-        switch WhitelistMode.current {
-        case .vkTurn:
-            return true
-        case .vks:
-            return VKSPreferences.isConfigured
-        }
+    private static func activeProfileBlob() -> String {
+        ConfigStore.shared.load() ?? ""
     }
 
     // MARK: – Derived state
@@ -84,12 +65,12 @@ struct ContentView: View {
 
         var statusLabel: String {
             switch self {
-            case .off:          return "Off"
-            case .connecting:   return "Connecting…"
-            case .connected:    return "Connected"
-            case .reconnecting: return "Reconnecting…"
-            case .failed:       return "Proxy unreachable"
-            case .error:        return "Error"
+            case .off:          return "Выключен"
+            case .connecting:   return "Подключение…"
+            case .connected:    return "Подключено"
+            case .reconnecting: return "Переподключение…"
+            case .failed:       return "Прокси недоступен"
+            case .error:        return "Ошибка"
             }
         }
 
@@ -106,11 +87,11 @@ struct ContentView: View {
 
         var connectButtonLabel: String {
             switch self {
-            case .connected:    return "Disconnect"
-            case .reconnecting: return "Disconnect"
-            case .failed:       return "Disconnect"
-            case .connecting:   return "Connecting…"
-            default:            return "Connect"
+            case .connected:    return "Отключить"
+            case .reconnecting: return "Отключить"
+            case .failed:       return "Отключить"
+            case .connecting:   return "Подключение…"
+            default:            return "Подключить"
             }
         }
 
@@ -138,14 +119,13 @@ struct ContentView: View {
             if pendingSwitch { return .reconnecting }
             if lampStore.isReconnecting { return .reconnecting }
             if lampStore.snapshot.pingFailed { return .failed }
-            // IPA-D27: green "Connected" normally waits for a successful
-            // real-internet ping. TURN is different: once the WireGuard
-            // netstack is ready, user traffic can already flow while the
-            // HTTP probe may still be slow or targeting a site that dislikes
-            // HEAD. Do not leave the UI stuck on Connecting when TURN is
-            // definitively attached.
             if lampStore.snapshot.pingMs < 0 {
-                if lampStore.turnNetstackReady || lampStore.snapshot.upstreamKind == "turn" {
+                // Green "Подключено" waits for a successful real-internet
+                // ping — except under the VKS carrier, where the room
+                // transport may legitimately take longer to warm up than
+                // the first probe. Once the native VKS client owns the
+                // upstream, user traffic can already flow.
+                if lampStore.snapshot.vksRunning != 0 {
                     return .connected
                 }
                 return .connecting
@@ -175,10 +155,7 @@ struct ContentView: View {
                     .padding(.horizontal, 16)
                     .padding(.top, 4)
 
-                // IPA-D25 fix5: row is always visible. `hasBackupConfigured`
-                // now means "a Whitelist target exists": either H2 backup URI
-                // or VK TURN via Main URI identity.
-                autoDetectRow
+                modeStatusRow
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
 
@@ -195,6 +172,9 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings, onDismiss: refreshConfigDerivedState) {
             SettingsView(onConfigChanged: { _ in
                 refreshConfigDerivedState()
+                // A mode change in Settings rewires the live tunnel;
+            // mirror the optimistic pendingSwitch flip here.
+            noteSwitchPendingIfConnected()
             })
             .environment(\.themeTokens, theme)
         }
@@ -202,34 +182,11 @@ struct ContentView: View {
             LogView(injectedBridge: bridge)
                 .environment(\.themeTokens, theme)
         }
-        .sheet(isPresented: $showEndpoints, onDismiss: refreshConfigDerivedState) {
-            EndpointsView { _ in
-                refreshConfigDerivedState()
-            }
-            .environment(\.themeTokens, theme)
-        }
-        // IPA-D65b: slider-fallback for VK Smart Verification challenge. The hidden
-        // WKWebView handler throws verification-required signal when
-        // VK swaps in a slider; the refresher publishes a
-        // `manualChallenge` here, we present a modal sheet and pass
-        // the user-solved success_token back into the refresh task.
-        .sheet(item: $turnRefresher.manualChallenge) { challenge in
-            ManualCaptchaSheet(
-                redirectURI: challenge.redirectURI,
-                sessionToken: challenge.sessionToken,
-                onSuccess: { token in
-                    turnRefresher.resolveManual(token: token)
-                },
-                onCancel: {
-                    turnRefresher.cancelManual()
-                }
-            )
-        }
         .onAppear {
             startStatusPolling()
             lampStore.start()
             exitIP.start(isConnected: bridge.state == .connected)
-            // IPA-D28: only run the main-app monitor while VPN is off
+            // Only run the main-app monitor while VPN is off
             // and auto-mode is selected. Once the extension is up,
             // its own WhitelistDetector takes over (it has actual
             // physical-iface binding + ICMP probes; we'd just be
@@ -249,10 +206,6 @@ struct ContentView: View {
             exitIP.refreshSoon(isConnected: isUp)
             // Stop monitor when extension takes over; resume when
             // tunnel drops back to disconnected.
-            updateWhitelistMonitorState()
-        }
-        .onChange(of: isAutoMode) { _, _ in
-            // Toggle auto-mode → maybe start/stop monitor accordingly.
             updateWhitelistMonitorState()
         }
         // Phase C iOS-notify (preserved from D20): server-pushed alert.
@@ -295,7 +248,7 @@ struct ContentView: View {
                     // (MARKETING_VERSION=0.3.<run>-<sha>, CURRENT_PROJECT_VERSION=<run>).
                     // Showing it right under the logo lets us answer "what's
                     // installed?" at a glance without diving into Settings →
-                    // About.
+                    // О приложении.
                     Text(Self.shortVersionLabel)
                         .font(.geistMono(.regular, size: 10))
                         .foregroundStyle(theme.textDim)
@@ -354,12 +307,12 @@ struct ContentView: View {
                     )
                 }
 
-                // IPA-D24: exit IP under the Ping chip. URLSession.shared
+                // Exit IP under the Ping chip. URLSession.shared
                 // follows the system default route — through the tunnel
                 // when on, real ISP when off. Quiet failure: line hides.
                 if let ip = exitIP.ip {
                     HStack(spacing: 4) {
-                        Text(exitIP.isFromTunnel ? "Exit" : "Network")
+                        Text(exitIP.isFromTunnel ? "Выход" : "Сеть")
                             .font(.geistMono(.regular, size: 11))
                             .foregroundStyle(theme.textMuted)
                         Text("·")
@@ -379,13 +332,6 @@ struct ContentView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
                 }
-                if let turnInfo = turnRefresher.turnInfo, !turnInfo.isEmpty {
-                    Text(turnInfo)
-                        .font(.geist(.regular, size: 13))
-                        .foregroundStyle(theme.textDim)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 24)
-                }
                 if let vpnProfileError {
                     Text(vpnProfileError)
                         .font(.geist(.regular, size: 13))
@@ -394,7 +340,7 @@ struct ContentView: View {
                         .padding(.horizontal, 24)
                 }
                 if !hasConfig {
-                    Text("Paste a tamizdat:// link in Settings → Proxies to begin.")
+                    Text("Вставьте tamizdat:// ссылку в Настройки → Профиль.")
                         .font(.geist(.regular, size: 13))
                         .foregroundStyle(theme.textDim)
                         .multilineTextAlignment(.center)
@@ -408,18 +354,15 @@ struct ContentView: View {
 
     private var statTiles: some View {
         HStack(spacing: 8) {
-            StatTile(label: "Mode",
+            StatTile(label: "Режим",
                      value: modeTileValue,
                      unit: nil)
-            StatTile(label: "Uptime",
+            StatTile(label: "Аптайм",
                      value: lampStore.uptimeText,
                      unit: lampStore.uptimeUnit.isEmpty ? nil : lampStore.uptimeUnit)
-            StatTile(label: "Data",
+            StatTile(label: "Трафик",
                      value: lampStore.dataText.value,
                      unit: lampStore.dataText.unit)
-            StatTile(label: "TURN",
-                     value: turnTileValue,
-                     unit: nil)
         }
     }
 
@@ -429,36 +372,12 @@ struct ContentView: View {
     private var modeTileValue: String {
         let snap = lampStore.snapshot
         if !snap.realShape.isEmpty {
-            if snap.upstreamKind == "turn" {
-                return "TURN"
-            }
-            if snap.desiredUpstream == "turn" {
-                return "TURN…"
-            }
             if snap.effectiveEndpoint == EndpointMode.backup.rawValue {
                 return "Whitelist"
             }
             return "Main"
         }
         return TamizdatStatusStore.modeLabel(active: effectiveEndpoint)
-    }
-
-    /// TURN tile glyph based on four states:
-    ///   "▲" — TURN netstack ready and routing can use it
-    ///   "…" — runner alive, waiting for WG config/netstack
-    ///   "✓" — session params cached but not actively used
-    ///   "—" — no session params, no upstream
-    private var turnTileValue: String {
-        if lampStore.turnNetstackReady {
-            return "▲"
-        }
-        if lampStore.turnUpstreamRunning {
-            return "…"
-        }
-        if lampStore.turnCredsValid || lampStore.snapshot.hasTURNCreds {
-            return "✓"
-        }
-        return "—"
     }
 
     /// "Effective" endpoint for label purposes:
@@ -471,108 +390,81 @@ struct ContentView: View {
         return EndpointModeStore.current
     }
 
-    private var desiredConnectUsesVKTurn: Bool {
-        guard WhitelistMode.current == .vkTurn else { return false }
-        let mode = EndpointModeStore.current
-        if mode == .backup { return true }
-        if mode == .auto && WhitelistStatusStore.trustedAutoEndpoint == .backup { return true }
-        return false
-    }
+    // MARK: – Mode status row (home keeps only the status line)
 
-    // MARK: – Auto-detect Whitelist row
-
-    private var autoDetectRow: some View {
+    private var modeStatusRow: some View {
         CardContainer(padding: 0) {
-            VStack(spacing: 0) {
-                DesignRow(
-                    icon: IconCard(systemName: "dot.radiowaves.up.forward",
-                                   bg: theme.blueDim,
-                                   fg: theme.blue),
-                    title: "Auto-detect Whitelist",
-                    sub: whitelistSub,
-                    isLast: isAutoMode    // last only when picker is hidden
-                ) {
-                    HStack(spacing: 8) {
-                        Toggle("", isOn: $isAutoMode)
-                            .labelsHidden()
-                            .tint(theme.mint)
-                            .onChange(of: isAutoMode) { _, newAuto in
-                                noteSwitchPending()
-                                let newMode: EndpointMode = newAuto ? .auto : manualEndpoint
-                                Task {
-                                    await VPNProfileStore.shared.switchEndpoint(to: newMode)
-                                }
-                            }
-                        // IPA-D24: chevron signals the card itself is
-                        // tappable — opens the Proxies sheet so the
-                        // user can jump straight to URL edit.
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(theme.textMuted)
-                    }
+            HStack(spacing: 14) {
+                IconCard(systemName: "dot.radiowaves.up.forward",
+                         bg: theme.blueDim,
+                         fg: theme.blue)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(modeLineTitle)
+                        .font(.geist(.medium, size: 16))
+                        .tracking(-0.16)
+                        .foregroundStyle(theme.text)
+                    Text(whitelistSub)
+                        .font(.geist(.regular, size: 12.5))
+                        .foregroundStyle(theme.textDim)
                 }
-                // IPA-D24: card-level tap opens Proxies. SwiftUI gesture
-                // priority lets the inner Toggle / segmented picker
-                // intercept their own taps; the surrounding tap on
-                // icon / title / sub area lands here.
-                .contentShape(Rectangle())
-                .onTapGesture { showEndpoints = true }
-
-                // IPA-D22 fix: when auto-detect is off, expose the manual
-                // Main/Whitelist picker inline below the toggle — port of
-                // the pre-D22 segmented control that was lost in the rewrite.
-                if !isAutoMode {
-                    HStack(spacing: 0) {
-                        manualPickerSegment(label: "Main",
-                                            isSelected: manualEndpoint == .primary,
-                                            tap: { selectManual(.primary) })
-                        manualPickerSegment(label: "Whitelist",
-                                            isSelected: manualEndpoint == .backup,
-                                            tap: { selectManual(.backup) })
-                    }
-                    .padding(4)
-                    .background(theme.chip)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 14)
-                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(theme.textMuted)
             }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { showSettings = true }
+    }
+
+    /// "Авто" / "Обычный" / "Whitelist" — the current mode selection.
+    private var modeLineTitle: String {
+        switch EndpointModeStore.current {
+        case .auto:    return "Авто"
+        case .primary: return "Обычный"
+        case .backup:  return "Whitelist"
         }
     }
 
-    private func manualPickerSegment(label: String,
-                                     isSelected: Bool,
-                                     tap: @escaping () -> Void) -> some View {
-        Button(action: tap) {
-            Text(label)
-                .font(.geist(.semibold, size: 13))
-                .tracking(-0.13)
-                .foregroundStyle(isSelected ? theme.chipActiveText : theme.text)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 8)
-                .background(isSelected ? theme.chipActive : Color.clear)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
+    private var whitelistSub: String {
+        // Under the whitelist endpoint name the carrier: the first
+        // enabled provider in the ladder order. Unknown is only the
+        // short in-flight state before the first ping result. Every
+        // failed/ambiguous completed cycle is an explicit error.
+        let blob = Self.activeProfileBlob()
+        let carrier: String? = {
+            guard VKSPreferences.enabled,
+                  VKSPreferences.isConfigured(profileBlob: blob) else { return nil }
+            let first = VKSPreferences.providerOrder
+                .first { VKSPreferences.providerEnabled($0) }
+            return VKSPreferences.providerDisplayName(first)
+        }()
+        switch whitelistStatus {
+        case .error, .noNetwork, .frozen:
+            return "Ошибка определения"
+        case .detected:
+            if let carrier {
+                return "Whitelist · через \(carrier)"
+            }
+            return "Whitelist активен"
+        case .off:
+            return EndpointModeStore.current == .auto ? "Свободный интернет" : "Ручной режим"
+        case .unknown:
+            return EndpointModeStore.current == .auto ? "Мониторинг…" : "Ручной режим"
         }
-        .buttonStyle(.plain)
     }
 
-    private func selectManual(_ ep: EndpointMode) {
-        guard !isAutoMode else { return }
-        manualEndpoint = ep
-        noteSwitchPending()
-        Task {
-            await VPNProfileStore.shared.switchEndpoint(to: ep)
-        }
-    }
-
-    /// IPA-D28: start/stop the main-app WhitelistMonitor based on the
-    /// current VPN state + auto-mode toggle. Runs ONLY when
+    /// Start/stop the main-app WhitelistMonitor based on the current VPN
+    /// state + auto-mode. Runs ONLY when
     ///   - bridge.state == .disconnected (extension's own detector
     ///     would conflict otherwise)
-    ///   - isAutoMode == true (no point monitoring if user picked
-    ///     manual endpoint)
+    ///   - EndpointModeStore.current == .auto (no point monitoring if
+    ///     the user picked a manual endpoint)
     private func updateWhitelistMonitorState() {
-        let shouldRun = bridge.state == .disconnected && isAutoMode
+        let shouldRun = bridge.state == .disconnected
+            && EndpointModeStore.current == .auto
         if shouldRun {
             whitelistMonitor.start()
         } else {
@@ -580,40 +472,38 @@ struct ContentView: View {
         }
     }
 
-    /// Re-derives config-dependent state (hasConfig / hasBackupConfigured
-    /// and the manual-endpoint fallback). Called from the config sheets'
-    /// callbacks AND their onDismiss — EndpointsView persists on Done via
-    /// closeAndPersist, but a swipe-down dismissal bypasses closeAndPersist
-    /// entirely, leaving the home screen showing stale hasConfig state.
+    /// Re-derives config-dependent state (hasConfig and the manual-endpoint
+    /// fallback). Called from the settings sheet's callbacks AND its
+    /// onDismiss.
     private func refreshConfigDerivedState() {
         hasConfig = ConfigStore.shared.load() != nil
-        hasBackupConfigured = ContentView.checkBackupConfigured()
-        if !hasBackupConfigured {
-            if manualEndpoint == .backup { manualEndpoint = .primary }
+        let blob = Self.activeProfileBlob()
+        let hasWhitelistTarget = VKSPreferences.enabled
+            && VKSPreferences.isConfigured(profileBlob: blob)
+        if !hasWhitelistTarget {
             if EndpointModeStore.current == .backup {
                 EndpointModeStore.current = .primary
             }
         }
     }
 
-    /// IPA-D25 fix6: flip the optimistic "reconnecting" flag instantly
-    /// so the shield turns amber the moment the user taps. The flag
-    /// auto-clears after 3 s — by then the extension's isRewiring
-    /// has propagated via the 500 ms status poll, so `homeState`
-    /// keeps showing `.reconnecting` from the real signal until the
-    /// new client finishes warming.
-    ///
-    /// IPA-D25 fix7: also kick the ExitIP store to refetch immediately
-    /// (otherwise the IP chip stays on the OLD exit IP for up to 5s
-    /// until the next regular poll lands).
+    /// Flip the optimistic "reconnecting" flag instantly when Settings
+    /// changed the mode while connected, so the shield turns amber the
+    /// moment the sheet's change lands. The flag auto-clears after 3 s —
+    /// by then the extension's isRewiring has propagated via the 500 ms
+    /// status poll.
+    private func noteSwitchPendingIfConnected() {
+        guard bridge.state == .connected else { return }
+        noteSwitchPending()
+    }
+
+    /// Optimistic "we just asked for a switch" flip: the shield turns
+    /// amber immediately; the 500 ms status poll takes over once the
+    /// extension's isRewiring propagates. Also kick the ExitIP store to
+    /// refetch soon after the rewire completes.
     private func noteSwitchPending() {
         pendingSwitchClearTask?.cancel()
         pendingSwitch = true
-        // The actual TLS handshake to the new upstream takes some
-        // time; refetch the exit IP a moment later (1.5 s gives the
-        // new samizdat client a chance to be fully ready). ExitIPStore
-        // itself also polls every 5 s now, so this is just a fast-path
-        // bump.
         exitIP.refreshSoon(isConnected: bridge.state == .connected)
         Task { @MainActor in
             try? await Task.sleep(for: .seconds(2))
@@ -624,17 +514,6 @@ struct ContentView: View {
             if !Task.isCancelled {
                 pendingSwitch = false
             }
-        }
-    }
-
-    private var whitelistSub: String {
-        // Unknown is only the short in-flight state before the first ping
-        // result. Every failed/ambiguous completed cycle is an explicit error.
-        switch whitelistStatus {
-        case .error, .noNetwork, .frozen: return "Error detecting"
-        case .detected:   return "Whitelist active"
-        case .off:        return isAutoMode ? "Free internet" : "Manual"
-        case .unknown:    return isAutoMode ? "Monitoring…" : "Manual"
         }
     }
 
@@ -696,16 +575,11 @@ struct ContentView: View {
             return
         }
         guard let blob = ConfigStore.shared.load() else { return }
-        let shouldPreflightTurnCreds = desiredConnectUsesVKTurn && TURNCredsStore.shared.needsRefresh
         isPreparingVPN = true
         vpnProfileError = nil
         Task { @MainActor in
             defer { isPreparingVPN = false }
             do {
-                if shouldPreflightTurnCreds {
-                    TURNLog.warn("turncreds", "connect requested for VK TURN with stale/missing creds — waiting before tunnel attach")
-                    try await TURNCredsRefresher.shared.ensureFreshForConnect(reason: "connectVKTurn")
-                }
                 try await bridge.connect(blob)
             } catch {
                 vpnProfileError = error.localizedDescription
@@ -719,11 +593,11 @@ struct ContentView: View {
         whitelistStatus = WhitelistStatusStore.current
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
         // Mirror WhitelistStatusStore.autoDecisionMaxAge (≥200 s, widened
-        // by probeInterval×7 at long intervals) instead of the old fixed
-        // 200 s — with a 120 s probe interval the detector legitimately
-        // goes silent for >200 s while still healthy, and this poll then
+        // by probeInterval×7 at long intervals) instead of a fixed window —
+        // with a 120 s probe interval the detector legitimately goes
+        // silent for >200 s while still healthy, and this poll then
         // mis-rendered "Error detecting" over a live verdict.
-        if isAutoMode && bridge.state == .connected
+        if EndpointModeStore.current == .auto && bridge.state == .connected
             && WhitelistStatusStore.ageSeconds > max(200, TimeInterval(WhitelistProbePreferences.probeInterval * 7)) {
             whitelistStatus = .error
         }

@@ -4,13 +4,12 @@ import Darwin
 
 /// Synchronous, fsync-per-write logger for the Network Extension.
 ///
-/// WHY this exists separately from `TURNLog` / `appendExtLog`: those
-/// rely on `FileHandle.write` / `synchronize`, which Foundation
-/// buffers internally. When the extension calls into gomobile
-/// `SocksstubStartVKTurnUpstream` (a blocking call that can sleep up
-/// to 15 seconds while VK Allocate handshakes), any log line the
-/// caller emits after the block never lands on disk before the
-/// extension is reaped by iOS or its log file handle goes stale.
+/// WHY this exists separately from `appendExtLog`: it relies on
+/// `FileHandle.write` / `synchronize`, which Foundation buffers
+/// internally. When the extension calls a blocking gomobile entry
+/// point, any log line the caller emits after the block never lands
+/// on disk before the extension is reaped by iOS or its log file
+/// handle goes stale.
 ///
 /// `ExtLog` opens a fresh file descriptor on every line, writes the
 /// bytes via `Darwin.write`, calls `fsync`, then closes the fd. No

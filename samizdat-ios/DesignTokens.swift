@@ -37,7 +37,6 @@ struct ThemeTokens {
     let mint: Color
     let mintInk: Color
     let mintDim: Color
-    let mintRing: Color
 
     // Red (off / destructive)
     let red: Color
@@ -70,7 +69,6 @@ struct ThemeTokens {
         mint: Color(hex: 0x7BF1A8),
         mintInk: Color(hex: 0x0A2316),
         mintDim: Color(red: 123/255, green: 241/255, blue: 168/255).opacity(0.14),
-        mintRing: Color(red: 123/255, green: 241/255, blue: 168/255).opacity(0.35),
         red: Color(hex: 0xFF6B6B),
         redDim: Color(red: 255/255, green: 107/255, blue: 107/255).opacity(0.14),
         amber: Color(hex: 0xFFB845),
@@ -98,7 +96,6 @@ struct ThemeTokens {
         mint: Color(hex: 0x0D8C5A),
         mintInk: Color(hex: 0x0A2316),
         mintDim: Color(red: 13/255, green: 140/255, blue: 90/255).opacity(0.12),
-        mintRing: Color(red: 13/255, green: 140/255, blue: 90/255).opacity(0.32),
         red: Color(hex: 0xD14545),
         redDim: Color(red: 209/255, green: 69/255, blue: 69/255).opacity(0.10),
         amber: Color(hex: 0xB8821F),

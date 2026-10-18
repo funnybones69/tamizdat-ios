@@ -160,34 +160,14 @@ final class VPNProfileStore {
         _ = try? await sendProviderMessage("refreshWhitelistProbes")
     }
 
-    /// Pushes freshly-saved VK TURN session parameters into the live Network
-    /// Extension process. The main app cannot update the runner by
-    /// calling the gomobile bridge directly: the active runner lives in
-    /// the extension's separate process and Go runtime. This RPC carries
-    /// only the command string; the extension re-reads the App Group JSON
-    /// itself, so raw TURN session parameters never travel through logs here.
-    func refreshVKTurnCreds() async -> String {
-        do {
-            return try await sendProviderMessage("refreshVKTurnCreds")
-        } catch {
-            SamizdatAddLog("warn: refreshVKTurnCreds provider message failed: \(error.localizedDescription)")
-            return "sendError"
-        }
+    /// Live-applies a changed VKS ladder (provider order / enable flags)
+    /// to the running extension. The extension re-reads the App Group
+    /// ladder spec and re-arms the native room transport. No-op while
+    /// disconnected — the next connect reads the same keys anyway.
+    func refreshVKSLadder() async {
+        _ = try? await sendProviderMessage("refreshVKSLadder")
     }
 
-    /// Applies Settings → VK TURN worker-count changes to a live TURN
-    /// runner. The extension re-reads App Group UserDefaults, stops the
-    /// current runner if policy is Restricted+Relay, and starts a fresh
-    /// attach with the new fanout. If the VPN is disconnected, the saved
-    /// value is simply picked up on the next connect.
-    func restartVKTurnUpstream() async -> String {
-        do {
-            return try await sendProviderMessage("restartVKTurnUpstream")
-        } catch {
-            SamizdatAddLog("warn: restartVKTurnUpstream provider message failed: \(error.localizedDescription)")
-            return "sendError"
-        }
-    }
 
     /// IPA-Z: fetch one snapshot of the live realtime / RTT state from
     /// the extension. Used by the main-screen lamp at 500 ms cadence.

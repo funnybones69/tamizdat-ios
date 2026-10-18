@@ -187,7 +187,7 @@ func (c *kcpConn) warnRateLimitedf(format string, args ...any) {
 		return
 	}
 
-	logger.Warnf("vp8channel: "+format, args...)
+	logger.Warnf("seichannel: "+format, args...)
 }
 
 func (c *kcpConn) ReadFrom(p []byte) (int, net.Addr, error) {
@@ -245,6 +245,7 @@ func (c *kcpConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 	if !deadline.IsZero() {
 		d := time.Until(deadline)
 		if d <= 0 {
+			packet.release()
 			return 0, TimeoutError{}
 		}
 		t := time.NewTimer(d)

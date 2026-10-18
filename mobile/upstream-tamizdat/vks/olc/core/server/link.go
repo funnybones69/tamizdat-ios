@@ -117,8 +117,20 @@ func (s *Server) reinstallSession(ctx context.Context, dead *smux.Session) {
 	}
 	s.reinstallMu.Lock()
 	defer s.reinstallMu.Unlock()
+	// A stale rebuild must not touch the live session. If a newer reinstall
+	// (or shutdown) already replaced the session this call was asked to
+	// rebuild, closing the current pair here would leave the server with no
+	// session at all and no state broadcast to wake the accept loop - the
+	// client's next handshake then times out waiting for its welcome.
 	s.sessMu.RLock()
-	if s.pair != nil {
+	stale := s.staleReinstall(dead)
+	current := s.pair
+	conn, controlConn := s.conn, s.controlConn
+	s.sessMu.RUnlock()
+	if stale {
+		return
+	}
+	if current != nil {
 		// ai-generated: changed s.pair.CloseConns() to s.pair.Close() and
 		// added this comment explaining why.
 		// Close (not CloseConns): the stale pair's smux Sessions must be
@@ -127,16 +139,15 @@ func (s *Server) reinstallSession(ctx context.Context, dead *smux.Session) {
 		// bucketNotify/die, not reading conn) never notices the conn died
 		// and AcceptStream on it stays blocked until something else
 		// eventually pokes it.
-		_ = s.pair.Close()
+		_ = current.Close()
 	} else {
-		if s.conn != nil {
-			_ = s.conn.Close()
+		if conn != nil {
+			_ = conn.Close()
 		}
-		if s.controlConn != nil {
-			_ = s.controlConn.Close()
+		if controlConn != nil {
+			_ = controlConn.Close()
 		}
 	}
-	s.sessMu.RUnlock()
 	replacement, err := tunnelcore.NewSessionPair(s.ln, s.keys, tunnelcore.ServerRole)
 	if replacement == nil {
 		logger.Warnf("smux server re-init failed: %v", err)
@@ -218,8 +229,19 @@ func (s *Server) closePeerRouting(teardown peerRoutingTeardown) {
 	s.closeAllUDPFlows()
 }
 
+// staleReinstall reports whether a rebuild targeting dead has been overtaken.
+// Callers hold sessMu: the session pointers it compares are written under it.
 func (s *Server) staleReinstall(dead *smux.Session) bool {
 	return dead != nil && dead != s.session && dead != s.controlSess
+}
+
+// staleControlLoop reports whether session is no longer the installed one.
+// Unlike staleReinstall it is safe to call without sessMu held: it takes the
+// read lock itself.
+func (s *Server) staleControlLoop(session *smux.Session) bool {
+	s.sessMu.RLock()
+	defer s.sessMu.RUnlock()
+	return s.staleReinstall(session)
 }
 
 func (s *Server) swapSession(dead *smux.Session, replacement *tunnelcore.SessionPair) bool {

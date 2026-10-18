@@ -41,12 +41,24 @@ func (s *Session) Connect(ctx context.Context) error {
 		return err
 	}
 
+	// A generation that fails to come up must not leak what it already
+	// built. connectFail tears the PCs, the DataChannel and the signaling
+	// socket back down and signals this generation's session channels, so
+	// the keepalive/signaling goroutines started below leave too.
+	connectFail := func(err error) error {
+		s.stopSession()
+		s.closeDataChannel()
+		s.closePeerConns()
+		s.closeWebSocket()
+		return err
+	}
+
 	keepAliveCh, sessionCloseCh := s.resetSession()
 	var dcReady chan struct{}
 	if s.onData != nil {
 		dc, err := s.pubPC().CreateDataChannel("olcrtc", nil)
 		if err != nil {
-			return fmt.Errorf("create dc: %w", err)
+			return connectFail(fmt.Errorf("create dc: %w", err))
 		}
 		s.dc.Store(dc)
 		dcReady = make(chan struct{})
@@ -54,7 +66,7 @@ func (s *Session) Connect(ctx context.Context) error {
 	}
 
 	if err := s.dialWebSocket(); err != nil {
-		return err
+		return connectFail(err)
 	}
 
 	s.setupICEHandlers()
@@ -65,13 +77,17 @@ func (s *Session) Connect(ctx context.Context) error {
 		case <-dcReady:
 			return s.abortIfTerminated()
 		case <-time.After(15 * time.Second):
-			return ErrDataChannelTimeout
+			return connectFail(ErrDataChannelTimeout)
 		case <-ctx.Done():
-			return fmt.Errorf("connect context cancelled: %w", ctx.Err())
+			return connectFail(fmt.Errorf("connect context cancelled: %w", ctx.Err()))
 		}
 	}
 
 	if err := s.waitForMediaReady(ctx, 20*time.Second); err != nil {
+		// stopSession lets the keepalive/signaling loops exit without a full
+		// teardown: waitForMediaReady timed out or the caller went away, but
+		// the caller may retry Connect on the same generation.
+		s.stopSession()
 		return err
 	}
 	return s.abortIfTerminated()
