@@ -109,12 +109,12 @@ final class VPNProfileStore {
     }
 
     /// IPA-P: live-switch the active endpoint without disconnecting the
-    /// VPN. Writes EndpointModeStore.current first (source of truth)
-    /// then pokes the extension via provider message so it re-reads
-    /// and rewires its samizdat client over the current network.
+    /// VPN. The CALLER owns the EndpointModeStore write (single writer:
+    /// SettingsView's mode picker) — this only pokes the extension via
+    /// provider message so it re-reads and rewires its samizdat client
+    /// over the current network.
     @discardableResult
     func switchEndpoint(to mode: EndpointMode) async -> String {
-        EndpointModeStore.current = mode
         do {
             let response = try await sendProviderMessage("switchEndpoint")
             if response.isEmpty {

@@ -28,7 +28,6 @@ import Foundation
 enum VKSPreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
 
-    private static let enabledKey = "tamizdat.vks.enabled"
     private static let keyHexKey = "tamizdat.vks.keyHex"
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
     private static let wakeDNSKey = "tamizdat.vks.wakeDNS"
@@ -70,15 +69,6 @@ enum VKSPreferences {
     // App Group defaults) or pass them via the profile link.
     static let testDefaultKeyHex = ""
     static let testDefaultShortIDHex = ""
-
-    /// Master switch for the VKS carrier under the whitelist endpoint.
-    static var enabled: Bool {
-        get {
-            if defaults?.object(forKey: enabledKey) == nil { return true }
-            return defaults?.bool(forKey: enabledKey) ?? false
-        }
-        set { defaults?.set(newValue, forKey: enabledKey) }
-    }
 
     /// Ladder order — provider ids from `allProviders`. Unknown ids read
     /// from storage are dropped; missing ones are appended in canonical

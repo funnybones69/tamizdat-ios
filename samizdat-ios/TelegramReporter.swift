@@ -49,15 +49,15 @@ enum TelegramReporter {
         var errorDescription: String? {
             switch self {
             case .notConfigured:
-                return "Set bot token and chat ID first (gear icon)"
+                return "Сначала укажите токен и chat id."
             case .http(let code, let body):
                 return "HTTP \(code): \(body.prefix(200))"
             case .transport(let err):
-                return "Transport: \(err.localizedDescription)"
+                return "Сеть: \(err.localizedDescription)"
             case .encoding:
-                return "Could not encode log"
+                return "Не удалось собрать файл."
             case .badURL:
-                return "Bot token contains characters that make the request URL invalid"
+                return "В токене недопустимые символы."
             }
         }
     }

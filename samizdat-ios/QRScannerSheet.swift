@@ -29,11 +29,13 @@ struct QRScannerSheet: View {
             VStack(spacing: 0) {
                 // Header (matches the Endpoints/Settings sheet pattern)
                 HStack {
-                    Chip(label: "Cancel") { dismiss() }
+                    Chip(label: "Закрыть") { dismiss() }
                     Spacer()
-                    Text("Scan QR")
+                    Text("QR-код")
                         .font(.geist(.semibold, size: 16))
                         .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                     Spacer()
                     // Spacer to balance the leading chip
                     Color.clear.frame(width: 64, height: 1)
@@ -42,7 +44,7 @@ struct QRScannerSheet: View {
                 .padding(.top, 8)
                 .padding(.bottom, 6)
 
-                Text("Scan a tamizdat:// QR")
+                Text("Наведите камеру")
                     .font(.geist(.bold, size: 22))
                     .tracking(-0.66)
                     .foregroundStyle(theme.text)
@@ -81,7 +83,7 @@ struct QRScannerSheet: View {
                     onScan(trimmed)
                     dismiss()
                 } else {
-                    lastError = "Not a tamizdat:// link"
+                    lastError = "Это не ссылка tamizdat://."
                 }
             })
             .clipShape(RoundedRectangle(cornerRadius: 22))
@@ -112,10 +114,10 @@ struct QRScannerSheet: View {
     private var permissionPrompt: some View {
         CardContainer {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Camera access")
+                Text("Доступ к камере")
                     .font(.geist(.semibold, size: 16))
                     .foregroundStyle(theme.text)
-                Text("Tamizdat needs camera access to scan tamizdat:// QR codes for endpoint setup.")
+                Text("Камера нужна, чтобы считать QR-код со ссылкой tamizdat://.")
                     .font(.geist(.regular, size: 13))
                     .foregroundStyle(theme.textDim)
                 Button {
@@ -125,7 +127,7 @@ struct QRScannerSheet: View {
                         }
                     }
                 } label: {
-                    Text("Allow camera")
+                    Text("Разрешить")
                         .font(.geist(.semibold, size: 14))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)
@@ -141,10 +143,10 @@ struct QRScannerSheet: View {
     private var permissionDenied: some View {
         CardContainer {
             VStack(alignment: .leading, spacing: 14) {
-                Text("Camera blocked")
+                Text("Камера недоступна")
                     .font(.geist(.semibold, size: 16))
                     .foregroundStyle(theme.text)
-                Text("Camera access is denied for Tamizdat. Open iOS Settings to grant permission, then try again.")
+                Text("Включите доступ к камере в настройках iOS.")
                     .font(.geist(.regular, size: 13))
                     .foregroundStyle(theme.textDim)
                 Button {
@@ -152,7 +154,7 @@ struct QRScannerSheet: View {
                         UIApplication.shared.open(url)
                     }
                 } label: {
-                    Text("Open iOS Settings")
+                    Text("Открыть настройки")
                         .font(.geist(.semibold, size: 14))
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 10)

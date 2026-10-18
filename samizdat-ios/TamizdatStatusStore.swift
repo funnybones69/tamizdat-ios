@@ -302,16 +302,17 @@ final class TamizdatStatusStore: ObservableObject {
 
     // MARK: – Formatted strings (IPA-D22)
 
-    /// "Main" / "Whitelist" / "Auto" — synced from `EndpointModeStore.current`.
+    /// «Обычный» / «Белые списки» / «Авто» — synced from
+    /// `EndpointModeStore.current`.
     /// Under the whitelist endpoint the carrier is always VKS now
     /// (VK TURN was removed), so the tile reflects the endpoint
     /// position; the home-screen status line names the live provider
     /// separately.
     static func modeLabel(active: EndpointMode) -> String {
         switch active {
-        case .primary: return "Main"
-        case .backup:  return "Whitelist"
-        case .auto:    return "Auto"
+        case .primary: return "Обычный"
+        case .backup:  return "Белые списки"
+        case .auto:    return "Авто"
         }
     }
 

@@ -7,11 +7,11 @@ import UserNotifications
 /// русские; оформление — дизайн-токены (Geist, ThemeTokens, mint).
 ///
 /// Структура:
-///   Подключение      → Профиль (список профилей), Режим (Авто/Обычный/Whitelist)
-///   Каналы whitelist → порядок провайдеров (drag) + тумблер на строку
+///   Подключение      → Профиль (список профилей), Режим (Авто/Обычный/Белые списки)
+///   Каналы VKS       → порядок провайдеров (drag) + тумблер на строку
 ///   Уведомления      → «Переключение режима» + строка про заблокированные
 ///   Оформление       → Системная / Светлая / Тёмная
-///   Дополнительно ›  → push-экран: Параметры VKS, Детектор whitelist,
+///   Дополнительно ›  → push-экран: Параметры VKS, Детектор белых списков,
 ///                      Проверка связи, Логи ›, Telegram для логов ›
 ///   О приложении     → версия, GitHub
 ///
@@ -36,11 +36,22 @@ struct SettingsView: View {
     @State private var permissionStatus: UNAuthorizationStatus = .notDetermined
     @State private var permissionDeniedAlert: Bool = false
 
-    /// Whitelist channel list: local mirror of VKSPreferences.providerOrder
+    /// VKS channel list: local mirror of VKSPreferences.providerOrder
     /// + per-provider enabled flags. Edits (drag/toggle) persist
     /// immediately and apply on the next connect (or live via the
     /// refreshVKSLadder provider message while connected).
     @State private var providerOrder: [String] = VKSPreferences.providerOrder
+
+    /// Зеркала сторов. EndpointModeStore и VKSPreferences — обычные
+    /// UserDefaults-обёртки без наблюдения: читать их прямо в Binding
+    /// getter'ах нельзя, иначе после тапа ничего не перерисовывается и
+    /// подсветка «отстаёт».
+    @State private var mode: EndpointMode = EndpointModeStore.current
+    @State private var providerEnabled: [String: Bool] = Dictionary(
+        uniqueKeysWithValues: VKSPreferences.allProviders.map {
+            ($0, VKSPreferences.providerEnabled($0))
+        }
+    )
 
     var body: some View {
         NavigationStack {
@@ -54,8 +65,8 @@ struct SettingsView: View {
                         connectionCard
                             .padding(.horizontal, 16)
 
-                        // ── Каналы whitelist ──────────────────────
-                        SectionLabel(text: "Каналы whitelist")
+                        // ── Каналы VKS ────────────────────────────
+                        SectionLabel(text: "Каналы VKS")
                             .padding(.top, 22)
                         channelsCard
                             .padding(.horizontal, 16)
@@ -103,7 +114,7 @@ struct SettingsView: View {
                 Button("Открыть настройки") { openSystemSettings() }
                 Button("Отмена", role: .cancel) { }
             } message: {
-                Text("Разрешите уведомления для Tamizdat в настройках iOS, чтобы получать оповещения о смене режима.")
+                Text("Включите уведомления для Tamizdat в настройках iOS.")
             }
         }
     }
@@ -143,29 +154,27 @@ struct SettingsView: View {
         return "tamizdat://"
     }
 
-    /// Режим: [ Авто | Обычный | Whititelist ]. Смена применяется сразу —
-    /// перезапись EndpointModeStore + живой rewire через switchEndpoint.
+    /// Режим: [ Авто | Обычный | Белые списки ]. Смена применяется сразу —
+    /// запись EndpointModeStore (единственный writer) + живой rewire
+    /// через switchEndpoint.
     private var modeRow: some View {
         VStack(spacing: 10) {
             HStack(spacing: 14) {
                 IconCard(systemName: "arrow.triangle.branch",
                          bg: theme.blueDim, fg: theme.blue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Режим")
-                        .font(.geist(.medium, size: 16))
-                        .tracking(-0.16)
-                        .foregroundStyle(theme.text)
-                    Text("Whitelist гоняет трафик через комнаты VKS")
-                        .font(.geist(.regular, size: 12.5))
-                        .foregroundStyle(theme.textDim)
-                }
+                Text("Режим")
+                    .font(.geist(.medium, size: 16))
+                    .tracking(-0.16)
+                    .foregroundStyle(theme.text)
                 Spacer(minLength: 8)
             }
             segmentedControl(
                 options: EndpointMode.allCases,
                 selection: Binding(
-                    get: { EndpointModeStore.current },
+                    get: { mode },
                     set: { newValue in
+                        guard newValue != mode else { return }
+                        mode = newValue
                         EndpointModeStore.current = newValue
                         Task {
                             _ = await VPNProfileStore.shared.switchEndpoint(to: newValue)
@@ -179,7 +188,7 @@ struct SettingsView: View {
         .padding(.vertical, 14)
     }
 
-    // MARK: – Каналы whitelist
+    // MARK: – Каналы VKS
 
     /// Переупорядочиваемый список провайдеров VKS: drag-хэндл слева,
     /// тумблер справа. Первая включённая строка — основной канал, остальные
@@ -188,35 +197,6 @@ struct SettingsView: View {
     private var channelsCard: some View {
         CardContainer(padding: 0) {
             VStack(spacing: 0) {
-                HStack(spacing: 14) {
-                    IconCard(systemName: "network",
-                             bg: theme.blueDim, fg: theme.blue)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Каналы")
-                            .font(.geist(.medium, size: 16))
-                            .tracking(-0.16)
-                            .foregroundStyle(theme.text)
-                        Text("Порядок = приоритет. Первый активный — основной.")
-                            .font(.geist(.regular, size: 12.5))
-                            .foregroundStyle(theme.textDim)
-                    }
-                    Spacer(minLength: 8)
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 6)
-
-                // Тумблер VKS общий (мастер-выключатель лестницы).
-                channelToggleRow(
-                    title: "VKS",
-                    icon: "shield.lefthalf.filled",
-                    isOn: Binding(
-                        get: { VKSPreferences.enabled },
-                        set: { VKSPreferences.enabled = $0 }
-                    ),
-                    isLast: false
-                )
-
                 ForEach(Array(providerOrder.enumerated()), id: \.element) { index, provider in
                     channelProviderRow(provider, orderIndex: index)
                 }
@@ -225,27 +205,21 @@ struct SettingsView: View {
     }
 
     /// Строка одного провайдера: drag-хэндл + имя + тумблер.
-    /// Резерв под будущую строку статуса/действия («Нужен вход — Войти»)
-    /// — место под заголовком строки, пока пустое.
     private func channelProviderRow(_ provider: String, orderIndex: Int) -> some View {
         HStack(spacing: 12) {
             Image(systemName: "line.3.horizontal")
                 .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(theme.textMuted)
                 .opacity(0.6)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(VKSPreferences.providerDisplayName(provider))
-                    .font(.geist(.medium, size: 15))
-                    .tracking(-0.16)
-                    .foregroundStyle(theme.text)
-                // Слот статуса/действия провайдера (заполняется из
-                // статуса расширения; сейчас пуст — см. follow-up).
-                Color.clear.frame(height: 0)
-            }
+            Text(VKSPreferences.providerDisplayName(provider))
+                .font(.geist(.medium, size: 15))
+                .tracking(-0.16)
+                .foregroundStyle(theme.text)
             Spacer(minLength: 8)
             Toggle("", isOn: Binding(
-                get: { VKSPreferences.providerEnabled(provider) },
+                get: { providerEnabled[provider] ?? true },
                 set: { newValue in
+                    providerEnabled[provider] = newValue
                     VKSPreferences.setProviderEnabled(provider, newValue)
                     pushLadderUpdate()
                 }
@@ -263,7 +237,7 @@ struct SettingsView: View {
     @ViewBuilder
     private func providerRowBackground(orderIndex: Int) -> some View {
         // Отключённый провайдер визуально гаснет.
-        let on = VKSPreferences.providerEnabled(providerOrder[orderIndex])
+        let on = providerEnabled[providerOrder[orderIndex]] ?? true
         Rectangle()
             .fill(on ? Color.clear : theme.chip)
             .opacity(on ? 0 : 0.5)
@@ -295,34 +269,6 @@ struct SettingsView: View {
         Task { await VPNProfileStore.shared.refreshVKSLadder() }
     }
 
-    @ViewBuilder
-    private func channelToggleRow(title: String, icon: String, isOn: Binding<Bool>, isLast: Bool) -> some View {
-        HStack(spacing: 14) {
-            IconCard(systemName: icon, bg: theme.chip, fg: theme.textDim)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.geist(.medium, size: 16))
-                    .tracking(-0.16)
-                    .foregroundStyle(theme.text)
-            }
-            Spacer(minLength: 8)
-            Toggle("", isOn: isOn)
-                .labelsHidden()
-                .tint(theme.mint)
-                .onChange(of: isOn.wrappedValue) { _, _ in
-                    pushLadderUpdate()
-                }
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        if !isLast {
-            Rectangle()
-                .fill(theme.rowBorder)
-                .frame(height: 0.5)
-                .padding(.leading, 16)
-        }
-    }
-
     // MARK: – Уведомления
 
     private var notificationsCard: some View {
@@ -330,7 +276,6 @@ struct SettingsView: View {
             DesignRow(
                 icon: IconCard(systemName: "bell.badge", bg: theme.blueDim, fg: theme.blue),
                 title: "Переключение режима",
-                sub: "Локальный push, когда детектор переключает Обычный ↔ Whitelist.",
                 isLast: permissionStatus != .denied || !notificationsEnabled
             ) {
                 Toggle("", isOn: $notificationsEnabled)
@@ -355,7 +300,6 @@ struct SettingsView: View {
                     icon: IconCard(systemName: "exclamationmark.triangle.fill",
                                    bg: theme.amberDim, fg: theme.amber),
                     title: "Уведомления заблокированы",
-                    sub: "Нажмите, чтобы открыть настройки iOS и включить.",
                     isLast: true
                 ) {
                     Image(systemName: "chevron.right")
@@ -378,15 +322,10 @@ struct SettingsView: View {
                 HStack(spacing: 14) {
                     IconCard(systemName: "paintpalette.fill",
                              bg: theme.chip, fg: theme.text)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Тема")
-                            .font(.geist(.medium, size: 16))
-                            .tracking(-0.16)
-                            .foregroundStyle(theme.text)
-                        Text("Светлая — по умолчанию, тёмная экономит OLED.")
-                            .font(.geist(.regular, size: 12.5))
-                            .foregroundStyle(theme.textDim)
-                    }
+                    Text("Тема")
+                        .font(.geist(.medium, size: 16))
+                        .tracking(-0.16)
+                        .foregroundStyle(theme.text)
                     Spacer(minLength: 8)
                 }
                 .padding(.horizontal, 16)
@@ -423,7 +362,6 @@ struct SettingsView: View {
                     icon: IconCard(systemName: "slider.horizontal.3",
                                    bg: theme.chip, fg: theme.textDim),
                     title: "Дополнительно",
-                    sub: "Параметры VKS, детектор, проверка связи, логи",
                     isLast: true
                 ) {
                     Image(systemName: "chevron.right")
@@ -486,8 +424,11 @@ struct SettingsView: View {
                     Text(label(option))
                         .font(.geist(.semibold, size: 13))
                         .tracking(-0.13)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 8)
+                        .padding(.horizontal, 4)
                         .background(active ? theme.chipActive : Color.clear)
                         .foregroundStyle(active ? theme.chipActiveText : theme.text)
                         .clipShape(RoundedRectangle(cornerRadius: 10))
@@ -578,7 +519,7 @@ extension EndpointMode {
     var modeSegmentLabel: String {
         switch self {
         case .primary: return "Обычный"
-        case .backup:  return "Whitelist"
+        case .backup:  return "Белые списки"
         case .auto:    return "Авто"
         }
     }
@@ -586,8 +527,8 @@ extension EndpointMode {
 
 // MARK: – Дополнительно (push-экран)
 
-/// Дополнительно: параметры VKS (ovverride'ы с плейсхолдерами из ссылки),
-/// детектор whitelist, проверка связи, логи, Telegram для логов.
+/// Дополнительно: параметры VKS (override'ы с плейсхолдерами из ссылки),
+/// детектор белых списков, проверка связи, логи, Telegram для логов.
 private struct AdvancedView: View {
     @Environment(\.themeTokens) private var theme
 
@@ -599,7 +540,7 @@ private struct AdvancedView: View {
     @State private var vksWakeZoneDraft: String = ""
     @State private var vksFeedback: String = ""
 
-    // Детектор whitelist.
+    // Детектор белых списков.
     @State private var testHostDraft: String = WhitelistProbePreferences.testHost
     @State private var whitelistHostDraft: String = WhitelistProbePreferences.whitelistHost
     @State private var wlSuccessesDraft: Int = WhitelistProbePreferences.successesNeeded
@@ -618,7 +559,7 @@ private struct AdvancedView: View {
                     vksParamsCard
                         .padding(.horizontal, 16)
 
-                    SectionLabel(text: "Детектор whitelist")
+                    SectionLabel(text: "Детектор белых списков")
                         .padding(.top, 22)
                     detectorCard
                         .padding(.horizontal, 16)
@@ -660,15 +601,10 @@ private struct AdvancedView: View {
                 HStack(spacing: 12) {
                     IconCard(systemName: "network",
                              bg: theme.mintDim, fg: theme.mint)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Параметры VKS")
-                            .font(.geist(.medium, size: 16))
-                            .tracking(-0.16)
-                            .foregroundStyle(theme.text)
-                        Text("Пустое поле = значение из ссылки профиля.")
-                            .font(.geist(.regular, size: 12.5))
-                            .foregroundStyle(theme.textDim)
-                    }
+                    Text("Параметры VKS")
+                        .font(.geist(.medium, size: 16))
+                        .tracking(-0.16)
+                        .foregroundStyle(theme.text)
                     Spacer()
                 }
 
@@ -701,16 +637,12 @@ private struct AdvancedView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-
-                Text("Провайдер и комната выбираются автоматически: клиент шлёт бикон, сервер создаёт комнату и отвечает TXT. Применится при следующем подключении.")
-                    .font(.geistMono(.regular, size: 10))
-                    .foregroundStyle(theme.textDim)
             }
         }
     }
 
     private var linkShortIDPlaceholder: String {
-        if let params = linkParams {
+        if linkParams != nil {
             let peer = SamizdatURLCodec.h2PeerConfig(from: activeProfileBlob)
             if let s = peer?.shortID, !s.isEmpty { return "из ссылки: \(s)" }
         }
@@ -759,7 +691,7 @@ private struct AdvancedView: View {
     private func saveVKSParams() {
         let keyDraft = vksKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !keyDraft.isEmpty && !(keyDraft.count == 64 && keyDraft.allSatisfy({ $0.isHexDigit })) {
-            vksFeedback = "Ключ отклонён: нужно 64 hex-символа."
+            vksFeedback = "Нужно 64 hex-символа."
             return
         }
         VKSPreferences.shortIDHex = vksShortIDDraft
@@ -773,17 +705,15 @@ private struct AdvancedView: View {
         vksWakeZoneDraft = ""
 
         let blob = activeProfileBlob
-        if !VKSPreferences.enabled {
-            vksFeedback = "Сохранено: VKS выключен (лестница доживёт до переподключения)"
-        } else if !VKSPreferences.isConfigured(profileBlob: blob) {
-            vksFeedback = "Сохранено, но лестница не собрана: нужен валидный ключ (64 hex) — из ссылки или поля выше"
+        if !VKSPreferences.isConfigured(profileBlob: blob) {
+            vksFeedback = "Сохранено. Нет ключа VKS — белые списки не заработают."
         } else {
-            vksFeedback = "Сохранено: \(VKSPreferences.providerCount) провайдер(а); применится при следующем подключении"
+            vksFeedback = "Сохранено. Каналов: \(VKSPreferences.providerCount)."
         }
         Task { await VPNProfileStore.shared.refreshVKSLadder() }
     }
 
-    // MARK: Детектор whitelist
+    // MARK: Детектор белых списков
 
     private var detectorCard: some View {
         CardContainer(padding: 16) {
@@ -791,22 +721,17 @@ private struct AdvancedView: View {
                 HStack(spacing: 12) {
                     IconCard(systemName: "shield.lefthalf.filled",
                              bg: theme.amberDim, fg: theme.amber)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Детектор whitelist")
-                            .font(.geist(.medium, size: 16))
-                            .tracking(-0.16)
-                            .foregroundStyle(theme.text)
-                        Text("ICMP-пинг вне туннеля")
-                            .font(.geist(.regular, size: 12.5))
-                            .foregroundStyle(theme.textDim)
-                    }
+                    Text("Детектор белых списков")
+                        .font(.geist(.medium, size: 16))
+                        .tracking(-0.16)
+                        .foregroundStyle(theme.text)
                     Spacer()
                 }
 
                 detectorField("Заблокированный хост", placeholder: "8.8.8.8", text: $testHostDraft)
                 detectorField("Разрешённый хост", placeholder: "77.88.8.8", text: $whitelistHostDraft)
 
-                Text("Подтверждённых циклов до переключения")
+                Text("Циклов до переключения")
                     .font(.geist(.medium, size: 12))
                     .foregroundStyle(theme.textMuted)
                 Stepper(value: $wlSuccessesDraft, in: 1...10) {
@@ -846,10 +771,6 @@ private struct AdvancedView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 .buttonStyle(.plain)
-
-                Text("Только ICMP echo. Отвечают оба — свободный интернет. Молчит заблокированный при живом разрешённом — whitelist. Остальное — ошибка определения.")
-                    .font(.geistMono(.regular, size: 10))
-                    .foregroundStyle(theme.textDim)
             }
         }
     }
@@ -895,23 +816,15 @@ private struct AdvancedView: View {
                 HStack(spacing: 12) {
                     IconCard(systemName: "waveform.path.ecg",
                              bg: theme.mintDim, fg: theme.mint)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Проверка связи")
-                            .font(.geist(.medium, size: 16))
-                            .tracking(-0.16)
-                            .foregroundStyle(theme.text)
-                        // Реальное поведение: HTTP HEAD через туннель,
-                        // 3 c на пробу на переднем плане / 30 c в фоне,
-                        // провал = 2 промаха подряд. Дефолт — ya.ru.
-                        Text("HTTP HEAD через туннель, каждые 3 с на экране / 30 с в фоне")
-                            .font(.geist(.regular, size: 12.5))
-                            .foregroundStyle(theme.textDim)
-                    }
+                    Text("Проверка связи")
+                        .font(.geist(.medium, size: 16))
+                        .tracking(-0.16)
+                        .foregroundStyle(theme.text)
                     Spacer()
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("URL пробы")
+                    Text("Адрес проверки")
                         .font(.geist(.medium, size: 12))
                         .foregroundStyle(theme.textMuted)
                     TextField("https://ya.ru", text: $pingURLDraft)
@@ -978,7 +891,6 @@ private struct AdvancedView: View {
                     icon: IconCard(systemName: "doc.text",
                                    bg: theme.chip, fg: theme.textDim),
                     title: "Логи",
-                    sub: "Живая лента + фильтры",
                     isLast: false
                 ) {
                     Image(systemName: "chevron.right")
@@ -996,7 +908,6 @@ private struct AdvancedView: View {
                     icon: IconCard(systemName: "paperplane.fill",
                                    bg: theme.chip, fg: theme.textDim),
                     title: "Telegram для логов",
-                    sub: "Токен бота + chat id",
                     isLast: true
                 ) {
                     Image(systemName: "chevron.right")

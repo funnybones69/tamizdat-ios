@@ -5,8 +5,9 @@ import UserNotifications
 /// WhitelistDetector runs inside the PacketTunnelProvider while VPN is up.
 ///
 /// Runs serial ICMP echo probes against blocked and allowlisted controls.
-/// The UI receives a final verdict after every cycle: Main, Whitelist, or
-/// Error detecting. TCP/TLS/HTTP are not part of detection.
+/// The UI receives a final verdict after every cycle: «Обычный»,
+/// «Белые списки» or «Ошибка определения». TCP/TLS/HTTP are not part of
+/// detection.
 final class WhitelistDetector {
 
     private static let holdDownSeconds: TimeInterval = 60
@@ -85,7 +86,7 @@ final class WhitelistDetector {
             self.timer?.cancel(); self.timer = nil
             // D59 FIX: do NOT reset WhitelistStatusStore.current here.
             // The last-known detection result should persist so the UI
-            // keeps showing "Whitelist active" / "Free internet" across
+            // keeps showing «Белые списки» / «Свободный интернет» across
             // VPN connect/disconnect cycles. The main-app WhitelistMonitor
             // picks up when the extension stops; the 200s stale-check in
             // ContentView.refreshWhitelistStatus() handles truly stale data.
@@ -283,11 +284,11 @@ final class WhitelistDetector {
         let content = UNMutableNotificationContent()
         switch endpoint {
         case .backup:
-            content.title = "Whitelist mode detected"
-            content.body  = "Switched to whitelist server to keep traffic flowing."
+            content.title = "Белые списки"
+            content.body  = "Переключились на белые списки, чтобы связь не пропала."
         case .primary, .auto:
-            content.title = "Whitelist lifted"
-            content.body  = "Switched back to main server."
+            content.title = "Обычный режим"
+            content.body  = "Вернулись на обычный сервер."
         }
         content.sound = .default
         content.categoryIdentifier = NotificationIDs.categoryIdentifier

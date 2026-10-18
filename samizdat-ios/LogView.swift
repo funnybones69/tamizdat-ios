@@ -40,10 +40,10 @@ struct LogView: View {
         var id: String { rawValue }
         var label: String {
             switch self {
-            case .info:  return "Info"
-            case .warn:  return "Warn"
-            case .error: return "Error"
-            case .crit:  return "Crit"
+            case .info:  return "Инфо"
+            case .warn:  return "Вним."
+            case .error: return "Ошибки"
+            case .crit:  return "Крит"
             }
         }
         func dotColor(theme: ThemeTokens) -> Color {
@@ -95,11 +95,13 @@ struct LogView: View {
             VStack(spacing: 0) {
                 // ── Header ────────────────────────────────────────
                 HStack {
-                    Chip(label: "Close") { dismiss() }
+                    Chip(label: "Закрыть") { dismiss() }
                     Spacer()
-                    Text("Logs")
+                    Text("Логи")
                         .font(.geist(.semibold, size: 16))
                         .foregroundStyle(theme.text)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
                     Spacer()
                     Button {
                         shareText = filteredLines.map { $0.raw }.joined(separator: "\n")
@@ -118,7 +120,7 @@ struct LogView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 6)
 
-                Text("Live logs")
+                Text("Поток")
                     .font(.geist(.bold, size: 32))
                     .tracking(-0.96)
                     .foregroundStyle(theme.text)
@@ -129,7 +131,7 @@ struct LogView: View {
                 // Streaming status line
                 HStack(spacing: 8) {
                     PulsingDot(color: theme.mint)
-                    Text("streaming · \(parsedLines.count) lines · \(autoScroll ? "auto-scroll" : "manual")")
+                    Text("записей: \(parsedLines.count) · \(autoScroll ? "авто" : "вручную")")
                         .font(.geistMono(.regular, size: 12.5))
                         .foregroundStyle(theme.textDim)
                 }
@@ -141,7 +143,7 @@ struct LogView: View {
                 // ── Filter pills ─────────────────────────────────
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        Pill(label: "All",
+                        Pill(label: "Все",
                              count: parsedLines.count,
                              dotColor: nil,
                              isActive: visibleLevels.count == LogLevel.allCases.count,
@@ -254,13 +256,13 @@ struct LogView: View {
     private var actionBar: some View {
         HStack(spacing: 4) {
             ActionTile(icon: autoScroll ? "arrow.down.to.line" : "arrow.up.and.down",
-                       label: "Auto",
+                       label: "Авто",
                        tint: theme.text,
                        isActive: autoScroll) {
                 autoScroll.toggle()
             }
             ActionTile(icon: copiedFlash ? "checkmark" : "doc.on.doc",
-                       label: copiedFlash ? "Copied" : "Copy",
+                       label: copiedFlash ? "Готово" : "Копия",
                        tint: theme.textDim,
                        isActive: false) {
                 UIPasteboard.general.string = filteredLines.map { $0.raw }.joined(separator: "\n")
@@ -280,7 +282,7 @@ struct LogView: View {
                 sendLatestAutoDumpToTelegram()
             }
             ActionTile(icon: "trash",
-                       label: showClearConfirm ? "Confirm" : "Clear",
+                       label: showClearConfirm ? "Точно?" : "Очистить",
                        tint: theme.red,
                        isActive: showClearConfirm) {
                 if showClearConfirm {
@@ -305,19 +307,19 @@ struct LogView: View {
 
     private var critFlashLabel: String {
         switch critFlash {
-        case .idle: return "Crit"
-        case .sending: return "Sending…"
-        case .sent: return "Sent"
-        case .failed: return "Failed"
+        case .idle: return "Сбой"
+        case .sending: return "Отправка…"
+        case .sent: return "Готово"
+        case .failed: return "Ошибка"
         }
     }
 
     private var shareFlashLabel: String {
         switch shareFlash {
-        case .idle: return "Share"
-        case .sending: return "Sending…"
-        case .sent: return "Sent"
-        case .failed: return "Failed"
+        case .idle: return "Отправить"
+        case .sending: return "Отправка…"
+        case .sent: return "Готово"
+        case .failed: return "Ошибка"
         }
     }
 
@@ -346,7 +348,7 @@ struct LogView: View {
                     if case .sent = shareFlash { shareFlash = .idle }
                 }
             case .failure(let err):
-                shareFlash = .failed(err.errorDescription ?? "unknown")
+                shareFlash = .failed(err.errorDescription ?? "Неизвестная ошибка")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
                     if case .failed = shareFlash { shareFlash = .idle }
                 }
@@ -358,13 +360,13 @@ struct LogView: View {
 
     private func sendLatestAutoDumpToTelegram() {
         guard TelegramReporter.isConfigured else {
-            critFlash = .failed("Configure bot token first")
+            critFlash = .failed("Сначала укажите токен бота.")
             return
         }
         guard let containerURL = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: SamizdatBridge.appGroupID
         ) else {
-            critFlash = .failed("App Group container unavailable")
+            critFlash = .failed("Нет доступа к контейнеру.")
             return
         }
         let fm = FileManager.default
@@ -373,7 +375,7 @@ struct LogView: View {
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else {
-            critFlash = .failed("Cannot read app group")
+            critFlash = .failed("Не удалось прочитать файлы.")
             return
         }
         let heapFiles = entries
@@ -387,7 +389,7 @@ struct LogView: View {
             .sorted { $0.1 > $1.1 }
 
         guard let latest = heapFiles.first?.0 else {
-            critFlash = .failed("No auto-dump available")
+            critFlash = .failed("Дамп не найден.")
             return
         }
         let latestName = latest.lastPathComponent
@@ -399,7 +401,7 @@ struct LogView: View {
         DispatchQueue.global(qos: .userInitiated).async {
             guard let data = try? Data(contentsOf: latest) else {
                 DispatchQueue.main.async {
-                    if case .sending = critFlash { critFlash = .failed("Cannot read \(latestName)") }
+                    if case .sending = critFlash { critFlash = .failed("Не удалось прочитать \(latestName).") }
                 }
                 return
             }
@@ -417,7 +419,7 @@ struct LogView: View {
                             if case .sent = critFlash { critFlash = .idle }
                         }
                     case .failure(let err):
-                        critFlash = .failed(err.errorDescription ?? "unknown")
+                        critFlash = .failed(err.errorDescription ?? "Неизвестная ошибка")
                     }
                 }
             }
@@ -443,6 +445,8 @@ private struct ActionTile: View {
                     .foregroundStyle(tint)
                 Text(label)
                     .font(.geist(.semibold, size: 10.5))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
                     .foregroundStyle(isActive ? theme.text : theme.textDim)
             }
             .frame(maxWidth: .infinity)

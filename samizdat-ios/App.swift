@@ -22,6 +22,10 @@ struct SamizdatTestApp: App {
             ContentView()
                 .environment(\.themeTokens, theme.tokens)
                 .preferredColorScheme(theme.colorScheme)
+                // Текст масштабируется вместе с системным размером, но
+                // фиксированные по высоте элементы управления ломаются
+                // на самых крупных ступенях. Ограничиваем потолок.
+                .dynamicTypeSize(...DynamicTypeSize.xxxLarge)
                 .onReceive(NotificationCenter.default.publisher(for: .tamizdatThemeChanged)) { _ in
                     theme = ThemePreferences.current
                 }

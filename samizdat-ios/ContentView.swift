@@ -8,9 +8,9 @@ import SwiftUI
 /// 3 stat tiles (Mode/Uptime/Data), big 60pt Connect/Disconnect
 /// button, mono caption.
 ///
-/// The endpoint mode picker (Auto / Main / Whitelist) lives in Settings;
-/// the home screen shows the current mode as a status line under the
-/// hero ("Whitelist · через Telemost" while the VKS carrier is up).
+/// The endpoint mode picker (Авто / Обычный / Белые списки) lives in
+/// Settings; the home screen shows the current mode as a status line
+/// under the hero («Белые списки · Telemost» while the VKS carrier is up).
 ///
 /// State machine: 6 states `off / connecting / connected /
 /// reconnecting / failed / error`. Phase C iOS-notify observer
@@ -33,6 +33,9 @@ struct ContentView: View {
 
     @State private var whitelistStatus: WhitelistStatus = .unknown
     @State private var whitelistActiveEndpoint: EndpointMode = .primary
+    /// Зеркало EndpointModeStore для отрисовки: сам стор не наблюдаемый,
+    /// поэтому без @State смена режима не перерисовывала экран.
+    @State private var currentMode: EndpointMode = EndpointModeStore.current
     @State private var statusPollTimer: Timer?
 
     @State private var isPreparingVPN = false
@@ -69,7 +72,7 @@ struct ContentView: View {
             case .connecting:   return "Подключение…"
             case .connected:    return "Подключено"
             case .reconnecting: return "Переподключение…"
-            case .failed:       return "Прокси недоступен"
+            case .failed:       return "Нет связи"
             case .error:        return "Ошибка"
             }
         }
@@ -340,7 +343,7 @@ struct ContentView: View {
                         .padding(.horizontal, 24)
                 }
                 if !hasConfig {
-                    Text("Вставьте tamizdat:// ссылку в Настройки → Профиль.")
+                    Text("Добавьте ссылку tamizdat:// в «Профиле».")
                         .font(.geist(.regular, size: 13))
                         .foregroundStyle(theme.textDim)
                         .multilineTextAlignment(.center)
@@ -372,10 +375,10 @@ struct ContentView: View {
     private var modeTileValue: String {
         let snap = lampStore.snapshot
         if !snap.realShape.isEmpty {
-            if snap.effectiveEndpoint == EndpointMode.backup.rawValue {
-                return "Whitelist"
-            }
-            return "Main"
+            let active: EndpointMode = snap.effectiveEndpoint == EndpointMode.backup.rawValue
+                ? .backup
+                : .primary
+            return TamizdatStatusStore.modeLabel(active: active)
         }
         return TamizdatStatusStore.modeLabel(active: effectiveEndpoint)
     }
@@ -384,10 +387,10 @@ struct ContentView: View {
     ///   - manual primary/backup → the picked one
     ///   - auto                 → WhitelistStatusStore.activeEndpoint
     private var effectiveEndpoint: EndpointMode {
-        if EndpointModeStore.current == .auto {
+        if currentMode == .auto {
             return WhitelistStatusStore.trustedAutoEndpoint
         }
-        return EndpointModeStore.current
+        return currentMode
     }
 
     // MARK: – Mode status row (home keeps only the status line)
@@ -419,40 +422,54 @@ struct ContentView: View {
         .onTapGesture { showSettings = true }
     }
 
-    /// "Авто" / "Обычный" / "Whitelist" — the current mode selection.
+    /// «Авто» / «Обычный» / «Белые списки» — текущий режим.
     private var modeLineTitle: String {
-        switch EndpointModeStore.current {
+        switch currentMode {
         case .auto:    return "Авто"
         case .primary: return "Обычный"
-        case .backup:  return "Whitelist"
+        case .backup:  return "Белые списки"
         }
     }
 
     private var whitelistSub: String {
-        // Under the whitelist endpoint name the carrier: the first
-        // enabled provider in the ladder order. Unknown is only the
-        // short in-flight state before the first ping result. Every
-        // failed/ambiguous completed cycle is an explicit error.
+        // Под именем «Белые списки» показываем канал: первый включённый
+        // провайдер в порядке списка. Если ключа VKS нет — прямо говорим
+        // об этом, а не притворяемся, что режим переключился.
         let blob = Self.activeProfileBlob()
+        let configured = VKSPreferences.isConfigured(profileBlob: blob)
         let carrier: String? = {
-            guard VKSPreferences.enabled,
-                  VKSPreferences.isConfigured(profileBlob: blob) else { return nil }
-            guard let first = VKSPreferences.providerOrder
-                .first(where: { VKSPreferences.providerEnabled($0) }) else { return nil }
+            guard configured,
+                  let first = VKSPreferences.providerOrder
+                    .first(where: { VKSPreferences.providerEnabled($0) })
+            else { return nil }
             return VKSPreferences.providerDisplayName(first)
         }()
-        switch whitelistStatus {
-        case .error, .noNetwork, .frozen:
-            return "Ошибка определения"
-        case .detected:
-            if let carrier {
-                return "Whitelist · через \(carrier)"
+        let whitelistLine = carrier.map { "Белые списки · \($0)" } ?? "Белые списки"
+
+        switch currentMode {
+        case .primary:
+            return "Выбрано вручную"
+        case .backup:
+            guard configured else {
+                return "Белые списки · не настроены (нет ключа VKS)"
             }
-            return "Whitelist активен"
-        case .off:
-            return EndpointModeStore.current == .auto ? "Свободный интернет" : "Ручной режим"
-        case .unknown:
-            return EndpointModeStore.current == .auto ? "Мониторинг…" : "Ручной режим"
+            switch whitelistStatus {
+            case .error, .noNetwork, .frozen:
+                return "Ошибка определения"
+            default:
+                return whitelistLine
+            }
+        case .auto:
+            switch whitelistStatus {
+            case .error, .noNetwork, .frozen:
+                return "Ошибка определения"
+            case .detected:
+                return whitelistLine
+            case .off:
+                return "Свободный интернет"
+            case .unknown:
+                return "Мониторинг…"
+            }
         }
     }
 
@@ -460,11 +477,11 @@ struct ContentView: View {
     /// state + auto-mode. Runs ONLY when
     ///   - bridge.state == .disconnected (extension's own detector
     ///     would conflict otherwise)
-    ///   - EndpointModeStore.current == .auto (no point monitoring if
+    ///   - currentMode == .auto (no point monitoring if
     ///     the user picked a manual endpoint)
     private func updateWhitelistMonitorState() {
         let shouldRun = bridge.state == .disconnected
-            && EndpointModeStore.current == .auto
+            && currentMode == .auto
         if shouldRun {
             whitelistMonitor.start()
         } else {
@@ -472,19 +489,13 @@ struct ContentView: View {
         }
     }
 
-    /// Re-derives config-dependent state (hasConfig and the manual-endpoint
-    /// fallback). Called from the settings sheet's callbacks AND its
-    /// onDismiss.
+    /// Re-derives config-dependent state (hasConfig + the mode mirror).
+    /// Called from the settings sheet's callbacks AND its onDismiss.
+    /// Never touches the user's mode: a missing VKS key is a state the
+    /// status line reports, not a reason to silently pick another mode.
     private func refreshConfigDerivedState() {
         hasConfig = ConfigStore.shared.load() != nil
-        let blob = Self.activeProfileBlob()
-        let hasWhitelistTarget = VKSPreferences.enabled
-            && VKSPreferences.isConfigured(profileBlob: blob)
-        if !hasWhitelistTarget {
-            if EndpointModeStore.current == .backup {
-                EndpointModeStore.current = .primary
-            }
-        }
+        currentMode = EndpointModeStore.current
     }
 
     /// Flip the optimistic "reconnecting" flag instantly when Settings
@@ -530,7 +541,7 @@ struct ContentView: View {
                     .tracking(-0.18)
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 60)
+            .frame(minHeight: 60)
             .background(homeState.isConnectButtonRed ? theme.red : theme.mint)
             .foregroundStyle(homeState.isConnectButtonRed ? Color.white : theme.mintInk)
             .clipShape(RoundedRectangle(cornerRadius: 20))
@@ -590,6 +601,7 @@ struct ContentView: View {
     // MARK: – Status polling
 
     private func refreshWhitelistStatus() {
+        currentMode = EndpointModeStore.current
         whitelistStatus = WhitelistStatusStore.current
         whitelistActiveEndpoint = WhitelistStatusStore.activeEndpoint
         // Mirror WhitelistStatusStore.autoDecisionMaxAge (≥200 s, widened
@@ -597,7 +609,7 @@ struct ContentView: View {
         // with a 120 s probe interval the detector legitimately goes
         // silent for >200 s while still healthy, and this poll then
         // mis-rendered "Error detecting" over a live verdict.
-        if EndpointModeStore.current == .auto && bridge.state == .connected
+        if currentMode == .auto && bridge.state == .connected
             && WhitelistStatusStore.ageSeconds > max(200, TimeInterval(WhitelistProbePreferences.probeInterval * 7)) {
             whitelistStatus = .error
         }

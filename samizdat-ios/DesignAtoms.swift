@@ -296,5 +296,8 @@ struct DesignRow<Trailing: View>: View {
                     .padding(.leading, 16)
             }
         }
+        // Без этого тап ловят только глифы: Spacer внутри HStack не
+        // участвует в hit-testing, и NavigationLink-строка «не нажимается».
+        .contentShape(Rectangle())
     }
 }

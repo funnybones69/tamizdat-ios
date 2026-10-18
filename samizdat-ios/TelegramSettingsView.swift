@@ -36,24 +36,15 @@ struct TelegramSettingsView: View {
                             HStack(spacing: 12) {
                                 IconCard(systemName: "paperplane.fill",
                                          bg: theme.blueDim, fg: theme.blue)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Telegram для логов")
-                                        .font(.geist(.medium, size: 16))
-                                        .tracking(-0.16)
-                                        .foregroundStyle(theme.text)
-                                    Text("Токен бота и chat id для отладки")
-                                        .font(.geist(.regular, size: 12.5))
-                                        .foregroundStyle(theme.textDim)
-                                }
+                                Text("Telegram для логов")
+                                    .font(.geist(.medium, size: 16))
+                                    .tracking(-0.16)
+                                    .foregroundStyle(theme.text)
                                 Spacer()
                             }
 
                             telegramField("Токен бота", placeholder: "123456:ABC-DEF…", text: $botToken, secure: true)
                             telegramField("Chat ID", placeholder: "-1001234567890", text: $chatID, secure: false)
-
-                            Text("Используется кнопкой «Telegram» в логах. Хранится только на этом устройстве. Токен выдаёт @BotFather; для личного чата отправьте боту любое сообщение и возьмите chat id из https://api.telegram.org/bot<TOKEN>/getUpdates.")
-                                .font(.geistMono(.regular, size: 10))
-                                .foregroundStyle(theme.textDim)
 
                             if let status = footerStatus {
                                 Text(status)
@@ -145,7 +136,7 @@ struct TelegramSettingsView: View {
 
     private var footerStatus: String? {
         if case .failed(let msg) = testStatus { return msg }
-        if case .ok = testStatus { return "Тестовое сообщение доставлено." }
+        if case .ok = testStatus { return "Отправлено." }
         return nil
     }
 

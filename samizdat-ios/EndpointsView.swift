@@ -107,7 +107,7 @@ struct EndpointsView: View {
     /// Validates and appends a URL to the saved profiles.
     private func addProfile(from s: String) {
         if let err = SamizdatBridge.validate(s) {
-            pasteError = "Profile: \(err)"
+            pasteError = "Ошибка: \(err)"
             return
         }
         ProfileStore.add(s)
@@ -124,7 +124,7 @@ struct EndpointsView: View {
             return
         }
         if let err = SamizdatBridge.validate(s) {
-            pasteError = "Profile: \(err)"
+            pasteError = "Ошибка: \(err)"
             return
         }
         ProfileStore.add(s)
@@ -163,6 +163,7 @@ struct EndpointsView: View {
         if p.isEmpty {
             ConfigStore.shared.delete()
             VKSPreferences.applyDerivedH2PeerConfig(nil)
+            onClose(false)
             return
         }
         let combined = SamizdatURLCodec.compose(primary: p, backup: nil)
@@ -173,6 +174,7 @@ struct EndpointsView: View {
         // identity mirror is already in the App Group, so the extension's
         // rewire picks it up.
         Task { await VPNProfileStore.shared.applyActiveConfigBlob(combined) }
+        onClose(true)
     }
 
     // MARK: – Profiles section
@@ -181,7 +183,7 @@ struct EndpointsView: View {
         CardContainer(padding: 16) {
             VStack(alignment: .leading, spacing: 12) {
                 HStack {
-                    Text("PROFILES")
+                    Text("ПРОФИЛИ")
                         .font(.geist(.bold, size: 10.5))
                         .tracking(0.84)
                         .padding(.horizontal, 8)
@@ -189,14 +191,10 @@ struct EndpointsView: View {
                         .background(Capsule().fill(theme.blueDim))
                         .foregroundStyle(theme.blue)
                     Spacer()
-                    Text("\(profiles.count) saved")
+                    Text("Профилей: \(profiles.count)")
                         .font(.geistMono(.regular, size: 12))
                         .foregroundStyle(theme.textMuted)
                 }
-
-                Text("Сохранённые H2-профили. Activate делает профиль активным — он сразу начинает использоваться (текущий останется в списке).")
-                    .font(.geistMono(.regular, size: 10))
-                    .foregroundStyle(theme.textDim)
 
                 if addingProfile {
                     TextEditor(text: $editBufferNewProfile)
@@ -213,13 +211,13 @@ struct EndpointsView: View {
                         .keyboardType(.URL)
                     HStack(spacing: 6) {
                         ActionChip(systemName: "xmark",
-                                   label: "Cancel",
+                                   label: "Отмена",
                                    tint: theme.textDim) {
                             addingProfile = false
                             editBufferNewProfile = ""
                         }
                         ActionChip(systemName: "checkmark",
-                                   label: "Add",
+                                   label: "Добавить",
                                    tint: theme.mint,
                                    labelColor: theme.mint,
                                    action: saveNewProfile)
@@ -227,16 +225,16 @@ struct EndpointsView: View {
                 } else {
                     HStack(spacing: 6) {
                         ActionChip(systemName: "doc.on.clipboard",
-                                   label: "Paste",
+                                   label: "Вставить",
                                    tint: theme.blue,
                                    action: pasteNewProfile)
                         ActionChip(systemName: "qrcode.viewfinder",
-                                   label: "Scan",
+                                   label: "QR",
                                    tint: theme.blue) {
                             scanning = .newProfile
                         }
                         ActionChip(systemName: "pencil",
-                                   label: "Enter",
+                                   label: "Ввод",
                                    tint: theme.blue) {
                             editBufferNewProfile = ""
                             addingProfile = true
@@ -246,7 +244,7 @@ struct EndpointsView: View {
 
                 if profiles.isEmpty {
                     CodeBlock {
-                        Text("No saved profiles yet — paste, scan or enter a tamizdat:// link to add one.")
+                        Text("Нет профилей.")
                             .foregroundStyle(theme.textMuted)
                     }
                 } else {
@@ -261,25 +259,34 @@ struct EndpointsView: View {
     private func profileRow(_ url: String) -> some View {
         let isActive = url == primaryURL
         return HStack(spacing: 8) {
-            Image(systemName: isActive ? "checkmark.circle.fill" : "doc.text")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(isActive ? theme.mint : theme.blue)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(endpointHost(url) ?? "tamizdat://")
-                    .font(.geist(.medium, size: 13))
-                    .foregroundStyle(theme.text)
-                Text(url)
-                    .font(.geistMono(.regular, size: 10))
-                    .foregroundStyle(theme.textDim)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+            Button {
+                guard !isActive else { return }
+                activateProfile(url)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isActive ? "checkmark.circle.fill" : "doc.text")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(isActive ? theme.mint : theme.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(endpointHost(url) ?? "tamizdat://")
+                            .font(.geist(.medium, size: 13))
+                            .foregroundStyle(theme.text)
+                        Text(url)
+                            .font(.geistMono(.regular, size: 10))
+                            .foregroundStyle(theme.textDim)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
+                .contentShape(Rectangle())
             }
-            Spacer()
+            .buttonStyle(.plain)
+            Spacer(minLength: 8)
             if deletingProfile == url {
                 Button {
                     deletingProfile = nil
                 } label: {
-                    Text("Cancel")
+                    Text("Отмена")
                         .font(.geist(.semibold, size: 12))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
@@ -290,7 +297,7 @@ struct EndpointsView: View {
                 Button {
                     deleteProfile(url)
                 } label: {
-                    Text("Delete")
+                    Text("Удалить")
                         .font(.geist(.bold, size: 12))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
@@ -300,7 +307,7 @@ struct EndpointsView: View {
                 .buttonStyle(.plain)
             } else {
                 if isActive {
-                    Text("Active")
+                    Text("Активен")
                         .font(.geist(.bold, size: 12))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
@@ -310,7 +317,7 @@ struct EndpointsView: View {
                     Button {
                         activateProfile(url)
                     } label: {
-                        Text("Activate")
+                        Text("Выбрать")
                             .font(.geist(.semibold, size: 12))
                             .padding(.horizontal, 10)
                             .padding(.vertical, 5)
@@ -375,7 +382,7 @@ private struct ActionChip: View {
                     .foregroundStyle(labelColor ?? theme.text)
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 38)
+            .frame(minHeight: 38)
             .background(theme.chip)
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }

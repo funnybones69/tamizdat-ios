@@ -255,6 +255,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let activeBlob = Self.pick(mode: mode, primary: split.primary, backup: split.backup)
         let policy = self.upstreamPolicy(mode: mode, backup: split.backup)
         appendExtLog("info: endpoint mode = \(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue) (backup configured: \(split.backup != nil))")
+        if mode == .backup && !VKSPreferences.isConfigured(profileBlob: configBlob) {
+            appendExtLog("warn: whitelist mode selected but VKS is not configured — no 64-hex key in the profile link or Settings; traffic cannot flow until a key is saved")
+        }
 
         // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
         // of the loopback bridge live in this extension, so there is no
@@ -362,7 +365,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // the settings into the App Group; changes apply on the next
         // connect (or on an endpoint-switch rewire / refreshVKSLadder
         // provider message).
-        if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: configBlob) {
+        if policy.usesVKS && VKSPreferences.isConfigured(profileBlob: configBlob) {
             // NATIVE VKS transport: the tamizdat session (utls+masq+shortid,
             // the SAME stack as h2) runs over the room datachannel — no
             // olcRTC epoch/keyHex/smux, single key (shortid). The socksstub
@@ -380,7 +383,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         } else {
             _ = SocksstubStopVKSUpstream()
             _ = SocksstubStopVKSNativeUpstream()
-            let vksReason = policy.usesVKS ? "disabled or not configured" : "endpoint is not whitelist"
+            let vksReason = policy.usesVKS ? "no VKS key configured" : "endpoint is not whitelist"
             log("info: [vks] chain inactive (\(vksReason))")
             ExtLog.info("[vks] chain inactive (\(vksReason))")
         }
@@ -406,7 +409,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         whitelistDetector = nil
         // D61 FIX: do NOT call WhitelistStatusStore.reset() here.
         // reset() wipes activeEndpoint → defaults to .primary → Mode
-        // tile flips from "Whitelist" to "Main" on every disconnect,
+        // tile flips from «Белые списки» to «Обычный» on every disconnect,
         // even though the network is still whitelist-filtered. The
         // main-app WhitelistMonitor resumes on disconnect and writes
         // fresh values; the 200s stale-check handles truly stale data.
@@ -581,6 +584,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             self.appendExtLog("info: rewire gen=\(generation) start mode=\(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue)")
+            if mode == .backup && !VKSPreferences.isConfigured(profileBlob: blob) {
+                self.appendExtLog("warn: rewire gen=\(generation) whitelist mode without a VKS key — the dial path cannot start until a 64-hex key is saved")
+            }
             // A mode/endpoint flip must re-point the dial path too, not only
             // the config blob: leaving a stale mode would keep routing via the
             // previous carrier.
@@ -594,7 +600,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // switch carriers. Main/H2 rewires stop the room transport
             // via the else-branch below.
 
-            if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: blob) {
+            if policy.usesVKS && VKSPreferences.isConfigured(profileBlob: blob) {
                 let vksStatus = SocksstubStartVKSNativeUpstream(
                     VKSPreferences.ladderSpec(profileBlob: blob),
                     VKSPreferences.resolvedKeyHex(profileBlob: blob),
@@ -607,7 +613,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } else {
                 _ = SocksstubStopVKSUpstream()
                 _ = SocksstubStopVKSNativeUpstream()
-                self.appendExtLog("info: [vks] rewire - carrier is not VKS or disabled; room transport stopped")
+                self.appendExtLog("info: [vks] rewire - carrier is not VKS or has no key; room transport stopped")
             }
 
             self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
@@ -635,20 +641,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// The whitelist target is the VKS ladder: enabled + configured
-    /// (at least one enabled provider + a resolvable key — from the
-    /// link or Settings). The params come from the combined blob.
+    /// The whitelist target is the VKS ladder: at least one enabled
+    /// provider and a resolvable 64-hex key (from the link or Settings).
+    /// The params come from the combined blob.
     private func whitelistTargetConfigured(backup: String?) -> Bool {
-        VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: combinedConfigBlob)
+        VKSPreferences.isConfigured(profileBlob: combinedConfigBlob)
     }
 
+    /// `.backup` is an explicit user choice and is never rewritten to
+    /// `.primary` behind their back: the VKS dial path refuses to fall
+    /// back to H2, so a missing key shows up as a dead tunnel plus a
+    /// status line, not as a silent mode change.
     private func effectiveEndpoint(mode: EndpointMode, backup: String?) -> EndpointMode {
         let hasWhitelistTarget = whitelistTargetConfigured(backup: backup)
         switch mode {
         case .primary:
             return .primary
         case .backup:
-            return hasWhitelistTarget ? .backup : .primary
+            return .backup
         case .auto:
             guard hasWhitelistTarget else { return .primary }
             return WhitelistStatusStore.trustedAutoEndpoint
@@ -714,7 +724,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         guard hasWhitelistTarget else {
             // Auto requested but there is no VKS ladder to fail over TO.
-            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist target configured (enable VKS or save a profile with vkskey)")
+            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist target configured (save a profile with a 64-hex vkskey or set the key in Settings → Дополнительно)")
             if whitelistDetector != nil {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
@@ -825,7 +835,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let policy = self.upstreamPolicy(mode: EndpointModeStore.current, backup: backupBlob)
             let blob = Self.pick(mode: EndpointModeStore.current, primary: primaryBlob, backup: backupBlob)
             appendExtLog("info: app requested VKS ladder refresh → effective=\(policy.effectiveEndpoint.rawValue) ladder=\(VKSPreferences.ladderSpec(profileBlob: blob))")
-            if policy.usesVKS && VKSPreferences.enabled && VKSPreferences.isConfigured(profileBlob: blob) {
+            if policy.usesVKS && VKSPreferences.isConfigured(profileBlob: blob) {
                 let vksStatus = SocksstubStartVKSNativeUpstream(
                     VKSPreferences.ladderSpec(profileBlob: blob),
                     VKSPreferences.resolvedKeyHex(profileBlob: blob),
