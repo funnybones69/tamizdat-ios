@@ -40,12 +40,12 @@ func RunLadder(ctx context.Context, specs []ClientConfig, retryDelay time.Durati
 			// provider cookies, room cap) — skip the provider so the ladder
 			// moves to the next one instead of dialing a stale assignment.
 			if cfg.WakeDNSServer != "" && cfg.WakeZone != "" {
-				spec, _, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
+				spec, _, err := SendWakeProvider(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.Provider, cfg.ShortIDHex)
 				if err != nil {
 					log.Printf("vks ladder: provider beacon for %s failed: %v", cfg.Provider, err)
-					// Fall back to the static room beacon.
-					rk := RoomWakeKey(cfg.KeyHex, cfg.Provider, cfg.RoomURL)
-					_ = SendWake(ctx, cfg.WakeDNSServer, cfg.WakeZone, rk)
+					// Fall back to the static room beacon (also shortid-keyed).
+					rk := RoomWakeKey(cfg.ShortIDHex, cfg.Provider, cfg.RoomURL)
+					_ = SendWake(ctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.ShortIDHex, rk)
 				} else if strings.TrimSpace(spec) == "" {
 					log.Printf("vks ladder: provider beacon for %s answered with an empty spec (login required: %v) — skipping the provider",
 						cfg.Provider, LoginRequiredProviders())

@@ -439,7 +439,7 @@ struct ContentView: View {
 
     private var whitelistSub: String {
         // Под именем «Белые списки» показываем канал: первый включённый
-        // провайдер в порядке списка. Если ключа VKS нет — прямо говорим
+        // провайдер в порядке списка. Если shortid нет — прямо говорим
         // об этом, а не притворяемся, что режим переключился.
         let blob = Self.activeProfileBlob()
         let configured = VKSPreferences.isConfigured(profileBlob: blob)
@@ -457,7 +457,7 @@ struct ContentView: View {
             return "Выбрано вручную"
         case .backup:
             guard configured else {
-                return "Белые списки · не настроены (нет ключа VKS)"
+                return "Белые списки · не настроены (нет shortid)"
             }
             switch whitelistStatus {
             case .error, .noNetwork, .frozen:

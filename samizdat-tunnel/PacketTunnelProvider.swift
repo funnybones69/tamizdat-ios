@@ -256,7 +256,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let policy = self.upstreamPolicy(mode: mode, backup: split.backup)
         appendExtLog("info: endpoint mode = \(mode.rawValue) effective=\(policy.effectiveEndpoint.rawValue) upstream=\(policy.upstream.rawValue) (backup configured: \(split.backup != nil))")
         if mode == .backup && !VKSPreferences.isConfigured(profileBlob: configBlob) {
-            appendExtLog("warn: whitelist mode selected but VKS is not configured — no 64-hex key in the profile link or Settings; traffic cannot flow until a key is saved")
+            appendExtLog("warn: whitelist mode selected but VKS is not configured — no shortid in the profile link or Settings; traffic cannot flow until an identity is available")
         }
 
         // Bring the in-process SOCKS5 listener up FIRST. Both endpoints
@@ -372,7 +372,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // forwards via the Client's DialContext.
             let vksStatus = SocksstubStartVKSNativeUpstream(
                 VKSPreferences.ladderSpec(profileBlob: configBlob),
-                VKSPreferences.resolvedKeyHex(profileBlob: configBlob),
                 VKSPreferences.beaconShortIDHex(profileBlob: configBlob),
                 VKSPreferences.wakeDNS(profileBlob: configBlob),
                 VKSPreferences.wakeZone(profileBlob: configBlob),
@@ -603,7 +602,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if policy.usesVKS && VKSPreferences.isConfigured(profileBlob: blob) {
                 let vksStatus = SocksstubStartVKSNativeUpstream(
                     VKSPreferences.ladderSpec(profileBlob: blob),
-                    VKSPreferences.resolvedKeyHex(profileBlob: blob),
                     VKSPreferences.beaconShortIDHex(profileBlob: blob),
                     VKSPreferences.wakeDNS(profileBlob: blob),
                     VKSPreferences.wakeZone(profileBlob: blob),
@@ -613,7 +611,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             } else {
                 _ = SocksstubStopVKSUpstream()
                 _ = SocksstubStopVKSNativeUpstream()
-                self.appendExtLog("info: [vks] rewire - carrier is not VKS or has no key; room transport stopped")
+                self.appendExtLog("info: [vks] rewire - carrier is not VKS or has no shortid; room transport stopped")
             }
 
             self.appendExtLog("info: rewire gen=\(generation) ok — fresh samizdat client warmed")
@@ -724,7 +722,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         guard hasWhitelistTarget else {
             // Auto requested but there is no VKS ladder to fail over TO.
-            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist target configured (save a profile with a 64-hex vkskey or set the key in Settings → Дополнительно)")
+            appendExtLog("warn: detector NOT started — auto mode requested but no whitelist target configured (save a profile with a shortid or set it in Settings → Дополнительно)")
             if whitelistDetector != nil {
                 whitelistDetector?.stop()
                 whitelistDetector = nil
@@ -863,7 +861,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if policy.usesVKS && VKSPreferences.isConfigured(profileBlob: blob) {
                 let vksStatus = SocksstubStartVKSNativeUpstream(
                     VKSPreferences.ladderSpec(profileBlob: blob),
-                    VKSPreferences.resolvedKeyHex(profileBlob: blob),
                     VKSPreferences.beaconShortIDHex(profileBlob: blob),
                     VKSPreferences.wakeDNS(profileBlob: blob),
                     VKSPreferences.wakeZone(profileBlob: blob),

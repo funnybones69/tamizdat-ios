@@ -607,9 +607,8 @@ private struct AdvancedView: View {
     @Environment(\.themeTokens) private var theme
 
     // Параметры VKS — черновики; применяются кнопкой «Сохранить»
-    // (ключ и shortid нужно валидировать).
+    // (shortid нужно валидировать).
     @State private var vksShortIDDraft: String = ""
-    @State private var vksKeyDraft: String = ""
     @State private var vksWakeDNSDraft: String = ""
     @State private var vksWakeZoneDraft: String = ""
     @State private var vksFeedback: String = ""
@@ -684,9 +683,6 @@ private struct AdvancedView: View {
                 vksField("shortid",
                          placeholder: linkShortIDPlaceholder,
                          text: $vksShortIDDraft)
-                vksField("Ключ (64 hex)",
-                         placeholder: linkKeyPlaceholder,
-                         text: $vksKeyDraft)
                 vksField("Wake DNS",
                          placeholder: linkWakeDNSPlaceholder,
                          text: $vksWakeDNSDraft)
@@ -722,14 +718,6 @@ private struct AdvancedView: View {
         return "hex из ссылки"
     }
 
-    private var linkKeyPlaceholder: String {
-        if let key = linkParams?.vksKeyHex, !key.isEmpty {
-            let head = key.prefix(8)
-            return "из ссылки: \(head)…"
-        }
-        return "64 hex из ссылки"
-    }
-
     private var linkWakeDNSPlaceholder: String {
         if let dns = linkParams?.wakeDNS, !dns.isEmpty {
             return "из ссылки: \(dns)"
@@ -762,24 +750,22 @@ private struct AdvancedView: View {
     }
 
     private func saveVKSParams() {
-        let keyDraft = vksKeyDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if !keyDraft.isEmpty && !(keyDraft.count == 64 && keyDraft.allSatisfy({ $0.isHexDigit })) {
-            vksFeedback = "Нужно 64 hex-символа."
+        let shortIDDraft = vksShortIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !shortIDDraft.isEmpty && !(shortIDDraft.count == 16 && shortIDDraft.allSatisfy({ $0.isHexDigit })) {
+            vksFeedback = "Нужно 16 hex-символов shortid."
             return
         }
         VKSPreferences.shortIDHex = vksShortIDDraft
-        VKSPreferences.keyHex = keyDraft
         VKSPreferences.wakeDNSOverride = vksWakeDNSDraft
         VKSPreferences.wakeZoneOverride = vksWakeZoneDraft
         // Re-sync drafts with the normalized persisted values.
         vksShortIDDraft = ""
-        vksKeyDraft = ""
         vksWakeDNSDraft = ""
         vksWakeZoneDraft = ""
 
         let blob = activeProfileBlob
         if !VKSPreferences.isConfigured(profileBlob: blob) {
-            vksFeedback = "Сохранено. Нет ключа VKS — белые списки не заработают."
+            vksFeedback = "Сохранено. Нет shortid в профиле — белые списки не заработают."
         } else {
             vksFeedback = "Сохранено. Каналов: \(VKSPreferences.providerCount)."
         }

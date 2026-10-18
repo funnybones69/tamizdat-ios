@@ -43,9 +43,10 @@ type Config struct {
 	// Transport selects the in-room carrier: vp8channel (default, fastest,
 	// proven) or datachannel.
 	Transport string
-	// KeyHex is the shared olcRTC wire key (64 hex chars), preventing random
-	// room participants from consuming the server. Tamizdat shortID auth
-	// still applies on top.
+	// KeyHex is the legacy olcRTC wire key (64 hex chars) used by the
+	// olcRTC transport. It is NOT part of the wake/beacon path any more:
+	// beacon selectors and the TXT answer are keyed by the client shortid.
+	// The native transport ignores it entirely.
 	KeyHex string
 	// Name is the display name shown in the room. Empty = generated.
 	Name string

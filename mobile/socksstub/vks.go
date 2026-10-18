@@ -9,9 +9,12 @@
 //
 // Public gomobile API:
 //
-//	StartVKSUpstream(specs, keyHex, shortIDHex string, listenPort int) string
+//	StartVKSUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenPort int) string
+//	StartVKSNativeUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenPort int) string
 //	StopVKSUpstream() string
+//	StopVKSNativeUpstream() string
 //	VKSUpstreamRunning() bool
+//	VKSNativeRunning() bool
 //	VKSUpstreamStatsJSON() string
 //	VKSLoginRequired() string
 //	UploadVKSCredentials(provider, cookieHeader string) string
@@ -95,16 +98,17 @@ func (logSinkWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// StartVKSUpstream starts the VKS ladder and its local SOCKS5 listener.
-// specs is a comma-separated provider:room ladder (telemost:…,
-// jazz:…,mts:…). keyHex is the shared olcRTC wire key; shortIDHex is the
-// tamizdat master_shortid. listenPort is the loopback SOCKS5 port.
-// wakeDNS (e.g. "77.88.8.8:53") and wakeZone (e.g. "wake.example.com"),
-// when both non-empty, make the client emit the on-demand wake beacon
-// (a DNS query for <roomKey>.<nonce>.<zone>) before each connect, so an
-// on-demand server joins the room just in time. Returns a JSON status
-// line. Non-blocking: the ladder runs in background.
-func StartVKSUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
+// StartVKSUpstream starts the legacy olcRTC VKS ladder and its local
+// SOCKS5 listener. specs is a comma-separated provider:room ladder
+// (telemost:…, jazz:…,mts:…). shortIDHex is the tamizdat master_shortid
+// and the only credential: the olcRTC wire key is derived from it, so no
+// separate shared secret is configured. listenPort is the loopback SOCKS5
+// port. wakeDNS (e.g. "77.88.8.8:53") and wakeZone (e.g.
+// "wake.example.com"), when both non-empty, make the client emit the
+// on-demand wake beacon (a DNS query keyed by the shortid) before each
+// connect, so an on-demand server joins the room just in time. Returns a
+// JSON status line. Non-blocking: the ladder runs in background.
+func StartVKSUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
 	// Bridge ladder diagnostics (std log) into the App Group log file so
 	// they are visible on device.
 	routeStdLogsToSink()
@@ -117,8 +121,8 @@ func StartVKSUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, liste
 		}
 		return vksStatusJSON("already-running", vksUp.addr, "")
 	}
-	if specs == "" || keyHex == "" || shortIDHex == "" {
-		return vksStatusJSON("error", "", "specs, keyHex and shortIDHex are required")
+	if specs == "" || shortIDHex == "" {
+		return vksStatusJSON("error", "", "specs and shortIDHex are required")
 	}
 	if listenPort < 1024 || listenPort > 65535 {
 		return vksStatusJSON("error", "", "listenPort must be 1024..65535")
@@ -131,9 +135,10 @@ func StartVKSUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, liste
 		return vksStatusJSON("error", "", err.Error())
 	}
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(listenPort))
+	wireKey := vks.DeriveWireKey(shortIDHex)
 	ladder := make([]vks.ClientConfig, len(cfgs))
 	for i := range cfgs {
-		cfgs[i].KeyHex = keyHex
+		cfgs[i].KeyHex = wireKey
 		ladder[i] = vks.ClientConfig{
 			Config:        cfgs[i],
 			ShortIDHex:    shortIDHex,
@@ -247,7 +252,7 @@ func vksStatusJSON(status, addr, errMsg string) string {
 // olcRTC epoch/keyHex/smux. dialUpstream forwards via the Client's
 // DialContext when this is set. The server config (pubkey, SNI) comes from
 // the active proxy profile's blob; the room config from the VKS settings.
-func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
+func StartVKSNativeUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenPort int) string {
 	rt.mu.Lock()
 	blob := rt.samizdatBlob
 	rt.mu.Unlock()
@@ -271,9 +276,12 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	// olc ladder stays as the fallback for a primary that is merely slow.
 	nativeLadder := make([]vks.ClientConfig, 0, len(cfgs))
 	for i := range cfgs {
-		c := vks.ClientConfig{Config: cfgs[i], ShortIDHex: shortIDHex, WakeDNSServer: wakeDNS, WakeZone: wakeZone}
-		c.KeyHex = keyHex
-		nativeLadder = append(nativeLadder, c)
+		nativeLadder = append(nativeLadder, vks.ClientConfig{
+			Config:        cfgs[i],
+			ShortIDHex:    shortIDHex,
+			WakeDNSServer: wakeDNS,
+			WakeZone:      wakeZone,
+		})
 	}
 	sidBytes, err := hex.DecodeString(shortIDHex)
 	if err != nil || len(sidBytes) != 8 {
@@ -297,10 +305,10 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	}
 	rt.mu.Lock()
 	old := rt.vksNativeClient
-	oldKey := rt.vksNativeKeyHex
+	oldShortID := rt.vksNativeShortID
 	oldSpecs := rt.vksNativeSpecs
 	rt.vksNativeClient = client
-	rt.vksNativeKeyHex = keyHex
+	rt.vksNativeShortID = shortIDHex
 	rt.vksNativeSpecs = specs
 	// A fresh client invalidates the previous failure latch: keeping it would
 	// make dialWhitelistVKS refuse the new carrier for up to vksNativeFailLatch.
@@ -311,12 +319,12 @@ func StartVKSNativeUpstream(specs, keyHex, shortIDHex, wakeDNS, wakeZone string,
 	if old != nil {
 		_ = old.Close()
 	}
-	// Sessions from a previous arming with a different key or spec are
-	// unreachable for the new client (dcKey is provider|room|key), so they
+	// Sessions from a previous arming with a different identity or spec are
+	// unreachable for the new client (dcKey is provider|room|shortid), so they
 	// would linger as ghost participants. Release them. Re-arming with the
-	// SAME key and spec keeps the warm session, so a redundant re-arm does not
-	// force a fresh room join.
-	if oldKey != "" && (oldKey != keyHex || oldSpecs != specs) {
+	// SAME shortid and spec keeps the warm session, so a redundant re-arm does
+	// not force a fresh room join.
+	if oldShortID != "" && (oldShortID != shortIDHex || oldSpecs != specs) {
 		vks.ShutdownNativeSessions()
 	}
 	rt.appendLog(fmt.Sprintf("info: [vks-native] upstream up shortid=%s provider=%s (beacon must carry a VALID user shortid)", shortIDHex, cfgs[0].Provider))

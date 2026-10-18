@@ -40,10 +40,11 @@ type RoomCreator func(ctx context.Context, provider string) (Config, error)
 // rotated by the refresher or replaced by the upload endpoint while the
 // server runs — capturing strings at construction would pin dead
 // cookies). Telemost rooms land in pool (created rooms persist for
-// reuse across restarts).
-func NewRoomCreator(keyHex, ownerToken string, creds *CredStore, pool *TelemostPool) RoomCreator {
+// reuse across restarts). The created Config carries no wire key: rooms
+// woken by a beacon are served by the NATIVE shortid-only transport.
+func NewRoomCreator(ownerToken string, creds *CredStore, pool *TelemostPool) RoomCreator {
 	return func(ctx context.Context, provider string) (Config, error) {
-		cfg := Config{Provider: provider, KeyHex: keyHex}
+		cfg := Config{Provider: provider}
 		switch provider {
 		case "wbstream":
 			if ownerToken == "" {

@@ -31,8 +31,7 @@ import (
 func main() {
 	var (
 		blob     = flag.String("blob", "", "tamizdat:// or samizdat:// profile URI that carries host/port/sni/pbk/shortid")
-		keyHex   = flag.String("vks-key", "", "shared VKS key (64 hex) that authenticates the beacon")
-		shortID  = flag.String("shortid", "", "user master shortid (16 hex) carried by the beacon")
+		shortID  = flag.String("shortid", "", "user master shortid (16 hex); the only beacon credential")
 		specs    = flag.String("vks", "jazz:stub", "ladder spec; the native transport dials the FIRST entry")
 		wakeDNS  = flag.String("wake-dns", "77.88.8.8:53", "resolver for the on-demand wake beacon")
 		wakeZone = flag.String("wake-zone", "", "beacon zone served by the server's authoritative NS (your own zone)")
@@ -47,8 +46,8 @@ func main() {
 		olcPort  = flag.Int("olc-listen", 0, "loopback SOCKS5 port for the olc ladder; default listen+1 (must not be 18443 or 9000)")
 	)
 	flag.Parse()
-	if *blob == "" || *keyHex == "" || *shortID == "" {
-		fmt.Fprintln(os.Stderr, "need -blob, -vks-key and -shortid")
+	if *blob == "" || *shortID == "" {
+		fmt.Fprintln(os.Stderr, "need -blob and -shortid")
 		os.Exit(2)
 	}
 
@@ -77,11 +76,11 @@ func main() {
 		if lp == 0 {
 			lp = *port + 1
 		}
-		status = socksstub.StartVKSUpstream(*specs, *keyHex, *shortID, *wakeDNS, *wakeZone, lp)
+		status = socksstub.StartVKSUpstream(*specs, *shortID, *wakeDNS, *wakeZone, lp)
 		defer socksstub.StopVKSUpstream()
 		fmt.Printf("olc ladder listening on 127.0.0.1:%d\n", lp)
 	default:
-		status = socksstub.StartVKSNativeUpstream(*specs, *keyHex, *shortID, *wakeDNS, *wakeZone, *port)
+		status = socksstub.StartVKSNativeUpstream(*specs, *shortID, *wakeDNS, *wakeZone, *port)
 	}
 	fmt.Printf("mode=%s upstream=%s listener=%s upstream_start=%s\n", socksstub.CurrentUpstreamMode(), *upstream, addr, status)
 

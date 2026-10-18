@@ -19,7 +19,9 @@
 
 ## Инфраструктура
 
-- Ключ VKS (прод): `258adb9d…c930` (`/tmp/vkskey.txt` на ru2). Прод-юнит: `-vks-listen mts:…25356498874,telemost:…13704628620010 -vks-watch … -vks-beacon :53 -vks-beacon-zone w.ai-archive.ru`.
+- ~~Ключ VKS (прод): `258adb9d…c930` (`/tmp/vkskey.txt` на ru2).~~ С
+  2026-10-18 beacon/wake-путь работает от shortid; отдельный ключ не нужен.
+  Прод-юнит: `-vks-listen mts:…25356498874,telemost:…13704628620010 -vks-watch … -vks-beacon :53 -vks-beacon-zone w.ai-archive.ru`.
 - Owner-куки MTS живые: `/opt/mts-autopromote/mts-owner.json` на ru2.
 - Мой тест-хлам на ru2 убит, порты 18445/6072/11085 свободны. `srvmon` (tail журнала прода) работает.
 - `mts-autopromote.service` продвигает гостей в LECTURER в прод-комнате MTS.

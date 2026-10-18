@@ -411,7 +411,7 @@ var (
 )
 
 func dcKey(cfg ClientConfig) string {
-	return cfg.Provider + "\x00" + cfg.RoomURL + "\x00" + cfg.KeyHex
+	return cfg.Provider + "\x00" + cfg.RoomURL + "\x00" + cfg.ShortIDHex
 }
 
 // resolvedName honours the documented contract (vks.go: "Name is the display
@@ -486,8 +486,8 @@ func ShutdownNativeSessions() {
 
 var (
 	specCacheMu sync.Mutex
-	specCache   = map[string]string{}      // provider|keyHex -> beacon-assigned spec
-	specWakeMu  = map[string]*sync.Mutex{} // provider|keyHex -> beacon lock
+	specCache   = map[string]string{}      // provider|shortid -> beacon-assigned spec
+	specWakeMu  = map[string]*sync.Mutex{} // provider|shortid -> beacon lock
 )
 
 // wakeSpecLock returns the per-key beacon lock, creating it on first use.
@@ -503,9 +503,9 @@ func wakeSpecLock(key string) *sync.Mutex {
 }
 
 // wakeSpecKey identifies an on-demand assignment: the beacon is per provider
-// and the assignment is authenticated by the shared key.
+// and the assignment is authenticated by the user shortid.
 func wakeSpecKey(cfg ClientConfig) string {
-	return cfg.Provider + "\x00" + cfg.KeyHex
+	return cfg.Provider + "\x00" + cfg.ShortIDHex
 }
 
 // dropWakeSpec forgets the cached assignment so the next dial beacons once
@@ -549,7 +549,7 @@ func resolveWakeSpec(ctx context.Context, cfg *ClientConfig, key string) bool {
 		// own ctx (it just fails this dial, the assignment stays cached).
 		bctx, bcancel := context.WithTimeout(context.WithoutCancel(ctx), 12*time.Second)
 		defer bcancel()
-		s, _, err := SendWakeProvider(bctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.KeyHex, cfg.Provider, cfg.ShortIDHex)
+		s, _, err := SendWakeProvider(bctx, cfg.WakeDNSServer, cfg.WakeZone, cfg.Provider, cfg.ShortIDHex)
 		if err != nil {
 			// Swallowing this made a dead wake channel look like a
 			// configured static room that never answers: every dial fell

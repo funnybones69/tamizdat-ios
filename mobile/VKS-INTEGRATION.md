@@ -21,19 +21,26 @@
 ## Публичное gomobile-API
 
 ```
-StartVKSUpstream(specs, keyHex, shortIDHex string, listenPort int) string
+StartVKSUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenPort int) string
+StartVKSNativeUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenPort int) string
 StopVKSUpstream() string
+StopVKSNativeUpstream() string
 VKSUpstreamRunning() bool
+VKSNativeRunning() bool
 VKSUpstreamStatsJSON() string
 ```
 
 - `specs` — лестница через запятую: `"telemost:https://telemost.yandex.ru/j/123,wbstream:stab"`.
-- `keyHex` — общий ключ olcRTC-wire (как `-vks-key` в CLI).
-- `shortIDHex` — `master_shortid` пользователя tamizdat.
+- `shortIDHex` — `master_shortid` пользователя tamizdat. Это **единственный**
+  креденшел: селектор провайдерского бикона и ключ TXT-ответа выводятся из
+  него, отдельного общего ключа VKS больше нет.
+- `wakeDNS` / `wakeZone` — резолвер и зона для on-demand бикона.
 - `listenPort` — loopback-порт SOCKS5 для VKS-листенера.
 
 `StartVKSUpstream` неблокирующий, возвращает JSON-статус; лестница живёт в
-фоне и сама переключает профили при отказе.
+фоне и сама переключает профили при отказе. `StartVKSNativeUpstream` —
+основной путь приложения: tamizdat-сессия (utls+masq+shortid) поверх
+датаканала комнаты, без olcRTC.
 
 ## Путь данных
 

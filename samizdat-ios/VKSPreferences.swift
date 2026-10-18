@@ -11,10 +11,14 @@ import Foundation
 /// Values resolve in this order:
 ///   1. an explicit operator override saved from Settings → Дополнительно
 ///      (empty field = "use the link");
-///   2. the `vkskey` / `wakedns` / `wakezone` query params of the active
+///   2. the `wakedns` / `wakezone` query params of the active
 ///      tamizdat:// profile link (see `SamizdatURLCodec.vksParams`);
 ///   3. `defaultWakeDNS` when neither the override nor the link carries a
 ///      wake DNS server.
+///
+/// The room credential is the profile's shortid — the same identity the H2
+/// tunnel authenticates with. There is no separate VKS wire key: beacon
+/// selectors and the TXT answer are derived from the shortid.
 ///
 /// The room itself is NOT chosen here: the client stores only the
 /// providers — the server creates/assigns the room via the beacon TXT
@@ -28,7 +32,6 @@ import Foundation
 enum VKSPreferences {
     private static let appGroupID = "group.com.anarki.samizdat-test"
 
-    private static let keyHexKey = "tamizdat.vks.keyHex"
     private static let shortIDKey = "tamizdat.vks.shortIDHex"
     private static let wakeDNSKey = "tamizdat.vks.wakeDNS"
     private static let wakeZoneKey = "tamizdat.vks.wakeZone"
@@ -62,12 +65,11 @@ enum VKSPreferences {
     }
 
     // -- TEST-BUILD DEFAULTS ---------------------------------------------
-    // Nothing deployment-specific is baked into this repository: the VKS
-    // wire key and the master shortid are per-deployment secrets, and the
-    // wake zone identifies the operator's own infrastructure. Fill them
-    // in from Settings → Дополнительно → Параметры VKS (they live in the
-    // App Group defaults) or pass them via the profile link.
-    static let testDefaultKeyHex = ""
+    // Nothing deployment-specific is baked into this repository: the
+    // master shortid is the per-user identity, and the wake zone
+    // identifies the operator's own infrastructure. Fill them in from
+    // Settings → Дополнительно → Параметры VKS (they live in the App
+    // Group defaults) or pass them via the profile link.
     static let testDefaultShortIDHex = ""
 
     /// Ladder order — provider ids from `allProviders`. Unknown ids read
@@ -105,11 +107,6 @@ enum VKSPreferences {
     static func setProviderEnabled(_ provider: String, _ value: Bool) {
         let key = "tamizdat.vks.\(provider)Enabled"
         defaults?.set(value, forKey: key)
-    }
-
-    static var keyHex: String {
-        get { defaults?.string(forKey: keyHexKey) ?? testDefaultKeyHex }
-        set { defaults?.set(trim(newValue).lowercased(), forKey: keyHexKey) }
     }
 
     /// The stored override, ignoring empty AND the shipped test placeholder:
@@ -207,18 +204,6 @@ enum VKSPreferences {
         return ""
     }
 
-    /// The key the native VKS transport arms its room sessions with.
-    /// Resolution: explicit override → link's `vkskey` param (64 hex).
-    static func resolvedKeyHex(profileBlob: String?) -> String {
-        let explicit = keyHex
-        if !explicit.isEmpty { return explicit }
-        if let blob = profileBlob, let params = SamizdatURLCodec.vksParams(from: blob),
-           !params.vksKeyHex.isEmpty {
-            return params.vksKeyHex
-        }
-        return testDefaultKeyHex
-    }
-
     /// Assembled `provider:room,` ladder spec over the user's order. A
     /// disabled provider is left out. Beacon-assignment: the client stores
     /// only the provider — the server creates/assigns the room via the TXT
@@ -237,16 +222,18 @@ enum VKSPreferences {
     }
 
     /// True when the VKS ladder can be raised: at least one enabled
-    /// provider and a valid wire key. A profile link carrying `vkskey`
-    /// is enough — the key no longer has to come from Settings.
+    /// provider and a usable user identity. The shortid is the only
+    /// credential; it comes from the profile link (or an explicit
+    /// override), never from a separate shared key.
     static func isConfigured(profileBlob: String?) -> Bool {
-        !ladderSpec(profileBlob: profileBlob).isEmpty && keyLooksValid(profileBlob: profileBlob)
+        !ladderSpec(profileBlob: profileBlob).isEmpty && shortIDLooksValid(profileBlob: profileBlob)
     }
 
-    /// 64 hex characters — the olcRTC wire-key shape.
-    static func keyLooksValid(profileBlob: String?) -> Bool {
-        let key = resolvedKeyHex(profileBlob: profileBlob)
-        return key.count == 64 && key.allSatisfy { $0.isHexDigit }
+    /// 16 hex characters — the master-shortid shape the native transport
+    /// and the beacon derivation require.
+    static func shortIDLooksValid(profileBlob: String?) -> Bool {
+        let sid = beaconShortIDHex(profileBlob: profileBlob)
+        return sid.count == 16 && sid.allSatisfy { $0.isHexDigit }
     }
 
     /// Mirror of the active profile's shortid, written by the main app so

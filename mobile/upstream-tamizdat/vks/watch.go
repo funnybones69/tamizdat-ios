@@ -27,7 +27,6 @@ import (
 type WatchServer struct {
 	hooks   ServerHooks
 	idle    time.Duration
-	keyHex  string
 	creator RoomCreator
 	// telemostPool, when set, feeds AssignRoom's telemost branch with
 	// previously created (persistent, reusable) rooms and records newly
@@ -71,9 +70,6 @@ func NewWatchServer(rooms []Config, hooks ServerHooks, idle time.Duration) *Watc
 	}
 	for _, cfg := range rooms {
 		cfg.IdleTimeout = idle
-		if w.keyHex == "" {
-			w.keyHex = cfg.KeyHex
-		}
 		w.rooms[w.roomKey(cfg)] = cfg
 	}
 	return w
@@ -131,48 +127,93 @@ func (w *WatchServer) SetCredStore(creds *CredStore) {
 	w.mu.Unlock()
 }
 
+// providerNames is the set of providers a beacon may select. Kept in sync
+// with ParseSpec's accepted prefixes.
+var providerNames = []string{"telemost", "wbstream", "jazz", "mts"}
+
 // matchProviderKey maps a beacon selector to a provider name when the
-// selector equals that provider's ProviderWakeKey (HMAC of the shared key).
-func (w *WatchServer) matchProviderKey(selector string) string {
-	w.mu.Lock()
-	keyHex := w.keyHex
-	w.mu.Unlock()
-	if keyHex == "" {
+// selector equals that provider's ProviderWakeKey for the beaconing user.
+// The shortid is the only credential: the selector proves the caller knows
+// the shortid it already carries in the query name, so the server needs no
+// shared secret and no user enumeration.
+func matchProviderKey(selector, shortIDHex string) string {
+	if selector == "" || shortIDHex == "" {
 		return ""
 	}
-	for _, p := range []string{"telemost", "wbstream", "jazz", "mts"} {
-		if ProviderWakeKey(keyHex, p) == selector {
+	for _, p := range providerNames {
+		if ProviderWakeKey(shortIDHex, p) == selector {
 			return p
 		}
 	}
 	return ""
 }
 
-// roomKey derives the stable, DNS-safe selector for a room from the shared
-// wire key. A client proves it knows the key by beaconing this value; a
-// random DNS querier cannot guess a valid roomKey, so noise and strangers
-// cannot wake the server.
+// roomKey is the server's INTERNAL map key for a room. It is deliberately
+// not a credential: the wake selector a client sends is derived per user
+// (RoomWakeKey) and matched against the armed rooms by the beacon handler.
 func (w *WatchServer) roomKey(cfg Config) string {
-	return RoomWakeKey(cfg.KeyHex, cfg.Provider, cfg.RoomURL)
+	return cfg.Provider + "\x00" + cfg.RoomURL
 }
 
-// RoomWakeKey computes the beacon token that wakes the given room. Shared by
-// the server (to match) and the client (to emit).
-func RoomWakeKey(keyHex, provider, roomURL string) string {
-	key, _ := hex.DecodeString(strings.TrimSpace(keyHex))
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte("vks-wake\x00" + provider + "\x00" + roomURL))
+// matchRoomKey maps a per-user wake selector to the internal key of an
+// armed room. The server iterates its (small) armed set because the
+// selector is now derived from the beaconing user's shortid, so it is not
+// known at startup.
+func (w *WatchServer) matchRoomKey(selector, shortIDHex string) (string, bool) {
+	if selector == "" || shortIDHex == "" {
+		return "", false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k, cfg := range w.rooms {
+		if RoomWakeKey(shortIDHex, cfg.Provider, cfg.RoomURL) == selector {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// shortIDKey turns the user's shortid (16 hex chars) into HMAC key
+// material. A malformed value is used verbatim so the derivation is still
+// deterministic; the server's validator rejects it before any room is
+// assigned.
+func shortIDKey(shortIDHex string) []byte {
+	sid := strings.ToLower(strings.TrimSpace(shortIDHex))
+	if b, err := hex.DecodeString(sid); err == nil && len(b) > 0 {
+		return b
+	}
+	return []byte(sid)
+}
+
+// DeriveWireKey returns the legacy olcRTC wire key derived from a user
+// shortid. The native transport does not use it; it lets the legacy
+// olcRTC ladder run without a separately configured shared secret. A
+// deployment serving that ladder must set -vks-key to this value for the
+// single user it serves (the olcRTC handshake has one key for the room).
+func DeriveWireKey(shortIDHex string) string {
+	mac := hmac.New(sha256.New, shortIDKey(shortIDHex))
+	mac.Write([]byte("vks-wire\x00"))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// RoomWakeKey computes the beacon token that wakes the given armed room on
+// behalf of one user. Shared by the server (to match) and the client (to
+// emit). The shortid replaces the old shared wire key: different users get
+// different selectors for the same room, so a leaked selector identifies
+// one user rather than the whole deployment.
+func RoomWakeKey(shortIDHex, provider, roomURL string) string {
+	mac := hmac.New(sha256.New, shortIDKey(shortIDHex))
+	mac.Write([]byte("vks-wake\x00" + strings.ToLower(strings.TrimSpace(provider)) + "\x00" + roomURL))
 	return hex.EncodeToString(mac.Sum(nil))[:24]
 }
 
 // ProviderWakeKey computes the beacon token that asks the server to CREATE
-// (or assign) a room on the given provider. The beacon carries this value;
-// the server matches it against its enabled providers and responds with the
-// room spec in the DNS TXT answer.
-func ProviderWakeKey(keyHex, provider string) string {
-	key, _ := hex.DecodeString(strings.TrimSpace(keyHex))
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte("vks-provider\x00" + provider))
+// (or assign) a room on the given provider for one user. The beacon carries
+// this value; the server matches it against its enabled providers and
+// responds with the room spec in the DNS TXT answer.
+func ProviderWakeKey(shortIDHex, provider string) string {
+	mac := hmac.New(sha256.New, shortIDKey(shortIDHex))
+	mac.Write([]byte("vks-provider\x00" + strings.ToLower(strings.TrimSpace(provider))))
 	return hex.EncodeToString(mac.Sum(nil))[:24]
 }
 
@@ -197,7 +238,7 @@ func (w *WatchServer) Serve(cfg Config) string {
 // for concurrent calls; a duplicate wake for a live room is a no-op (the
 // existing join's idle timer keeps running).
 func (w *WatchServer) Wake(roomKey string) {
-	roomKey = strings.ToLower(strings.TrimSpace(roomKey))
+	roomKey = strings.TrimSpace(roomKey)
 	w.mu.Lock()
 	cfg, known := w.rooms[roomKey]
 	_, live := w.active[roomKey]
@@ -266,13 +307,8 @@ func (w *WatchServer) Wake(roomKey string) {
 func (w *WatchServer) AssignRoom(ctx context.Context, provider string) (Config, error) {
 	w.mu.Lock()
 	creator := w.creator
-	keyHex := w.keyHex
 	maxRooms := w.maxRooms
 	w.mu.Unlock()
-
-	if keyHex == "" {
-		return Config{}, fmt.Errorf("vks watch: no key configured")
-	}
 
 	// Telemost: reuse an idle pool room before creating anything.
 	if provider == "telemost" {
@@ -372,9 +408,9 @@ func (w *WatchServer) assignTelemostFromPool(maxRooms int) (Config, bool) {
 	w.mu.Lock()
 	if w.telemostPool != nil {
 		for _, roomURL := range w.telemostPool.Rooms() {
-			key := w.roomKey(Config{KeyHex: w.keyHex, Provider: "telemost", RoomURL: roomURL})
+			key := w.roomKey(Config{Provider: "telemost", RoomURL: roomURL})
 			if _, known := w.rooms[key]; !known {
-				cfg := Config{Provider: "telemost", RoomURL: roomURL, KeyHex: w.keyHex, IdleTimeout: w.idle}
+				cfg := Config{Provider: "telemost", RoomURL: roomURL, IdleTimeout: w.idle}
 				w.rooms[key] = cfg
 				w.dynamic[key] = false // pool rooms persist — never dropped on release
 			}

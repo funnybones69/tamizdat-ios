@@ -2,7 +2,11 @@ package vks
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -23,18 +27,23 @@ import (
 // (e.g. Yandex DoH, whitelisted). The resolver→authoritative-NS hop is
 // infrastructure traffic, invisible to the client-side whitelist.
 //
-// The roomKey is HMAC-derived from the shared wire key (RoomWakeKey), so a
-// query both authenticates the caller and names the room. Random DNS noise
-// and strangers cannot wake the server — they do not know the key.
+// The roomKey is HMAC-derived from the CLIENT SHORTID (RoomWakeKey), so a
+// query both authenticates the caller and names the room. The shortid is
+// the only credential — there is no separate deployment-wide wire key. The
+// beacon carries the shortid as its second label so the server can derive
+// the same selector and validate the user against the panel registry.
+// Random DNS noise and strangers without a valid shortid cannot wake the
+// server.
 //
-// No token can expire here: the beacon is key-based, and the room join it
-// triggers uses a fresh anonymous guest registration.
+// No token can expire here: the beacon is shortid-based, and the room join
+// it triggers uses a fresh anonymous guest registration.
 
 // RunBeaconDNS serves the authoritative nameserver for zone, waking rooms on
 // matching queries, until ctx is done. listenAddr is typically ":53".
 //
 // The zone is the DNS suffix that delegates to this server, e.g.
-// "w.example.com" — a query for "<roomKey>.w.example.com" wakes that room.
+// "w.example.com" — a query for "<selector>.<shortid>.<nonce>.w.example.com"
+// wakes that room (or assigns a provider room) for that user.
 func RunBeaconDNS(ctx context.Context, listenAddr, zone string, watch *WatchServer) error {
 	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
 	if zone == "" {
@@ -78,83 +87,72 @@ func handleBeaconQuery(pc net.PacketConn, src net.Addr, msg []byte, zone string,
 	}
 	qtype := int(msg[qend])<<8 | int(msg[qend+1])
 
-	// Match "<roomKey>.<zone>" or "<roomKey>.<nonce>.<zone>" (a random
-	// nonce label makes every query unique so resolver caches never answer
-	// a wake on the NS's behalf — a cached A record would silently swallow
-	// the beacon).
+	// Beacon names are "<selector>.<shortid>.<nonce>.<zone>". The nonce
+	// keeps every query unique so resolver caches never answer a wake on
+	// the NS's behalf — a cached A record would silently swallow the
+	// beacon. The selector is HMAC-derived from the shortid: a provider
+	// selector (ProviderWakeKey) asks for a room on that provider, a room
+	// selector (RoomWakeKey) wakes one specific armed room.
 	lower := strings.ToLower(name)
 	if suffix := "." + zone; strings.HasSuffix(lower, suffix) {
 		left := strings.TrimSuffix(lower, suffix)
 		if left != "" {
-			selector := left
-			if i := strings.Index(left, "."); i > 0 {
-				selector = left[:i] // "<selector>.<nonce>"
+			labels := strings.Split(left, ".")
+			selector := labels[0]
+			beaconShortID := ""
+			nonce := ""
+			if len(labels) > 1 {
+				beaconShortID = labels[1]
 			}
-			if selector != "" && !strings.Contains(selector, ".") {
-				// First: a specific room wake (existing behavior).
-				woken := false
-				if watch != nil {
+			if len(labels) > 2 {
+				nonce = labels[2]
+			}
+			if selector != "" && watch != nil {
+				watch.mu.Lock()
+				validator := watch.validateShortID
+				watch.mu.Unlock()
+				// The shortid is the only credential: validate it once for
+				// both beacon kinds. A server without a validator (standalone
+				// or test deployment) accepts any shortid, exactly as a
+				// key-less deployment behaved before.
+				if validator != nil && !validator(beaconShortID) {
+					log.Printf("vks beacon dns: beacon name=%q REJECTED (bad shortid %q) from %s", name, beaconShortID, src)
+				} else if roomKey, known := watch.matchRoomKey(selector, beaconShortID); known {
+					// First: a specific armed-room wake.
+					log.Printf("vks beacon dns: wake query name=%q roomKey=%q from %s", name, selector, src)
+					watch.Wake(roomKey)
+				} else if provider := matchProviderKey(selector, beaconShortID); provider != "" {
+					// Second: a PROVIDER beacon — create/assign a room and
+					// answer with its spec in a TXT record.
+					log.Printf("vks beacon dns: provider beacon name=%q provider=%q shortid=%q from %s", name, provider, beaconShortID, src)
+					ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+					cfg, err := watch.AssignRoom(ctx, provider)
+					cancel()
+					// Provider flags ride in the same TXT RR: providers
+					// whose credentials are dead (login required) tell
+					// the client to re-upload cookies instead of a
+					// silent empty answer. When the assign fails for a
+					// login reason (or the room cap / a dead provider),
+					// the answer carries an EMPTY spec + flags, not a
+					// silent fallback.
 					watch.mu.Lock()
-					_, knownRoom := watch.rooms[selector]
+					creds := watch.creds
 					watch.mu.Unlock()
-					if knownRoom {
-						log.Printf("vks beacon dns: wake query name=%q roomKey=%q from %s", name, selector, src)
-						watch.Wake(selector)
-						woken = true
-					}
-				}
-				// Second: a PROVIDER beacon — create/assign a room and
-				// answer with its spec in a TXT record.
-				if !woken && watch != nil {
-					provider := watch.matchProviderKey(selector)
-					if provider != "" {
-						// Auth gap fix: the beacon carries the client's shortid
-						// as a label (<providerKey>.<shortid>.<nonce>); only a
-						// VALID user gets a room created/assigned. Without it a
-						// stranger with the wire key could spam room creation.
-						beaconShortID := ""
-						if rest := left[len(selector)+1:]; strings.HasPrefix(left, selector+".") && len(rest) > 0 {
-							if i := strings.Index(rest, "."); i > 0 {
-								beaconShortID = rest[:i]
-							}
-						}
-						watch.mu.Lock()
-						validator := watch.validateShortID
-						watch.mu.Unlock()
-						if validator != nil && !validator(beaconShortID) {
-							log.Printf("vks beacon dns: provider beacon %q REJECTED (bad shortid %q) from %s", provider, beaconShortID, src)
-						} else {
-							log.Printf("vks beacon dns: provider beacon name=%q provider=%q shortid=%q from %s", name, provider, beaconShortID, src)
-							ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-							cfg, err := watch.AssignRoom(ctx, provider)
-							cancel()
-							// Provider flags ride in the same TXT RR: providers
-							// whose credentials are dead (login required) tell
-							// the client to re-upload cookies instead of a
-							// silent empty answer. When the assign fails for a
-							// login reason (or the room cap / a dead provider),
-							// the answer carries an EMPTY spec + flags, not a
-							// silent fallback.
-							watch.mu.Lock()
-							creds := watch.creds
-							watch.mu.Unlock()
-							flags := []string{}
-							if creds != nil {
-								if req := creds.LoginRequired(); len(req) > 0 {
-									flags = append(flags, "login="+strings.Join(req, ","))
-								}
-							}
-							if err != nil {
-								log.Printf("vks beacon dns: assign %s failed: %v", provider, err)
-								respondTXT(pc, src, msg, qend, "", flags)
-								return
-							}
-							spec := cfg.Provider + ":" + cfg.RoomURL
-							log.Printf("vks beacon dns: assigned %s -> TXT %q (flags %v)", provider, spec, flags)
-							respondTXT(pc, src, msg, qend, spec, flags)
-							return
+					flags := []string{}
+					if creds != nil {
+						if req := creds.LoginRequired(); len(req) > 0 {
+							flags = append(flags, "login="+strings.Join(req, ","))
 						}
 					}
+					if err != nil {
+						log.Printf("vks beacon dns: assign %s failed: %v", provider, err)
+						respondTXT(pc, src, msg, qend, beaconShortID, nonce, "", flags)
+						return
+					}
+					spec := cfg.Provider + ":" + cfg.RoomURL
+					log.Printf("vks beacon dns: assigned %s -> TXT spec for shortid=%q (flags %v)", provider, beaconShortID, flags)
+					respondTXT(pc, src, msg, qend, beaconShortID, nonce, spec, flags)
+					return
 				}
 			}
 		}
@@ -212,18 +210,26 @@ func decodeQName(msg []byte, off int) (string, int, bool) {
 	return "", 0, false
 }
 
-// SendWake emits the wake beacon for a room through the given DNS server
-// (direct "host:53", or a whitelisted resolver). The client calls this just
-// before connecting so the on-demand server joins the room in time.
-// The query name carries a random nonce label (<roomKey>.<nonce>.<zone>) so
-// resolver caches never swallow the beacon with a stale A record.
-func SendWake(ctx context.Context, dnsServer, zone, roomKey string) error {
+// SendWake emits the wake beacon for a specific armed room through the
+// given DNS server (direct "host:53", or a whitelisted resolver). The
+// client calls this just before connecting so the on-demand server joins
+// the room in time. The query name is
+// <roomKey>.<shortid>.<nonce>.<zone>: roomKey is derived from the caller's
+// shortid (RoomWakeKey) and the shortid label lets the server derive the
+// same selector and validate the user. The random nonce label makes every
+// query unique so resolver caches never swallow the beacon with a stale A
+// record.
+func SendWake(ctx context.Context, dnsServer, zone, shortIDHex, roomKey string) error {
 	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
+	sid := strings.ToLower(strings.TrimSpace(shortIDHex))
+	if sid == "" {
+		sid = "0"
+	}
 	nonce := make([]byte, 4)
 	if _, err := rand.Read(nonce); err != nil {
 		return fmt.Errorf("wake nonce: %w", err)
 	}
-	name := strings.ToLower(roomKey) + "." + hex.EncodeToString(nonce) + "." + zone + "."
+	name := strings.ToLower(roomKey) + "." + sid + "." + hex.EncodeToString(nonce) + "." + zone + "."
 	query := buildAQuery(name)
 	d := net.Dialer{Timeout: 5 * time.Second}
 	c, err := d.DialContext(ctx, "udp", dnsServer)
@@ -254,25 +260,94 @@ func buildAQuery(name string) []byte {
 	return msg
 }
 
+// answerKey derives the per-user key that protects the room spec in the
+// TXT answer. The old shared wire key never protected the answer (it only
+// keyed the beacon selector), but with the shortid as the only credential
+// the answer must not be readable by another user of the same server.
+func answerKey(shortIDHex string) []byte {
+	mac := hmac.New(sha256.New, shortIDKey(shortIDHex))
+	mac.Write([]byte("vks-answer\x00"))
+	return mac.Sum(nil)
+}
+
+// answerKeystream expands answerKey into n bytes of HMAC-SHA256 counter
+// mode, bound to the beacon nonce so two answers to the same user never
+// share a keystream.
+func answerKeystream(shortIDHex, nonce string, n int) []byte {
+	key := answerKey(shortIDHex)
+	out := make([]byte, 0, n+sha256.Size)
+	var ctr [4]byte
+	for i := uint32(0); len(out) < n; i++ {
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte(nonce))
+		binary.BigEndian.PutUint32(ctr[:], i)
+		mac.Write(ctr[:])
+		out = append(out, mac.Sum(nil)...)
+	}
+	return out[:n]
+}
+
+// encodeAnswerSpec encrypts the room spec for one user and authenticates
+// it (encrypt-then-MAC). Format: "v1:" + base64url(ciphertext || tag16).
+func encodeAnswerSpec(shortIDHex, nonce, spec string) string {
+	// DNS character-strings cap at 255 bytes; 170 plaintext bytes leave
+	// room for the 16-byte tag and base64 expansion inside one string.
+	if len(spec) > 170 {
+		spec = spec[:170]
+	}
+	plain := []byte(spec)
+	ks := answerKeystream(shortIDHex, nonce, len(plain))
+	ct := make([]byte, len(plain))
+	for i := range plain {
+		ct[i] = plain[i] ^ ks[i]
+	}
+	mac := hmac.New(sha256.New, answerKey(shortIDHex))
+	mac.Write([]byte("mac\x00"))
+	mac.Write([]byte(nonce))
+	mac.Write(ct)
+	ct = append(ct, mac.Sum(nil)[:16]...)
+	return "v1:" + base64.RawURLEncoding.EncodeToString(ct)
+}
+
+// decodeAnswerSpec reverses encodeAnswerSpec. A string without the "v1:"
+// prefix is returned verbatim: an older server (or a plaintext test
+// vector) simply did not encrypt the spec. ok=false means the tag did not
+// verify — the answer belongs to a different user or was tampered with.
+func decodeAnswerSpec(shortIDHex, nonce, s string) (string, bool) {
+	if !strings.HasPrefix(s, "v1:") {
+		return s, true
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s[3:])
+	if err != nil || len(raw) < 16 {
+		return "", false
+	}
+	ct, want := raw[:len(raw)-16], raw[len(raw)-16:]
+	mac := hmac.New(sha256.New, answerKey(shortIDHex))
+	mac.Write([]byte("mac\x00"))
+	mac.Write([]byte(nonce))
+	mac.Write(ct)
+	if !hmac.Equal(mac.Sum(nil)[:16], want) {
+		return "", false
+	}
+	ks := answerKeystream(shortIDHex, nonce, len(ct))
+	plain := make([]byte, len(ct))
+	for i := range ct {
+		plain[i] = ct[i] ^ ks[i]
+	}
+	return string(plain), true
+}
+
 // respondTXT answers a DNS query with a TXT record carrying the
 // beacon-assignment answer: the FIRST character-string is the room spec
-// ("" when no room was assigned — e.g. login required), the following
-// strings are `key=value` flags (e.g. "login=telemost,mts"). TTL 0.
-//
-// Old clients read only the first character-string (parseTXTAnswer's
-// legacy behavior), so the spec stays first and flags ride behind it in
-// the same RR — an old client sees its spec unchanged, a new client
-// reads both.
-func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec string, flags []string) {
+// encrypted for the beaconing shortid ("" when no room was assigned —
+// e.g. login required), the following strings are plaintext `key=value`
+// flags (e.g. "login=telemost,mts"). TTL 0.
+func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, shortIDHex, nonce, spec string, flags []string) {
 	if len(flags) > 5 {
 		flags = flags[:5]
 	}
 	stringsOut := make([][]byte, 0, 1+len(flags))
-	d := []byte(spec)
-	if len(d) > 200 {
-		d = d[:200] // DNS-safe cap
-	}
-	stringsOut = append(stringsOut, d)
+	stringsOut = append(stringsOut, []byte(encodeAnswerSpec(shortIDHex, nonce, spec)))
 	for _, f := range flags {
 		d := []byte(f)
 		if len(d) > 200 {
@@ -305,30 +380,31 @@ func respondTXT(pc net.PacketConn, src net.Addr, msg []byte, qend int, spec stri
 // SendWakeProvider asks the server to CREATE/ASSIGN a room on the given
 // provider and returns the assigned room spec ("provider:roomURL") and
 // the answer's key=value flags from the DNS TXT answer. This is the
-// beacon-assignment flow: the client beacons a provider key (HMAC of the
-// shared key), the server creates a fresh room (WB/Jazz) or assigns an
+// beacon-assignment flow: the client beacons a selector derived from its
+// shortid, the server creates a fresh room (WB/Jazz) or assigns an
 // armed/pool one (Telemost/MTS) and answers in-band. shortIDHex is the
-// client's tamizdat user identity — carried as a beacon label so the
-// server can gate room creation on a valid user (auth gap fix).
+// client's tamizdat user identity and the ONLY credential — it is both
+// the selector key and the answer key.
 //
-// The answer's first TXT character-string is the room spec ("" when the
-// server could not assign a room — e.g. login required); the strings
-// after it are flags (e.g. "login=telemost,mts"). On a successful
-// (ANCOUNT>=1) answer the package-level login-required set is refreshed
-// from the flags, so LoginRequiredProviders() reflects the server's view
-// (see nativeconn.go for the empty-spec fail-fast).
-func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, shortIDHex string) (string, []string, error) {
+// The answer's first TXT character-string is the encrypted room spec
+// ("" when the server could not assign a room — e.g. login required);
+// the strings after it are flags (e.g. "login=telemost,mts"). On a
+// successful (ANCOUNT>=1) answer the package-level login-required set is
+// refreshed from the flags, so LoginRequiredProviders() reflects the
+// server's view (see nativeconn.go for the empty-spec fail-fast).
+func SendWakeProvider(ctx context.Context, dnsServer, zone, provider, shortIDHex string) (string, []string, error) {
 	zone = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(zone), "."))
-	providerKey := ProviderWakeKey(keyHex, provider)
-	nonce := make([]byte, 4)
-	if _, err := rand.Read(nonce); err != nil {
-		return "", nil, fmt.Errorf("wake nonce: %w", err)
-	}
 	sid := strings.ToLower(strings.TrimSpace(shortIDHex))
 	if sid == "" {
 		sid = "0"
 	}
-	name := strings.ToLower(providerKey) + "." + sid + "." + hex.EncodeToString(nonce) + "." + zone + "."
+	providerKey := ProviderWakeKey(sid, provider)
+	nonce := make([]byte, 4)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", nil, fmt.Errorf("wake nonce: %w", err)
+	}
+	nonceHex := hex.EncodeToString(nonce)
+	name := strings.ToLower(providerKey) + "." + sid + "." + nonceHex + "." + zone + "."
 	query := buildTXTQuery(name)
 	d := net.Dialer{Timeout: 5 * time.Second}
 	c, err := d.DialContext(ctx, "udp", dnsServer)
@@ -345,14 +421,20 @@ func SendWakeProvider(ctx context.Context, dnsServer, zone, keyHex, provider, sh
 	if err != nil {
 		return "", nil, fmt.Errorf("wake read: %w", err)
 	}
-	flags, err := parseTXTAnswerAll(buf[:n])
-	if err == nil {
-		recordLoginFlags(flags)
+	strs, err := parseTXTAnswerAll(buf[:n])
+	if err != nil {
+		return "", nil, err
 	}
-	if len(flags) > 0 {
-		return flags[0], flags, nil
+	if len(strs) == 0 {
+		return "", nil, fmt.Errorf("wake answer: no TXT record")
 	}
-	return "", nil, err
+	spec, ok := decodeAnswerSpec(sid, nonceHex, strs[0])
+	if !ok {
+		return "", nil, fmt.Errorf("wake answer: spec authentication failed for shortid %q", sid)
+	}
+	flags := strs[1:]
+	recordLoginFlags(flags)
+	return spec, flags, nil
 }
 
 // recordLoginFlags folds a beacon answer's "login=..." flag into the
@@ -412,21 +494,9 @@ func buildTXTQuery(name string) []byte {
 	return msg
 }
 
-// parseTXTAnswer extracts the FIRST TXT character-string from a DNS
-// response. Old-client contract: the room spec is always the first
-// string, so this keeps returning exactly what a pre-flags client saw
-// (spec, or "" for an empty first string).
-func parseTXTAnswer(msg []byte) (string, error) {
-	strs, err := parseTXTAnswerAll(msg)
-	if err != nil {
-		return "", err
-	}
-	return strs[0], nil
-}
-
 // parseTXTAnswerAll extracts every TXT character-string from the FIRST
-// answer record: [0] is the room spec (possibly empty — the server could
-// not assign a room), [1:] are the key=value flags.
+// answer record: [0] is the encrypted room spec (possibly empty — the
+// server could not assign a room), [1:] are the plaintext key=value flags.
 func parseTXTAnswerAll(msg []byte) ([]string, error) {
 	if len(msg) < 12 {
 		return nil, fmt.Errorf("short response")
