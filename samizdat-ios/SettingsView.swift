@@ -295,6 +295,7 @@ struct SettingsView: View {
         Task { await VPNProfileStore.shared.refreshVKSLadder() }
     }
 
+    @ViewBuilder
     private func channelToggleRow(title: String, icon: String, isOn: Binding<Bool>, isLast: Bool) -> some View {
         HStack(spacing: 14) {
             IconCard(systemName: icon, bg: theme.chip, fg: theme.textDim)

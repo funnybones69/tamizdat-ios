@@ -437,8 +437,8 @@ struct ContentView: View {
         let carrier: String? = {
             guard VKSPreferences.enabled,
                   VKSPreferences.isConfigured(profileBlob: blob) else { return nil }
-            let first = VKSPreferences.providerOrder
-                .first { VKSPreferences.providerEnabled($0) }
+            guard let first = VKSPreferences.providerOrder
+                .first(where: { VKSPreferences.providerEnabled($0) }) else { return nil }
             return VKSPreferences.providerDisplayName(first)
         }()
         switch whitelistStatus {

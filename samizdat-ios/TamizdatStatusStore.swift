@@ -85,6 +85,8 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
     let endpointMode: String
     let effectiveEndpoint: String
     let desiredUpstream: String
+    /// Upstream actually carrying traffic ("h2" / "vks").
+    let upstreamKind: String
     /// VKS ladder carrier state from the status RPC: 1 while the native
     /// room transport owns the upstream. Extension-ground-truth; main-app
     /// gomobile calls hit a separate idle Go runtime, so never read Go
@@ -111,6 +113,7 @@ struct TamizdatStatusSnapshot: Codable, Equatable {
         case rxBytes, txBytes, uptimeSec, isRewiring
         case rewireGeneration, endpointMode, effectiveEndpoint, desiredUpstream, upstreamKind
         case vksRunning
+    }
 
     init(realShape: String, lockedFlows: Int, liteAlive: Int,
          rttLiteMs: Int, rttBulkMs: Int,

@@ -90,7 +90,7 @@ struct EndpointsView: View {
         .navigationBarTitleDisplayMode(.inline)
         .sheet(item: $scanning) { target in
             QRScannerSheet { code in
-                applyScanned(code, to: target)
+                addProfile(from: code)
             }
             .environment(\.themeTokens, theme)
         }
