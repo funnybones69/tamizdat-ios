@@ -348,6 +348,10 @@ func StopVKSNativeUpstream() string {
 	rt.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
+		// Flows that were riding this carrier are parked in a copy with no
+		// deadline; without this they outlive it and pile up across
+		// reconnects until iOS kills the extension for memory.
+		closeAllFlows("carrier stopped")
 	}
 	// The room sessions live inside the vks package, not on the samizdat client:
 	// closing the client alone leaves the SFU websocket, the PeerConnections and

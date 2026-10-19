@@ -397,6 +397,7 @@ func SetSamizdatConfig(blob string) error {
 		stopPingProber()
 		if oldClient != nil {
 			_ = oldClient.Close()
+			closeAllFlows("client cleared")
 		}
 		rt.appendLog("info: dial mode = direct")
 		return nil
@@ -607,6 +608,9 @@ func SetSamizdatConfig(blob string) error {
 	rt.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
+		// The old client's flows are stranded: their handlers sit in a copy
+		// with no deadline and would never return.
+		closeAllFlows("client replaced")
 	}
 	// IPA-D21: (re)start the real-internet ping prober bound to the new
 	// samizdat client. startPingProber stops any prior prober first;
@@ -1571,7 +1575,18 @@ func relay(a, b net.Conn, idx uint64) {
 // iteration and exits naturally; tamizdat's transport pool stays alive.
 //
 // gomobile binding exposes this as SocksstubCloseAllFlows().
-func CloseAllFlows() int32 {
+func CloseAllFlows() int32 { return closeAllFlows("memory pressure") }
+
+// closeAllFlows drops every registered flow, with a reason for the log.
+//
+// A SOCKS handler parks in a bidirectional copy with no read deadline once
+// its handshake is done, so a flow whose upstream silently stops answering
+// never returns and never deregisters. Those parked handlers are real memory
+// (goroutine stack + two copy buffers + the tunnel stream) and they survive
+// the carrier that stranded them. Closing them when that carrier is replaced
+// or stopped is what keeps a reconnect cycle from accumulating them until
+// iOS kills the extension.
+func closeAllFlows(reason string) int32 {
 	closed := int32(0)
 	flowRegistry.Range(func(k, v any) bool {
 		fs := v.(*flowState)
@@ -1580,7 +1595,7 @@ func CloseAllFlows() int32 {
 		return true
 	})
 	if closed > 0 {
-		rt.appendLog(fmt.Sprintf("warn: nuclear close — %d flows terminated under memory pressure", closed))
+		rt.appendLog(fmt.Sprintf("warn: closed %d flows (%s)", closed, reason))
 	}
 	debug.FreeOSMemory()
 	return closed
