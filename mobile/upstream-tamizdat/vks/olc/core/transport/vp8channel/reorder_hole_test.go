@@ -62,3 +62,56 @@ func TestReorderBufferStillReorders(t *testing.T) {
 		}
 	}
 }
+
+// TestReorderNewHoleGetsItsOwnClock is the regression for a hole inheriting
+// the age of the hole that was just filled.
+//
+// Sequence from the review: 100 and 102 at t=0 (hole at 101), 104 at t=90ms,
+// then 101 at t=100ms and 103 at t=105ms. Filling 101 makes 103 the missing
+// head, but 103 has only been missing for microseconds. Reusing the old
+// hole's 100 ms age skipped straight past 103 and dropped it — even though it
+// arrived 5 ms later, well inside the reorder window the buffer exists to
+// absorb.
+func TestReorderNewHoleGetsItsOwnClock(t *testing.T) {
+	now := time.Unix(0, 0)
+	b := newReorderBuffer()
+	b.now = func() time.Time { return now }
+
+	var got []uint16
+	deliver := func(p *rtp.Packet) { got = append(got, p.SequenceNumber) }
+
+	b.push(mkPkt(100), deliver) // t=0
+	b.push(mkPkt(102), deliver) // t=0, hole at 101
+	if len(got) != 1 {
+		t.Fatalf("after 100/102 delivered %v, want just [100]", got)
+	}
+
+	now = now.Add(90 * time.Millisecond)
+	b.push(mkPkt(104), deliver) // still inside the hole wait
+	if len(got) != 1 {
+		t.Fatalf("90ms in, delivered %v; 102 must still be held", got)
+	}
+
+	now = now.Add(10 * time.Millisecond) // t=100ms: the old hole is now due
+	b.push(mkPkt(101), deliver)
+	if len(got) != 3 {
+		t.Fatalf("after 101 delivered %v, want [100 101 102]", got)
+	}
+
+	now = now.Add(5 * time.Millisecond) // t=105ms
+	b.push(mkPkt(103), deliver)
+
+	want := []uint16{100, 101, 102, 103, 104}
+	if len(got) != len(want) {
+		t.Fatalf("delivered %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("delivered %v, want %v", got, want)
+		}
+	}
+}
+
+func mkPkt(seq uint16) *rtp.Packet {
+	return &rtp.Packet{Header: rtp.Header{SequenceNumber: seq}, Payload: []byte{0}}
+}

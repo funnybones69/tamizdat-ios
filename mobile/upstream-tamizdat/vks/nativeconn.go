@@ -649,7 +649,7 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		OnData:        s.onData,
 		OnPeerData:    s.onPeerData,
 	}
-	if kcpCarrier(cfg.transportName()) {
+	if autoConfirmCarrier(cfg.transportName()) {
 		// One KCP state machine per pair. With OnPeerData set the KCP
 		// carriers run in SERVER mode: a broadcast plane for sending plus a
 		// per-peer session that receives the server's frames — two state
@@ -657,6 +657,9 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		// on the plane that did not send the data and the TLS flight never
 		// completed. Client mode keeps a single data plane; the server's
 		// discovery answer (addressed to our epoch) binds it.
+		//
+		// Only VP8 has the targeted-confirm rule this depends on; see
+		// autoConfirmCarrier.
 		tcfg.OnPeerData = nil
 		if o, ok := tcfg.Options.(vp8channel.Options); ok {
 			o.AutoConfirmTargeted = true
@@ -859,6 +862,20 @@ func kcpCarrier(name string) bool {
 	return name == "vp8channel" || name == "seichannel"
 }
 
+// autoConfirmCarrier reports whether this carrier may run in client mode with
+// targeted peer confirmation.
+//
+// Only VP8 has it. seichannel's first-frame bind accepts ANY sender,
+// broadcast included (seichannel/transport.go), so a second client starting at
+// the same time could become the peer; the real server's later targeted answer
+// then relatches KCP WITHOUT rotating the local epoch, while the server keeps
+// the state machine it already built for that epoch. The two sides desync and
+// discovery/TLS hangs. Until SEI gets the same targeted-confirm rule as VP8,
+// it must keep running the way it did.
+func autoConfirmCarrier(name string) bool {
+	return name == "vp8channel"
+}
+
 // ---------------------------------------------------------------------------
 // Server side: accept native tamizdat sessions over a room datachannel.
 // ---------------------------------------------------------------------------
@@ -1058,11 +1075,42 @@ func (l *dcListener) touch() {
 	l.lastActivityNanos.Store(time.Now().UnixNano())
 }
 
-// idleExpired reports whether the room has been silent for the whole idle
-// span. Activity, not open conns, is the signal: a live client is quiet
-// between flows and would otherwise lose the room under it.
+// liveConns reports how many accepted conns are still open. A conn that
+// closed but has not yet been deleted from the map (its onClose runs
+// asynchronously) does not count.
+func (l *dcListener) liveConns() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, c := range l.conns {
+		c.mu.Lock()
+		closed := c.closed
+		c.mu.Unlock()
+		if !closed {
+			n++
+		}
+	}
+	return n
+}
+
+// idleExpired reports whether the room is genuinely abandoned: no open conn
+// AND no client traffic for the whole idle span.
+//
+// BOTH conditions are required, and each covers a case the other misses:
+//
+//   - An open conn means a flow is live. During a download the client only
+//     ACKs — those never reach the application callback that stamps
+//     lastActivity, so an activity-only rule released the room mid-transfer
+//     and killed the download.
+//   - Recent traffic means the client is still there between flows. A
+//     tunnel's conns are short-lived by design, so a socket-count-only rule
+//     released the room underneath a healthy client that was merely idle
+//     for a moment (observed live: released 12 s before the next dial).
 func (l *dcListener) idleExpired() bool {
 	if l.idle <= 0 {
+		return false
+	}
+	if l.liveConns() > 0 {
 		return false
 	}
 	last := l.lastActivityNanos.Load()

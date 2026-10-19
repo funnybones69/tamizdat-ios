@@ -311,6 +311,14 @@ func StartVKSNativeUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenP
 		TCPFragmentation:       true,
 		RecordFragmentation:    true,
 		CoverTrafficEnabled:    false,
+		// The pool holds exactly one transport, so it MUST be able to replace
+		// a transport that went away. A server GOAWAY marks the transport
+		// draining without closing it; with capacity 1 the draining transport
+		// then occupies the only slot and every dial fails until the 60 s
+		// reaper — TCP and UDP alike. Strict single-H2 is what enables the
+		// pool's inline cleanup of a draining zero-stream slot, which is
+		// exactly this configuration (one room, one transport).
+		StrictSingleH2: true,
 		// The native client's Dialer is the ROOM, not the H2 endpoint: an
 		// RTT probe inside it dials 1.1.1.1:80 through the room once a
 		// second, which on Telemost means one CONNECT + one RTP sample per

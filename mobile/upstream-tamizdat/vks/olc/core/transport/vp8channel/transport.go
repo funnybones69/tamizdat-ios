@@ -55,10 +55,14 @@ const (
 
 	// maxSampleBytes is the cap on one published sample, chosen so the sample
 	// fits in ONE RTP packet - the only shape Telemost's SFU forwards (see
-	// streamTransport.maxSampleBytes). A full KCP segment plus this package's
-	// framing is epochHdrLen+kcpMTU+len(kcpBatchMagic)+2 = 1042 bytes; the cap
-	// leaves room for the RTP header, the VP8 payload descriptor and SRTP
-	// overhead inside a 1200-byte path MTU.
+	// streamTransport.maxSampleBytes). One full KCP segment plus this
+	// package's framing is 1046 bytes: epochHdrLen 36 + batch magic 4 +
+	// length prefix 2 + KCP segment 1000 (24 header + 976 payload) + packet
+	// CRC 4. Pion's RTP MTU is 1200, minus a 12-byte RTP header and at most 4
+	// bytes of VP8 payload descriptor, so a sample must stay under 1184 to
+	// be a single RTP packet; 1150 leaves headroom and still cannot hold two
+	// segments (2052). Note this bounds the RTP packet, not the IP path MTU:
+	// with SRTP and IPv4/UDP the datagram reaches ~1210 bytes.
 	maxSampleBytes = 1150
 
 	// publishBurstBytes is what the writer's token bucket holds when the

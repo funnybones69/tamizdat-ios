@@ -604,13 +604,20 @@ func SetSamizdatConfig(blob string) error {
 	rt.mu.Lock()
 	old := rt.samizdatClient
 	rt.samizdatBlob = blob
+	// Drop the outgoing client's flows BEFORE publishing the new one.
+	//
+	// A flow's handler parks in a bidirectional copy with no deadline, so a
+	// flow whose upstream stopped answering never returns and never
+	// deregisters. Closing them is what bounds that — but doing it after the
+	// swap also killed flows that had already been accepted on the NEW
+	// client, because the registry is process-wide and has no owner. Under
+	// the lock no dial can pick the new client up until the registry is
+	// empty, so only the outgoing client's flows are affected.
+	closeAllFlows("client replaced")
 	rt.samizdatClient = client
 	rt.mu.Unlock()
 	if old != nil {
 		_ = old.Close()
-		// The old client's flows are stranded: their handlers sit in a copy
-		// with no deadline and would never return.
-		closeAllFlows("client replaced")
 	}
 	// IPA-D21: (re)start the real-internet ping prober bound to the new
 	// samizdat client. startPingProber stops any prior prober first;

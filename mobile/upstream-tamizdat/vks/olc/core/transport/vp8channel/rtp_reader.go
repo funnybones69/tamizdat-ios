@@ -62,7 +62,14 @@ type reorderBuffer struct {
 	// holeSince is when the buffer first held packets behind a missing
 	// nextSeq; zero while there is no hole. now is time.Now (tests stub it).
 	holeSince time.Time
-	now       func() time.Time
+	// holeSeq is the sequence number that hole belongs to. Without it a NEW
+	// hole inherits the age of the one just filled: with 100,102 then 104,101
+	// arriving, filling 101 makes 103 the missing head, and the old timer
+	// would skip straight past 103 even though it had only been missing for
+	// microseconds — losing a packet the reorder window was meant to absorb.
+	holeSeq    uint16
+	holeSeqSet bool
+	now        func() time.Time
 }
 
 func newReorderBuffer() *reorderBuffer {
@@ -96,6 +103,7 @@ func (b *reorderBuffer) push(pkt *rtp.Packet, deliver func(*rtp.Packet)) {
 	b.drain(deliver)
 	if len(b.pkts) == 0 {
 		b.holeSince = time.Time{}
+		b.holeSeqSet = false
 		return
 	}
 	// A hole remains. Give a genuine reorder reorderHoleWait to fill it,
@@ -104,8 +112,10 @@ func (b *reorderBuffer) push(pkt *rtp.Packet, deliver func(*rtp.Packet)) {
 	if b.now != nil {
 		now = b.now()
 	}
-	if b.holeSince.IsZero() {
-		b.holeSince = now
+	// A hole at a NEW head starts its own clock: the age of the hole that was
+	// just filled says nothing about this one.
+	if !b.holeSeqSet || b.holeSeq != b.nextSeq {
+		b.holeSeq, b.holeSeqSet, b.holeSince = b.nextSeq, true, now
 		return
 	}
 	if now.Sub(b.holeSince) < reorderHoleWait {
@@ -115,8 +125,11 @@ func (b *reorderBuffer) push(pkt *rtp.Packet, deliver func(*rtp.Packet)) {
 	b.drain(deliver)
 	if len(b.pkts) == 0 {
 		b.holeSince = time.Time{}
+		b.holeSeqSet = false
 	} else {
 		b.holeSince = now
+		b.holeSeq = b.nextSeq
+		b.holeSeqSet = true
 	}
 }
 
