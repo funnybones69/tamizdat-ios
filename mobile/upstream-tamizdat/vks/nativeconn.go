@@ -883,6 +883,15 @@ type dcListener struct {
 	// carriers), so the answer and every write of the accepted conn must go
 	// to that client's session via SendTo, never the broadcast plane.
 	pinPeer bool
+
+	// lastActivityNanos is the last moment this room saw ANY frame from a
+	// client: a HELLO retry, a control-plane keepalive, or payload on an
+	// accepted conn. The idle timer reads it instead of counting open
+	// conns, because a tunnel's conns are short-lived by design — a client
+	// that is merely between flows looks exactly like an abandoned room
+	// when you count sockets, and the room was being released underneath a
+	// perfectly healthy client every IdleTimeout.
+	lastActivityNanos atomic.Int64
 }
 
 // nativeListen joins the room as the host and returns a net.Listener whose
@@ -968,6 +977,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 // tag, answer TMZD_SERVER+tag, and offer the conn to Accept. The tag isolates
 // this session from any retried dial on the shared broadcast lane.
 func (l *dcListener) handleHello(peerID string, sid []byte) {
+	l.touch()
 	if !l.pinPeer {
 		peerID = ""
 	}
@@ -1002,6 +1012,7 @@ func (l *dcListener) route(data []byte) {
 	if len(data) < 4 {
 		return
 	}
+	l.touch()
 	key := string(data[:4])
 	l.mu.Lock()
 	conn, ok := l.conns[key]
@@ -1041,22 +1052,24 @@ func (l *dcListener) Close() error {
 
 func (l *dcListener) Addr() net.Addr { return l.addr }
 
-// liveConns reports how many accepted conns are still open. A conn that
-// closed but has not yet been deleted from the map (its onClose runs
-// asynchronously) does not count.
-func (l *dcListener) liveConns() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	n := 0
-	for _, c := range l.conns {
-		c.mu.Lock()
-		closed := c.closed
-		c.mu.Unlock()
-		if !closed {
-			n++
-		}
+// touch records client activity, which the idle timer treats as "the room
+// is still wanted".
+func (l *dcListener) touch() {
+	l.lastActivityNanos.Store(time.Now().UnixNano())
+}
+
+// idleExpired reports whether the room has been silent for the whole idle
+// span. Activity, not open conns, is the signal: a live client is quiet
+// between flows and would otherwise lose the room under it.
+func (l *dcListener) idleExpired() bool {
+	if l.idle <= 0 {
+		return false
 	}
-	return n
+	last := l.lastActivityNanos.Load()
+	if last == 0 {
+		return false
+	}
+	return time.Since(time.Unix(0, last)) >= l.idle
 }
 
 // watchIdle closes the listener once it has served zero live conns for the
@@ -1067,20 +1080,16 @@ func (l *dcListener) liveConns() int {
 func (l *dcListener) watchIdle() {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
-	emptySince := time.Now()
+	l.touch() // the join itself counts as the starting point
 	for {
 		select {
 		case <-l.closeCh:
 			return
 		case <-t.C:
-			if l.liveConns() == 0 {
-				if time.Since(emptySince) >= l.idle {
-					log.Printf("[native] listen: room idle for %s — releasing", l.idle)
-					_ = l.Close()
-					return
-				}
-			} else {
-				emptySince = time.Now()
+			if l.idleExpired() {
+				log.Printf("[native] listen: room idle for %s — releasing", l.idle)
+				_ = l.Close()
+				return
 			}
 		}
 	}

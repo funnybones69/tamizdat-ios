@@ -296,6 +296,13 @@ func StartVKSNativeUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenP
 		ShortID:       shortID,
 		MinTransports: 1,
 		MaxTransports: 1, // single session over the shared broadcast lane
+		// The native client's Dialer is the ROOM, not the H2 endpoint: an
+		// RTT probe inside it dials 1.1.1.1:80 through the room once a
+		// second, which on Telemost means one CONNECT + one RTP sample per
+		// second of pure noise on the same track the tunnel rides. It also
+		// inflated the carrier's own byte counters. The room path already
+		// reports its own health; keep the client quiet.
+		DisableRTTProbe: true,
 		Dialer: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return vks.NativeDialLadder(ctx, nativeLadder)
 		},

@@ -66,8 +66,27 @@ const (
 	// to absorb cold TLS handshake to upstream.
 	pingProbeTimeout      = 3 * time.Second
 	pingProbeTimeoutFirst = 5 * time.Second
-	pingFailedThreshold   = 2 // consecutive misses to enter Failed state
+	// Whitelist carriers pay a room join before their first byte can move:
+	// the native client joins the SFU room, publishes its track and waits for
+	// the server's TMZD_SERVER discovery answer. Measured on a live Telemost
+	// room that is ~13 s from the first dial, so a 5 s probe is guaranteed to
+	// miss and the shield paints red on a healthy tunnel. These budgets cover
+	// the join without being long enough to hide a genuinely dead carrier.
+	pingProbeTimeoutVKS      = 20 * time.Second
+	pingProbeTimeoutVKSFirst = 30 * time.Second
+	pingFailedThreshold      = 2 // consecutive misses to enter Failed state
 )
+
+// probeTimeouts returns the steady-state and first-probe timeouts for the
+// carrier currently selected. A whitelist carrier is slow to open its FIRST
+// byte (room join + peer discovery) and its steady state still pays an SFU
+// round trip, so it gets the longer pair; Main keeps the H2 numbers.
+func probeTimeouts() (steady, first time.Duration) {
+	if CurrentUpstreamMode() == "main" {
+		return pingProbeTimeout, pingProbeTimeoutFirst
+	}
+	return pingProbeTimeoutVKS, pingProbeTimeoutVKSFirst
+}
 
 // lastForegroundPollAtNanos is bumped to time.Now().UnixNano() every
 // time the extension handles a foreground status RPC. The prober loop
@@ -242,7 +261,8 @@ func runPingProbeLoop(ctx context.Context, client probeDialer) {
 	// longer timeout because cold-start includes TLS handshake to the
 	// upstream tamizdat server + first H/2 stream open — easily 1-4s
 	// on its own.
-	probeOnceWithTimeout(ctx, client, pingProbeTimeoutFirst)
+	_, first := probeTimeouts()
+	probeOnceWithTimeout(ctx, client, first)
 
 	// Dynamic cadence: use time.Timer instead of Ticker so we can
 	// re-arm with the current cadence each cycle (3s FG / 30s BG).
@@ -263,7 +283,8 @@ func runPingProbeLoop(ctx context.Context, client probeDialer) {
 // updates the shared snapshot. Errors and non-2xx/3xx responses both
 // count as "miss". Uses the steady-state timeout.
 func probeOnce(ctx context.Context, client probeDialer) {
-	probeOnceWithTimeout(ctx, client, pingProbeTimeout)
+	steady, _ := probeTimeouts()
+	probeOnceWithTimeout(ctx, client, steady)
 }
 
 // probeOnceWithTimeout is the actual probe implementation with a

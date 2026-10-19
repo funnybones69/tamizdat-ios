@@ -61,6 +61,14 @@ type ClientConfig struct {
 	CoverTrafficEnabled bool
 	CoverTrafficTargets []string // empty = defaults
 
+	// DisableRTTProbe turns off the built-in RTT sampler. That sampler dials
+	// a fixed reference target (1.1.1.1:80) once a second THROUGH this
+	// client, which is fine for the H2 endpoint it was written for but
+	// wrong for a client whose Dialer is a shared media room: every probe
+	// becomes a CONNECT plus an RTP sample on the tunnel's own track.
+	// Default false (probe on) keeps the H2 behaviour unchanged.
+	DisableRTTProbe bool
+
 	// PoolVariant selects an operator-controlled transport-pool strategy.
 	// Empty keeps the foundation/V3-shaped defaults; "v2" uses one bulk
 	// transport plus one on-demand realtime lite transport.

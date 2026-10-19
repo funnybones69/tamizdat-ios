@@ -272,8 +272,10 @@ func NewClient(config ClientConfig) (*Client, error) {
 		c.cover = c.startCoverTraffic(c.coverCtx, config.CoverTrafficTargets)
 	}
 
-	c.rttProbe = newRTTProbe(c)
-	c.rttProbe.start()
+	if !config.DisableRTTProbe {
+		c.rttProbe = newRTTProbe(c)
+		c.rttProbe.start()
+	}
 	return c, nil
 }
 
