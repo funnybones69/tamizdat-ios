@@ -555,6 +555,13 @@ func SetSamizdatConfig(blob string) error {
 				cb.OnNotification(e.Code, e.Title, e.Body, e.Locale)
 			}
 		},
+		// The H2 client keeps existing in whitelist mode (it is simply not
+		// the data path), and its built-in RTT sampler dials 1.1.1.1:80 once
+		// a second THROUGH it. That is real tunnel traffic the operator never
+		// asked for, it competes with user flows for the same carrier, and it
+		// shows up as a permanent CONNECT storm. In whitelist mode the room
+		// reports its own health, so silence this client.
+		DisableRTTProbe: CurrentUpstreamMode() != "main",
 		// IPA-Y: Performance mode toggle removed. Plan B+'s realtime
 		// classifier auto-flips the bulk transport to ShapeLite (no
 		// cover, no fragmentation, no jitter) for the duration of any
@@ -1075,9 +1082,27 @@ func sendReply(client net.Conn, code byte) error {
 	return err
 }
 
-// vksNativeFailLatch is how long the native VKS path is skipped after a dial
-// failure, so a dead room does not make every flow pay the beacon timeout.
-const vksNativeFailLatch = 30 * time.Second
+// vksNativeFailLatch is how long the native VKS path is skipped after the
+// CARRIER itself reports a failure, so a dead room does not make every flow
+// pay a beacon timeout. It is deliberately short: outside Main mode there is
+// no fallback, so while the latch is set every flow in the app is refused.
+const vksNativeFailLatch = 5 * time.Second
+
+// callerGaveUp reports whether a dial failure is the CALLER running out of
+// time rather than the carrier being down.
+//
+// This distinction is load-bearing. The ping prober dials with a 3 s budget
+// while a room dial legitimately takes longer (a cold join is ~13 s), so a
+// probe that times out says nothing about the carrier. Latching on it used to
+// blackhole every flow in the app for 30 s — with no fallback in whitelist
+// mode that is a total outage, repeating for as long as the probes keep
+// timing out.
+func callerGaveUp(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
 
 // vksCarrierWarmupGrace covers a freshly installed native carrier: joining the
 // room and waiting for the beacon can outlast the first probe (5 s) by a wide
@@ -1110,6 +1135,11 @@ func dialWhitelistVKS(ctx context.Context, dest string) (net.Conn, error) {
 		if c, err := nclient.DialContext(ctx, "tcp", dest); err == nil {
 			rt.vksNativeFailUntil.Store(0)
 			return c, nil
+		} else if callerGaveUp(ctx, err) {
+			// The caller's budget ran out before the room opened a stream.
+			// That is not evidence the carrier is down, and latching here
+			// would refuse every other flow in the app.
+			rt.appendLog(fmt.Sprintf("warn: vks-native dial %s ran out of caller budget: %v", dest, err))
 		} else {
 			rt.vksNativeFailUntil.Store(time.Now().Add(vksNativeFailLatch).UnixNano())
 			rt.appendLog(fmt.Sprintf("warn: vks-native dial %s failed: %v", dest, err))
