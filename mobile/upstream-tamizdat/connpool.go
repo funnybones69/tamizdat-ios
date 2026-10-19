@@ -373,8 +373,19 @@ func (p *connPool) getLiteTransport(ctx context.Context) (*h2Transport, error) {
 					continue
 				}
 			}
+			// Degrade to bulk instead of failing.
+			//
+			// The lite transport exists to keep realtime flows off the bulk
+			// pipe, not to gate them. When it is full (its stream slots are
+			// taken, or the pool is at cap with a bulk transport already
+			// open) the caller still needs its stream: failing here returned
+			// ErrPoolBackpressure straight to the app, which for UDP means
+			// DNS/QUIC/APNs die while TCP keeps working — the "tunnel is up
+			// but the internet is not" failure. Running a realtime flow over
+			// bulk is the documented fallback anyway: strict-single-H2 and
+			// the lite-spawn warm-up window both do exactly that.
 			p.mu.Unlock()
-			return nil, fmt.Errorf("%w: cap=%d", ErrPoolBackpressure, p.maxTransports)
+			return p.getBulkTransport(ctx)
 		}
 
 		p.creating++

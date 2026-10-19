@@ -296,6 +296,21 @@ func StartVKSNativeUpstream(specs, shortIDHex, wakeDNS, wakeZone string, listenP
 		ShortID:       shortID,
 		MinTransports: 1,
 		MaxTransports: 1, // single session over the shared broadcast lane
+		// applyDefaults() otherwise raises MinTransports to 2 for the
+		// security defaults, which drags MaxTransports to 2 with it: the room
+		// then carries two TLS+H2 sessions instead of one, and the pool
+		// reports "MaxTransports cap: cap=2" the moment both are busy. Every
+		// UDP flow (DNS, QUIC, APNs) is classified realtime and needed the
+		// second slot, so it failed outright — 176 times in a few minutes of
+		// a live log, while TCP kept working.
+		//
+		// The room is already the disguise, so the H2-side security defaults
+		// are redundant here; keep the two fragmentation flags to preserve
+		// the existing on-the-wire shape and own the pool sizing explicitly.
+		DisableDefaultSecurity: true,
+		TCPFragmentation:       true,
+		RecordFragmentation:    true,
+		CoverTrafficEnabled:    false,
 		// The native client's Dialer is the ROOM, not the H2 endpoint: an
 		// RTT probe inside it dials 1.1.1.1:80 through the room once a
 		// second, which on Telemost means one CONNECT + one RTP sample per
