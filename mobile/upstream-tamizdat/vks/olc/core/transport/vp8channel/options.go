@@ -13,6 +13,12 @@ const (
 type Options struct {
 	FPS       int
 	BatchSize int
+	// AutoConfirmTargeted lets a client-mode transport bind its data plane
+	// to the first remote epoch that addresses a frame to OUR epoch, instead
+	// of waiting for ConfirmPeer from an encrypted handshake. The native
+	// VKS path needs it: its discovery answer is the first such frame, and
+	// the TLS session that follows authenticates the server end to end.
+	AutoConfirmTargeted bool
 }
 
 // TransportOptions marks Options as belonging to the transport options family.

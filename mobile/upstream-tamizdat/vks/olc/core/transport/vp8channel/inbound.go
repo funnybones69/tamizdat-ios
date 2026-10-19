@@ -48,6 +48,9 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		return
 	}
 
+	if p.autoConfirm && !p.peerConfirmed.Load() && dst != 0 && dst == p.localEpochValue() {
+		_ = p.ConfirmPeer(formatPeerID(src))
+	}
 	p.handleSinglePeerData(src, kcpPayload)
 }
 

@@ -164,7 +164,7 @@ func (w *writerState) batchDatagramSampleFrom(src <-chan []byte, first []byte) [
 				return sample
 			}
 			payload := frame[epochHdrLen:]
-			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+			if len(sample)+2+len(payload) > w.p.maxSampleBytes() {
 				w.pendingDatagram = frame
 				return sample
 			}
@@ -363,7 +363,7 @@ func (p *streamTransport) batchSampleFrom(
 				continue
 			}
 			payload := frame.data[epochHdrLen:]
-			if len(sample)+2+len(payload) > defaultMaxPayloadSize {
+			if len(sample)+2+len(payload) > p.maxSampleBytes() {
 				return sample, frame
 			}
 			sample = appendBatchPacket(sample, payload)
@@ -379,8 +379,8 @@ func (p *streamTransport) prepareBatchBuffer(dst []byte, src <-chan *packetBuffe
 	packetSize := len(first) - epochHdrLen
 	packetCount := min(p.batchSize, len(src)+1)
 	want := epochHdrLen + len(kcpBatchMagic) + packetCount*(2+packetSize)
-	if want > defaultMaxPayloadSize {
-		want = defaultMaxPayloadSize
+	if limit := p.maxSampleBytes(); want > limit {
+		want = limit
 	}
 	if cap(dst) < want {
 		return make([]byte, 0, want)
@@ -397,3 +397,15 @@ func appendBatchPacket(dst, packet []byte) []byte {
 	dst = append(dst, lenBuf[:]...)
 	return append(dst, packet...)
 }
+
+// maxSampleBytes bounds one published sample to a single RTP packet.
+//
+// This is a hard requirement of Telemost's SFU, measured on a live room: the
+// SFU forwards a published frame only when it packetizes into one RTP packet.
+// A sample large enough to need two or more is dropped whole, not thinned -
+// the receiver sees the single-packet frames (keepalives) and nothing else,
+// so a multi-packet message such as a TLS ServerHello never arrives and the
+// tunnel cannot complete a handshake. Batching therefore stops at one KCP
+// segment, which is why kcpMTU is 1000 rather than the 1400 the segment
+// header would allow.
+func (p *streamTransport) maxSampleBytes() int { return maxSampleBytes }

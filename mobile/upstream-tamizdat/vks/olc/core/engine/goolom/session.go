@@ -452,3 +452,22 @@ func (s *Session) drainPublisherRTCP(sender *webrtc.RTPSender) {
 	}
 	go engine.DrainRTCP(sender)
 }
+
+// publishRateLimit is what a Telemost participant may publish, in bytes a
+// second, before the SFU starts dropping what it does not want to forward.
+//
+// Goolom never tells us a number: it drops excess frames silently and the
+// RTCP it sends back (REMB, TWCC) is discarded by DrainRTCP. What it does do
+// is thin a publisher that bursts: measured on a live room (2026-10-19), a
+// writer that emitted whole 60 KB samples back to back had its frames dropped
+// mid-burst, while the same data paced out in small samples went through
+// untouched. Pacing the track is therefore not a politeness here, it is what
+// keeps a TLS flight intact.
+//
+// The value sits well above what the tunnel needs (a probe costs a few KB) and
+// low enough that no single 60 ms writer tick can hand the SFU more than one
+// frame's worth of packets.
+const publishRateLimit = 512 * 1024
+
+// PublishRateLimit implements engine.PublishRateLimited.
+func (s *Session) PublishRateLimit() int { return publishRateLimit }

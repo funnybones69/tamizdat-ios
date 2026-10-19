@@ -34,6 +34,7 @@ import (
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/app/session"
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport"
+	"github.com/funnybones69/tamizdat/vks/olc/core/transport/vp8channel"
 )
 
 const (
@@ -637,7 +638,7 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 	// (odin forwards only H264 SEI media, and only to subscribers; goolom
 	// relays VP8): the session came up, the first frame went out, and the
 	// channel died in the same second.
-	tr, err := transport.New(sessCtx, cfg.transportName(), transport.Config{
+	tcfg := transport.Config{
 		Provider:      cfg.Provider,
 		RoomURL:       cfg.RoomURL,
 		ProviderToken: cfg.ProviderToken,
@@ -647,7 +648,22 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		Options:       cfg.transportOptions(),
 		OnData:        s.onData,
 		OnPeerData:    s.onPeerData,
-	})
+	}
+	if kcpCarrier(cfg.transportName()) {
+		// One KCP state machine per pair. With OnPeerData set the KCP
+		// carriers run in SERVER mode: a broadcast plane for sending plus a
+		// per-peer session that receives the server's frames — two state
+		// machines facing the server's one per-peer session, so ACKs landed
+		// on the plane that did not send the data and the TLS flight never
+		// completed. Client mode keeps a single data plane; the server's
+		// discovery answer (addressed to our epoch) binds it.
+		tcfg.OnPeerData = nil
+		if o, ok := tcfg.Options.(vp8channel.Options); ok {
+			o.AutoConfirmTargeted = true
+			tcfg.Options = o
+		}
+	}
+	tr, err := transport.New(sessCtx, cfg.transportName(), tcfg)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("native: open %s: %w", cfg.transportName(), err)
@@ -816,7 +832,17 @@ func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 				cfg.Provider, cfg.RoomURL, discoveryBudget)
 		case peer := <-serverPeer:
 			sess.everHealthy.Store(true)
-			if peer != "broadcast" {
+			// The KCP carriers (vp8channel/seichannel) must stay on the
+			// broadcast plane the hello went out on. Both native ends run
+			// them in server mode (OnPeerData is set), so the server files
+			// everything from this client under ONE per-peer KCP session; a
+			// latched SendTo switched the client to a second KCP state
+			// machine whose sequence numbers restart at zero, and the server
+			// dropped the whole TLS flight as duplicates (telemost/mts
+			// "TLS handshake: deadline"; see vp8channel
+			// TestNativeLaneMixLoopback). Session tags already keep
+			// concurrent dials apart on the broadcast lane.
+			if peer != "broadcast" && !kcpCarrier(cfg.transportName()) {
 				conn.latchPeer(peer)
 			}
 			log.Printf("[native] dial %s: server peer discovered: %s", cfg.Provider, peer)
@@ -825,6 +851,12 @@ func NativeDial(ctx context.Context, cfg ClientConfig) (net.Conn, error) {
 			_ = sendTo(sess.tr, "", hello)
 		}
 	}
+}
+
+// kcpCarrier reports whether a transport carries the native session over
+// its own KCP planes (as opposed to a reliable datachannel).
+func kcpCarrier(name string) bool {
+	return name == "vp8channel" || name == "seichannel"
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +879,10 @@ type dcListener struct {
 	// this path, so every woken room lived forever — the server-side half
 	// of the prod RSS growth and the room leak).
 	idle time.Duration
+	// pinPeer: the carrier keeps one KCP session per client (KCP
+	// carriers), so the answer and every write of the accepted conn must go
+	// to that client's session via SendTo, never the broadcast plane.
+	pinPeer bool
 }
 
 // nativeListen joins the room as the host and returns a net.Listener whose
@@ -859,6 +895,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		closeCh: make(chan struct{}),
 		addr:    dcAddr("server"),
 		idle:    cfg.IdleTimeout,
+		pinPeer: kcpCarrier(cfg.transportName()),
 	}
 	session.RegisterDefaults() // registers the provider auth flows (jazz/mts/wb/telemost)
 
@@ -873,7 +910,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		OnData: func(data []byte) {
 			// Discovery probe: "TMZD_HELLO" + 4-byte session tag.
 			if len(data) >= 14 && string(data[:10]) == tmzdHello {
-				l.handleHello(data[10:14])
+				l.handleHello("", data[10:14])
 				return
 			}
 			// Post-discovery: session-tagged TLS/tunnel bytes — route by tag.
@@ -881,7 +918,7 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 		},
 		OnPeerData: func(peerID string, data []byte) {
 			if len(data) >= 14 && string(data[:10]) == tmzdHello {
-				l.handleHello(data[10:14])
+				l.handleHello(peerID, data[10:14])
 				return
 			}
 			l.route(data)
@@ -930,16 +967,21 @@ func NativeListen(ctx context.Context, cfg Config) (*dcListener, error) {
 // handleHello answers a client discovery probe: bind a conn to the session
 // tag, answer TMZD_SERVER+tag, and offer the conn to Accept. The tag isolates
 // this session from any retried dial on the shared broadcast lane.
-func (l *dcListener) handleHello(sid []byte) {
+func (l *dcListener) handleHello(peerID string, sid []byte) {
+	if !l.pinPeer {
+		peerID = ""
+	}
 	key := string(sid)
+	answer := append([]byte(tmzdServer), sid...)
 	l.mu.Lock()
 	if _, exists := l.conns[key]; exists {
 		l.mu.Unlock()
-		_ = sendTo(l.tr, "", append([]byte(tmzdServer), sid...)) // re-answer a retry
+		_ = sendTo(l.tr, peerID, answer) // re-answer a retry
 		return
 	}
 	conn := newDcConn(l.tr, dcAddr("server"), dcAddr(key))
 	conn.sid = sid
+	conn.peer = peerID
 	conn.onClose = func() {
 		l.mu.Lock()
 		delete(l.conns, key)
@@ -948,7 +990,7 @@ func (l *dcListener) handleHello(sid []byte) {
 	l.conns[key] = conn
 	l.mu.Unlock()
 
-	_ = sendTo(l.tr, "", append([]byte(tmzdServer), sid...))
+	_ = sendTo(l.tr, peerID, answer)
 	select {
 	case l.accept <- conn:
 	case <-l.closeCh:

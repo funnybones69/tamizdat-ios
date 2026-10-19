@@ -149,10 +149,13 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 
 	s.sendAck(uid)
 
-	if s.onData == nil {
-		if slotErr := s.sendSetSlots(); slotErr != nil {
-			logger.Debugf("setSlots error: %v", slotErr)
-		}
+	// Always ask for slots. This used to run only when no data callback was
+	// installed, so the native tunnel path - which always sets OnData - never
+	// requested a video slot and the SFU never forwarded the peer's track to
+	// it: the tunnel could publish but not subscribe, and every handshake died
+	// waiting for a ServerHello the client was never sent.
+	if slotErr := s.sendSetSlots(); slotErr != nil {
+		logger.Debugf("setSlots error: %v", slotErr)
 	}
 
 	if !sendPub {

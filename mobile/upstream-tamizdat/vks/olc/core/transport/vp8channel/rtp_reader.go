@@ -1,6 +1,8 @@
 package vp8channel
 
 import (
+	"time"
+
 	"github.com/pion/rtp"
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
@@ -14,6 +16,16 @@ import (
 // sequence is treated as genuinely lost and we advance, so a truly dropped
 // packet cannot stall delivery indefinitely.
 const reorderWindow = 256
+
+// reorderHoleWait bounds how long the buffer waits for a missing sequence
+// number before treating it as lost. The packet-count bound above is not
+// enough on its own: Telemost's SFU thins a low-rate track by dropping whole
+// frames WITHOUT renumbering (observed live: seq 1, 6, 10, 15, 22, ... at ~10
+// packets/s), so every hole is permanent and the count bound alone held
+// delivery for ~25 s per hole — discovery took ~25 s and every TLS flight
+// after it missed its deadline. KCP retransmits whatever a skipped hole
+// carried, so waiting longer than a genuine reorder needs only adds latency.
+const reorderHoleWait = 100 * time.Millisecond
 
 // Reordered RTP packets normally carry an MTU-sized payload. Larger buffers
 // are not retained after delivery so one malformed packet cannot pin a large
@@ -47,10 +59,14 @@ type reorderBuffer struct {
 	free    []*rtp.Packet
 	nextSeq uint16
 	started bool
+	// holeSince is when the buffer first held packets behind a missing
+	// nextSeq; zero while there is no hole. now is time.Now (tests stub it).
+	holeSince time.Time
+	now       func() time.Time
 }
 
 func newReorderBuffer() *reorderBuffer {
-	return &reorderBuffer{pkts: make(map[uint16]*rtp.Packet, reorderWindow)}
+	return &reorderBuffer{pkts: make(map[uint16]*rtp.Packet, reorderWindow), now: time.Now}
 }
 
 // push adds pkt and synchronously delivers packets now available in strict
@@ -78,6 +94,30 @@ func (b *reorderBuffer) push(pkt *rtp.Packet, deliver func(*rtp.Packet)) {
 		b.skipToOldest()
 	}
 	b.drain(deliver)
+	if len(b.pkts) == 0 {
+		b.holeSince = time.Time{}
+		return
+	}
+	// A hole remains. Give a genuine reorder reorderHoleWait to fill it,
+	// then treat the missing sequence as lost (see reorderHoleWait).
+	now := time.Now()
+	if b.now != nil {
+		now = b.now()
+	}
+	if b.holeSince.IsZero() {
+		b.holeSince = now
+		return
+	}
+	if now.Sub(b.holeSince) < reorderHoleWait {
+		return
+	}
+	b.skipToOldest()
+	b.drain(deliver)
+	if len(b.pkts) == 0 {
+		b.holeSince = time.Time{}
+	} else {
+		b.holeSince = now
+	}
 }
 
 // drain pops contiguous packets starting at nextSeq.

@@ -53,6 +53,14 @@ import (
 const (
 	defaultMaxPayloadSize = 60 * 1024
 
+	// maxSampleBytes is the cap on one published sample, chosen so the sample
+	// fits in ONE RTP packet - the only shape Telemost's SFU forwards (see
+	// streamTransport.maxSampleBytes). A full KCP segment plus this package's
+	// framing is epochHdrLen+kcpMTU+len(kcpBatchMagic)+2 = 1042 bytes; the cap
+	// leaves room for the RTP header, the VP8 payload descriptor and SRTP
+	// overhead inside a 1200-byte path MTU.
+	maxSampleBytes = 1150
+
 	// publishBurstBytes is what the writer's token bucket holds when the
 	// engine's service polices how fast a participant may publish (see
 	// engine.PublishRateLimited): two full samples, so both a peer pump and
@@ -177,6 +185,8 @@ type streamTransport struct {
 	linkUnhealthy     atomic.Bool
 
 	peerConfirmed atomic.Bool
+	// autoConfirm: see Options.AutoConfirmTargeted.
+	autoConfirm bool
 
 	// shaper applies the optional traffic policy to the bulk data path only;
 	// the control plane must stay unpaced.
@@ -266,6 +276,7 @@ func newStreamTransport(
 		writerDone:       make(chan struct{}),
 		frameInterval:    time.Second / time.Duration(opts.FPS),
 		batchSize:        opts.BatchSize,
+		autoConfirm:      opts.AutoConfirmTargeted,
 		bindingToken:     channelBindingToken(cfg),
 		limiter:          limiter,
 		sendWindow:       kcpSendWindow(limiter != nil),

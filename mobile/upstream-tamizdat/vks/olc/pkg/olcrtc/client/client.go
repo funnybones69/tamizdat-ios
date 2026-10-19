@@ -159,7 +159,7 @@ func toTransportOptions(options TransportOptions) transport.Options {
 	case VideoOptions:
 		return videochannel.Options(value)
 	case VP8Options:
-		return vp8channel.Options(value)
+		return vp8channel.Options{FPS: value.FPS, BatchSize: value.BatchSize}
 	case SEIOptions:
 		return seichannel.Options(value)
 	default:

@@ -20,7 +20,13 @@ const kcpConvID = 0xC0FFEE01
 const (
 	// kcp-go hardcodes mtuLimit=1500, so SetMtu() above this is silently
 	// clamped. Stay below that with headroom for KCP overhead (24 bytes).
-	kcpMTU = 1400
+	//
+	// 1000 rather than 1400 is a hard requirement of the Telemost SFU, not a
+	// preference: see maxSampleBytes. The SFU forwards only the frames that
+	// fit in a single RTP packet; a sample that packetizes into two or more is
+	// dropped whole, so a segment size above the single-packet budget would
+	// make every large message (a TLS ServerHello, say) vanish.
+	kcpMTU = 1000
 
 	// Send/receive window in segments. Bulk data runs on its own KCP session,
 	// isolated from the control plane (ping/pong has a separate startKCP and is
