@@ -74,19 +74,17 @@ func (p *streamTransport) writeSampleLocked(data []byte) bool {
 	if p.sampleWriter != nil {
 		written = p.sampleWriter(data)
 	} else {
-		// RTP time follows the wall clock, not the nominal frame rate: a
-		// track written 12 times a second while idle must not claim 90 fps,
-		// or the SFU sees the stream run ahead of real time and holds it.
-		dur := p.frameInterval
-		now := time.Now()
-		if !p.lastSampleAt.IsZero() {
-			dur = min(max(now.Sub(p.lastSampleAt), time.Millisecond), time.Second)
+		// RTP time follows the wall clock. Pion stamps a sample with the
+		// packetizer's CURRENT timestamp and only then advances it by
+		// Duration, so a Duration on this sample would land on the next one.
+		// Instead the clock is moved first with an empty sample (pion's
+		// Packetize turns an empty payload into SkipSamples: timestamp
+		// advances, no RTP packet, no sequence number consumed), and the
+		// data goes out with Duration 0 at exactly "now".
+		if adv := p.rtpAdvance(time.Now()); adv > 0 {
+			_ = p.track.WriteSample(media.Sample{Duration: rtpTicksDuration(adv)})
 		}
-		p.lastSampleAt = now
-		written = p.track.WriteSample(media.Sample{
-			Data:     data,
-			Duration: dur,
-		}) == nil
+		written = p.track.WriteSample(media.Sample{Data: data}) == nil
 	}
 	if written {
 		p.limiter.Charge(len(data))
@@ -101,6 +99,36 @@ func (p *streamTransport) writeSampleLocked(data []byte) bool {
 		}
 	}
 	return written
+}
+
+// vp8ClockRate is the RTP clock of a VP8 track.
+const vp8ClockRate = 90000
+
+// rtpAdvance returns how many RTP ticks to advance the track clock before a
+// sample written at now, so that sample is stamped with the wall-clock time
+// since the first one. It never returns 0 after the first sample: two
+// distinct frames must not share a timestamp, or the SFU would merge them
+// into one frame. The tick count is tracked as an integer from a fixed
+// origin, so per-sample rounding does not accumulate into drift. Caller
+// holds writeMu.
+func (p *streamTransport) rtpAdvance(now time.Time) uint64 {
+	if p.rtpOrigin.IsZero() {
+		p.rtpOrigin = now
+		return 0
+	}
+	target := uint64(now.Sub(p.rtpOrigin).Seconds() * vp8ClockRate)
+	adv := uint64(1)
+	if target > p.rtpTicks {
+		adv = target - p.rtpTicks
+	}
+	p.rtpTicks += adv
+	return adv
+}
+
+// rtpTicksDuration converts RTP ticks to the Duration pion turns back into
+// ticks (pion carries the fractional remainder between samples).
+func rtpTicksDuration(ticks uint64) time.Duration {
+	return time.Duration(float64(ticks) / vp8ClockRate * float64(time.Second))
 }
 
 // readyToSend reports whether the bucket has room for a bulk frame of this

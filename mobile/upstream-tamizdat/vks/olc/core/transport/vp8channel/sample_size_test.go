@@ -85,3 +85,33 @@ func TestDataSamplesAreInterframes(t *testing.T) {
 		t.Fatal("interframe tag broke the epoch header")
 	}
 }
+
+// TestRTPAdvanceFollowsWallClock pins the RTP clock to wall time: the first
+// sample sets the origin, each later sample is stamped with the elapsed time
+// since it (no per-sample lag, no rounding drift), and samples written in
+// the same instant still get distinct timestamps.
+func TestRTPAdvanceFollowsWallClock(t *testing.T) {
+	p := &streamTransport{}
+	t0 := time.Unix(1_000_000, 0)
+	if adv := p.rtpAdvance(t0); adv != 0 {
+		t.Fatalf("first sample advanced %d ticks, want 0", adv)
+	}
+	var total uint64
+	for _, step := range []struct {
+		at   time.Duration
+		want uint64 // cumulative ticks since t0
+	}{
+		{100 * time.Millisecond, 9000},
+		{101 * time.Millisecond, 9090},
+		{101 * time.Millisecond, 9091}, // same instant: still +1 tick
+		{3 * time.Second, 270000},      // long idle gap is kept, not clamped
+	} {
+		total += p.rtpAdvance(t0.Add(step.at))
+		if total != step.want {
+			t.Fatalf("at %v: clock at %d ticks, want %d", step.at, total, step.want)
+		}
+	}
+	if d := rtpTicksDuration(9000); d != 100*time.Millisecond {
+		t.Fatalf("rtpTicksDuration(9000) = %v, want 100ms", d)
+	}
+}

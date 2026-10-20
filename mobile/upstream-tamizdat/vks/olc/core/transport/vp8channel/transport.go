@@ -202,8 +202,10 @@ type streamTransport struct {
 	txLast    time.Time
 	txSamples int
 	txBytes   int
-	// lastSampleAt is the previous WriteSample time (guarded by writeMu).
-	lastSampleAt time.Time
+	// rtpOrigin and rtpTicks map the wall clock onto the track's RTP clock
+	// (see rtpAdvance; guarded by writeMu).
+	rtpOrigin time.Time
+	rtpTicks  uint64
 
 	// shaper applies the optional traffic policy to the bulk data path only;
 	// the control plane must stay unpaced.
