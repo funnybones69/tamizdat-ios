@@ -12,6 +12,11 @@ type Options struct {
 	BatchSize    int
 	FragmentSize int
 	AckTimeoutMS int
+	// AutoConfirmTargeted makes a client bind only to the first remote frame
+	// addressed to its own epoch. Broadcast frames are ignored until then;
+	// this prevents another MTS participant's broadcast from becoming the
+	// client's KCP peer before the server's discovery answer arrives.
+	AutoConfirmTargeted bool
 }
 
 // TransportOptions marks Options as belonging to the transport options family.

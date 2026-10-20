@@ -166,7 +166,7 @@ func toTransportOptions(options TransportOptions) transport.Options {
 	case VP8Options:
 		return vp8channel.Options{FPS: value.FPS, BatchSize: value.BatchSize}
 	case SEIOptions:
-		return seichannel.Options(value)
+		return seichannel.Options{FPS: value.FPS, BatchSize: value.BatchSize, FragmentSize: value.FragmentSize, AckTimeoutMS: value.AckTimeoutMS}
 	default:
 		return nil
 	}

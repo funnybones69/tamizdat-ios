@@ -113,5 +113,15 @@ CGO_ENABLED=0 GOOS=ios   GOARCH=arm64 go build ./socksstub ./samizdat
   провайдеров.
 - **Rewire**: смена сети (Wi-Fi↔сотовая) лестницу не перезапускает — полагается
   на внутренний reconnect; проверить отдельным тестом.
-- **5-секундный дедлайн чейн-диала**: флапающая комната больше не съедает
-  15 с из бюджета потока (быстрый фолбэк на samizdat).
+- **Cold-start budget:** первый native-flow MTS/Telemost получает до 60 с на
+  подписку SFU и TLS; после прогрева тёплые потоки быстрые. Старое описание
+  «5 секунд» относилось к прежней цепочке и больше не действует.
+
+## Native MTS/Telemost verification (2026-10-21)
+
+The provider-specific native KCP fixes are mirrored from the server tree. The
+real `socksstub` harness was verified on isolated rooms: MTS returned TCP/UDP
+`1/1`, and a newly created Telemost room returned TCP/UDP `1/1`. The first
+Telemost flow took about 20 seconds while the room subscribed to its remote
+VP8 track; warm flows remain fast. The TCP and UDP cold-flow budgets in
+`socksstub` are therefore 60 seconds, rather than 20 seconds.

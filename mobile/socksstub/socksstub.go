@@ -1057,10 +1057,10 @@ func readSocksAddr(r io.Reader, atyp byte) (string, uint16, error) {
 func handleConnect(ctx context.Context, client net.Conn, idx uint64, dest string) {
 	flowLogf("info: conn#%d dial → %s", idx, dest)
 	dialStart := time.Now()
-	// IPA-K: 10s was too tight for first-flow on Russian cellular where
-	// TLS handshake gets delayed by DPI. 20s lets cold-cache transport
-	// setup complete; warm transports return ~20ms anyway.
-	dialCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	// Native Telemost/MTS may need ~30s to subscribe to the first remote
+	// media track before discovery can answer. Warm sessions remain fast;
+	// this budget only protects the cold first flow.
+	dialCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	upstream, err := dialUpstream(dialCtx, dest)
 	cancel()
 	if err != nil {
@@ -1166,7 +1166,6 @@ func dialWhitelistVKS(ctx context.Context, dest string) (net.Conn, error) {
 	return nil, errors.New("vks carrier unavailable — H2 fallback refused (whitelist mode)")
 }
 
-
 // dialMainH2 is the Main-endpoint path: the samizdat H2 tunnel, else direct.
 func dialMainH2(ctx context.Context, dest string) (net.Conn, error) {
 	rt.mu.Lock()
@@ -1209,7 +1208,6 @@ func dialWhitelistVKSUDP(ctx context.Context, dest string) (net.PacketConn, erro
 	return nil, errors.New("vks udp carrier unavailable — H2 fallback refused (whitelist mode)")
 }
 
-
 // dialMainUDP is the Main-endpoint lane: samizdat UDP-over-H2, else a direct
 // UDP socket.
 func dialMainUDP(ctx context.Context, dest string) (net.PacketConn, error) {
@@ -1228,7 +1226,6 @@ func dialMainUDP(ctx context.Context, dest string) (net.PacketConn, error) {
 	// ReadFrom returns dest as Addr).
 	return newConnectedUDPAdapter(c.(*net.UDPConn), dest), nil
 }
-
 
 // connectedUDPAdapter wraps a "connected" *net.UDPConn so it satisfies
 // net.PacketConn with the connected peer as the constant remote addr.
@@ -1470,11 +1467,9 @@ func handleFwdUDP(ctx context.Context, client net.Conn, idx uint64) {
 				}
 			}
 			pcMu.Unlock()
-			// Dial outside the lock — TCP+uTLS+H2 setup is slow.
-			// IPA-K: 5s was too tight for slow cellular. 20s gives the
-			// underlying samizdat.DialUDP enough headroom for cold-cache
-			// transport setup (TCP dial + uTLS handshake + H2 settings).
-			dialCtx, dialCancel := context.WithTimeout(subCtx, 20*time.Second)
+			// Native MTS/Telemost media discovery can take tens of seconds on
+			// a cold room; the warm path remains immediate.
+			dialCtx, dialCancel := context.WithTimeout(subCtx, 60*time.Second)
 			pc, derr := dialUpstreamUDP(dialCtx, net.JoinHostPort(host, strconv.Itoa(int(port))))
 			dialCancel()
 			if derr != nil {

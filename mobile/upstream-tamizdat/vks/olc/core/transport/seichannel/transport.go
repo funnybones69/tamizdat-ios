@@ -72,9 +72,11 @@ type streamTransport struct {
 	// which side of the link this is: the multi-peer (server) side keeps one
 	// session per remote epoch; the single-peer (client) side latches onto
 	// exactly one. Routing decisions read this flag instead of re-deriving
-	// the mode from a callback being nil.
 	onPeerData func(peerID string, data []byte)
 	serverMode bool
+	// autoConfirmTargeted prevents a client from binding to an unrelated
+	// participant's broadcast before the server's targeted discovery answer.
+	autoConfirmTargeted bool
 
 	data       *kcpPlane
 	localEpoch atomic.Uint32
@@ -93,8 +95,8 @@ type streamTransport struct {
 	// Tests inject a writer here to observe the exact byte stream that
 	// reaches the track and to run without a pion track. It must consume
 	// data before returning. Always invoked under writeMu.
-	sampleWriter func([]byte) bool
-	writeMu      sync.Mutex
+	sampleWriter    func([]byte) bool
+	writeMu         sync.Mutex
 	closeCh         chan struct{}
 	writerDone      chan struct{}
 	closed          atomic.Bool
@@ -172,17 +174,18 @@ func newStreamTransport(
 ) *streamTransport {
 	closeCh := make(chan struct{})
 	tr := &streamTransport{
-		Lifecycle:     common.NewLifecycle(stream),
-		stream:        stream,
-		track:         track,
-		onData:        cfg.OnData,
-		onPeerData:    cfg.OnPeerData,
-		serverMode:    cfg.OnPeerData != nil,
-		closeCh:       closeCh,
-		writerDone:    make(chan struct{}),
-		frameInterval: time.Second / time.Duration(opts.FPS),
-		batchSize:     opts.BatchSize,
-		bindingToken:  common.BindingToken(cfg.ChannelID, cfg.RoomURL),
+		Lifecycle:           common.NewLifecycle(stream),
+		stream:              stream,
+		track:               track,
+		onData:              cfg.OnData,
+		onPeerData:          cfg.OnPeerData,
+		serverMode:          cfg.OnPeerData != nil,
+		autoConfirmTargeted: opts.AutoConfirmTargeted,
+		closeCh:             closeCh,
+		writerDone:          make(chan struct{}),
+		frameInterval:       time.Second / time.Duration(opts.FPS),
+		batchSize:           opts.BatchSize,
+		bindingToken:        common.BindingToken(cfg.ChannelID, cfg.RoomURL),
 	}
 	tr.localEpoch.Store(randomEpoch())
 	tr.data = newKCPPlane(outboundQueueSize, tr.onData)
@@ -571,12 +574,13 @@ func (p *streamTransport) handleIncomingPayload(payload []byte) {
 		// Server mode: every sender epoch is its own client. Route the
 		// KCP payload to that peer's plane - created on demand - and
 		// never mix packets from different epochs into one KCP state
-		// machine (their sequence spaces are unrelated). The dst filter
-		// above already dropped frames addressed to other participants.
+		// machine.
 		p.handlePeerFrame(src, payload[epochHdrLen:])
 		return
 	}
-
+	if p.autoConfirmTargeted && p.peerEpoch.Load() == 0 && dst != p.localEpoch.Load() {
+		return
+	}
 	if !p.acceptPeerEpoch(src, dst) {
 		return
 	}

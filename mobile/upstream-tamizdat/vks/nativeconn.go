@@ -34,6 +34,7 @@ import (
 
 	"github.com/funnybones69/tamizdat/vks/olc/core/app/session"
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport"
+	"github.com/funnybones69/tamizdat/vks/olc/core/transport/seichannel"
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport/vp8channel"
 )
 
@@ -650,18 +651,15 @@ func joinDcSession(ctx context.Context, cfg ClientConfig) (*dcSession, error) {
 		OnPeerData:    s.onPeerData,
 	}
 	if autoConfirmCarrier(cfg.transportName()) {
-		// One KCP state machine per pair. With OnPeerData set the KCP
-		// carriers run in SERVER mode: a broadcast plane for sending plus a
-		// per-peer session that receives the server's frames — two state
-		// machines facing the server's one per-peer session, so ACKs landed
-		// on the plane that did not send the data and the TLS flight never
-		// completed. Client mode keeps a single data plane; the server's
-		// discovery answer (addressed to our epoch) binds it.
-		//
-		// Only VP8 has the targeted-confirm rule this depends on; see
-		// autoConfirmCarrier.
+		// KCP carriers use one client-side data plane. The first server
+		// discovery answer is targeted at this client's epoch and binds the
+		// peer; broadcasts from another MTS participant must not bind first.
 		tcfg.OnPeerData = nil
-		if o, ok := tcfg.Options.(vp8channel.Options); ok {
+		switch o := tcfg.Options.(type) {
+		case vp8channel.Options:
+			o.AutoConfirmTargeted = true
+			tcfg.Options = o
+		case seichannel.Options:
 			o.AutoConfirmTargeted = true
 			tcfg.Options = o
 		}
@@ -863,17 +861,10 @@ func kcpCarrier(name string) bool {
 }
 
 // autoConfirmCarrier reports whether this carrier may run in client mode with
-// targeted peer confirmation.
-//
-// Only VP8 has it. seichannel's first-frame bind accepts ANY sender,
-// broadcast included (seichannel/transport.go), so a second client starting at
-// the same time could become the peer; the real server's later targeted answer
-// then relatches KCP WITHOUT rotating the local epoch, while the server keeps
-// the state machine it already built for that epoch. The two sides desync and
-// discovery/TLS hangs. Until SEI gets the same targeted-confirm rule as VP8,
-// it must keep running the way it did.
+// targeted peer confirmation. Both KCP media carriers need one client-side
+// data plane; Jazz's reliable datachannel remains unchanged.
 func autoConfirmCarrier(name string) bool {
-	return name == "vp8channel"
+	return name == "vp8channel" || name == "seichannel"
 }
 
 // ---------------------------------------------------------------------------
