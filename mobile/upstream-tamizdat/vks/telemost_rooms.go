@@ -52,10 +52,8 @@ func mtsLoginHeaders(cookieHeader string) map[string]string {
 	}
 }
 
-// mtsGetLoginData performs POST AccountUcaas.GetLoginData with body {} and
-// the browser headers, returning the response's Set-Cookie values. A 200
-// whose Set-Cookie set lacks BOTH the `access` and `refresh` cookies is
-// treated as a dead session (the live endpoint rotates both).
+// mtsGetLoginData validates the account session and returns any Set-Cookie
+// updates. A live session may return LoginData without rotating either cookie.
 func mtsGetLoginData(ctx context.Context, cookieHeader string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, mtsGetLoginDataURL, strings.NewReader("{}"))
 	if err != nil {
@@ -71,7 +69,10 @@ func mtsGetLoginData(ctx context.Context, cookieHeader string) ([]string, error)
 		return nil, err
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if readErr != nil {
+		return nil, fmt.Errorf("GetLoginData: read response: %w", readErr)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GetLoginData: status %d", resp.StatusCode)
 	}
@@ -87,7 +88,15 @@ func mtsGetLoginData(ctx context.Context, cookieHeader string) ([]string, error)
 		}
 	}
 	if !gotAccess || !gotRefresh {
-		return nil, fmt.Errorf("GetLoginData: 200 without access/refresh rotation (access=%v refresh=%v)", gotAccess, gotRefresh)
+		var login struct {
+			Type string `json:"type"`
+			Value struct {
+				UserID string `json:"userId"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal(body, &login); err != nil || login.Type != "LoginData" || login.Value.UserID == "" {
+			return nil, fmt.Errorf("GetLoginData: 200 without authenticated LoginData or access/refresh rotation")
+		}
 	}
 	return resp.Header.Values("Set-Cookie"), nil
 }
@@ -101,17 +110,12 @@ func telemostUIDFromCookie(cookieHeader string) (string, bool) {
 		if !ok || k != "Session_id" {
 			continue
 		}
-		// session format: <hex>.<uid>.<timestamp>|<uid>
-		if idx := strings.LastIndex(v, "|"); idx >= 0 {
-			digits := v[idx+1:]
-			if isDigits(digits) && digits != "" {
+		// Current sessions have |<uid>.<signed suffix>; older exports
+		// ended at |<uid>. Numeric fields before the pipe are not a UID.
+		if idx := strings.Index(v, "|"); idx >= 0 {
+			digits, _, _ := strings.Cut(v[idx+1:], ".")
+			if isDigits(digits) {
 				return digits, true
-			}
-		}
-		// Fallback: the first all-digit segment between separators.
-		for _, seg := range strings.FieldsFunc(v, func(r rune) bool { return r == '.' || r == '|' }) {
-			if isDigits(seg) && seg != "" {
-				return seg, true
 			}
 		}
 	}
