@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/anarki/samizdat-ios/mobile/socksstub"
@@ -40,6 +41,9 @@ func main() {
 		hold      = flag.Duration("hold", 0, "after the probes, hold ONE tcp conn idle for this long, then use it")
 		holdPing  = flag.Duration("hold-ping", 0, "during -hold, write one byte this often (0 = stay silent)")
 		holdDest  = flag.String("hold-dest", "1.1.1.1:80", "destination for the -hold connection")
+		dl        = flag.String("dl", "", "after the probes, download over plain HTTP: host[:port]/path")
+		dlBytes   = flag.Int64("dl-bytes", 2<<20, "stop each download after this many body bytes")
+		dlPar     = flag.Int("dl-par", 1, "parallel downloads (a page load opens many conns)")
 	)
 	flag.Parse()
 
@@ -102,6 +106,10 @@ func main() {
 		if err != nil {
 			os.Exit(1)
 		}
+	}
+
+	if *dl != "" {
+		runDownloads(proxy, *dl, *dlBytes, *dlPar, *timeout)
 	}
 
 	fmt.Printf("RESULT tcp ok=%d/%d  udp ok=%d/%d\n", okTCP, *n, okUDP, *n)
@@ -354,4 +362,81 @@ func holdConn(proxy, dest string, d, ping, timeout time.Duration) error {
 		return fmt.Errorf("no response after %s idle: %w", d, err)
 	}
 	return nil
+}
+
+// runDownloads measures real throughput through socksstub: par parallel
+// HTTP GETs, each read until maxBytes of body or EOF. The probes above only
+// read 32 bytes, which says nothing about whether a page can load.
+func runDownloads(proxy, target string, maxBytes int64, par int, timeout time.Duration) {
+	hostPort, path, _ := strings.Cut(target, "/")
+	path = "/" + path
+	if !strings.Contains(hostPort, ":") {
+		hostPort += ":80"
+	}
+	type res struct {
+		n   int64
+		ttf time.Duration
+		err error
+	}
+	out := make(chan res, par)
+	start := time.Now()
+	for i := 0; i < par; i++ {
+		go func() {
+			n, ttf, err := download(proxy, hostPort, path, maxBytes, 4*timeout)
+			out <- res{n, ttf, err}
+		}()
+	}
+	var total int64
+	for i := 0; i < par; i++ {
+		r := <-out
+		total += r.n
+		st := "ok"
+		if r.err != nil {
+			st = "FAIL " + r.err.Error()
+		}
+		fmt.Printf("dl %d: %8d bytes  first-byte %6dms  %s\n", i, r.n, r.ttf.Milliseconds(), st)
+	}
+	el := time.Since(start)
+	fmt.Printf("DL total %d bytes in %.1fs = %.1f KB/s (par=%d)\n", total, el.Seconds(), float64(total)/1024/el.Seconds(), par)
+}
+
+func download(proxy, hostPort, path string, maxBytes int64, timeout time.Duration) (int64, time.Duration, error) {
+	start := time.Now()
+	c, err := net.DialTimeout("tcp", proxy, timeout)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(timeout))
+	if err := socksHandshake(c); err != nil {
+		return 0, 0, err
+	}
+	host, portStr, _ := net.SplitHostPort(hostPort)
+	port, err := net.LookupPort("tcp", portStr)
+	if err != nil {
+		return 0, 0, err
+	}
+	if err := socksRequest(c, 0x01, host, uint16(port)); err != nil {
+		return 0, 0, err
+	}
+	if _, err := fmt.Fprintf(c, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: curl/8\r\nConnection: close\r\n\r\n", path, host); err != nil {
+		return 0, 0, err
+	}
+	buf := make([]byte, 32<<10)
+	var n int64
+	var ttf time.Duration
+	for n < maxBytes {
+		k, err := c.Read(buf)
+		if k > 0 && ttf == 0 {
+			ttf = time.Since(start)
+		}
+		n += int64(k)
+		if err == io.EOF {
+			return n, ttf, nil
+		}
+		if err != nil {
+			return n, ttf, err
+		}
+	}
+	return n, ttf, nil
 }

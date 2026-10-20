@@ -39,6 +39,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,20 +52,28 @@ import (
 	"github.com/funnybones69/tamizdat/vks/olc/core/transport/common"
 )
 
+// forceKeepalivePeriod is how often a bare, fully decodable VP8 keyframe is
+// injected even while bulk data flows. Data samples are interframes, so this
+// keyframe is what lets the SFU (and its PLI recovery) resynchronise; 500 ms
+// measured best on Telemost. VKS_VP8_KEYMS overrides it (tuning knob).
+var forceKeepalivePeriod = func() time.Duration {
+	if n, err := strconv.Atoi(os.Getenv("VKS_VP8_KEYMS")); err == nil && n > 0 {
+		return time.Duration(n) * time.Millisecond
+	}
+	return 500 * time.Millisecond
+}()
+
 const (
 	defaultMaxPayloadSize = 60 * 1024
 
-	// maxSampleBytes is the cap on one published sample, chosen so the sample
-	// fits in ONE RTP packet - the only shape Telemost's SFU forwards (see
-	// streamTransport.maxSampleBytes). One full KCP segment plus this
-	// package's framing is 1046 bytes: epochHdrLen 36 + batch magic 4 +
-	// length prefix 2 + KCP segment 1000 (24 header + 976 payload) + packet
-	// CRC 4. Pion's RTP MTU is 1200, minus a 12-byte RTP header and at most 4
-	// bytes of VP8 payload descriptor, so a sample must stay under 1184 to
-	// be a single RTP packet; 1150 leaves headroom and still cannot hold two
-	// segments (2052). Note this bounds the RTP packet, not the IP path MTU:
-	// with SRTP and IPv4/UDP the datagram reaches ~1210 bytes.
-	maxSampleBytes = 1150
+	// maxSampleBytes caps one published sample at four RTP packets. Telemost's
+	// SFU forwards multi-packet interframes (see writeSampleLocked) but drops
+	// frames of five or more packets; four measured stable. Pion packetizes
+	// at most 1184 bytes of VP8 payload per RTP packet (1200 MTU - 12 RTP
+	// header - 4 VP8 descriptor), and one KCP segment plus framing is 1046
+	// bytes (epochHdrLen 36 + batch magic 4 + length prefix 2 + segment 1000
+	// + CRC 4), so 4600 holds four segments in four packets.
+	maxSampleBytes = 4600
 
 	// publishBurstBytes is what the writer's token bucket holds when the
 	// engine's service polices how fast a participant may publish (see
@@ -87,10 +97,6 @@ const (
 	inboundQueueSize         = 4096
 	canSendHighWatermark     = 90 // percent
 	keepaliveIdlePeriod      = 100 * time.Millisecond
-	// forceKeepalivePeriod is how often a bare, fully decodable VP8 keyframe
-	// is injected even while bulk data flows, so the SFU decoder never times
-	// out and stops forwarding the track.
-	forceKeepalivePeriod = 2 * time.Second
 	// defaultPeerRestartGrace is how long the latched peer must be silent
 	// before a frame from a different epoch is read as a server restart. The
 	// server emits a decodable keepalive every ~2s, so a few missed beats is
@@ -191,6 +197,13 @@ type streamTransport struct {
 	peerConfirmed atomic.Bool
 	// autoConfirm: see Options.AutoConfirmTargeted.
 	autoConfirm bool
+
+	// tx counters for VKS_RX_LOG (guarded by writeMu).
+	txLast    time.Time
+	txSamples int
+	txBytes   int
+	// lastSampleAt is the previous WriteSample time (guarded by writeMu).
+	lastSampleAt time.Time
 
 	// shaper applies the optional traffic policy to the bulk data path only;
 	// the control plane must stay unpaced.

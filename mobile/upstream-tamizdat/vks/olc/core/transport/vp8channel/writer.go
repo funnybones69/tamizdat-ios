@@ -2,6 +2,9 @@ package vp8channel
 
 import (
 	"encoding/binary"
+	"github.com/funnybones69/tamizdat/vks/olc/core/logger"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -52,7 +55,16 @@ func (w *writerState) writeSample(data []byte) bool {
 // sample's packetize+send atomic and keeps sequence numbers monotonic. Pion's
 // VP8 payloader copies sample.Data into RTP payloads during Packetize, before
 // WriteSample returns, so the writer can release its packet buffer afterward.
+//
+// Data samples are flagged as VP8 interframes (frame-tag bit 0 set); only
+// the bare keepalive keeps the keyframe tag. Telemost's SFU drops a stream
+// made of multi-packet keyframes but forwards multi-packet interframes, so
+// this is what lets a sample span several RTP packets. Receivers ignore the
+// bit (parseEpochHeader checks the CRC only), so old peers interoperate.
 func (p *streamTransport) writeSampleLocked(data []byte) bool {
+	if len(data) > epochHdrLen {
+		data[0] |= 0x01
+	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 	// Every sample this transport publishes passes here, so this is where
@@ -62,13 +74,31 @@ func (p *streamTransport) writeSampleLocked(data []byte) bool {
 	if p.sampleWriter != nil {
 		written = p.sampleWriter(data)
 	} else {
+		// RTP time follows the wall clock, not the nominal frame rate: a
+		// track written 12 times a second while idle must not claim 90 fps,
+		// or the SFU sees the stream run ahead of real time and holds it.
+		dur := p.frameInterval
+		now := time.Now()
+		if !p.lastSampleAt.IsZero() {
+			dur = min(max(now.Sub(p.lastSampleAt), time.Millisecond), time.Second)
+		}
+		p.lastSampleAt = now
 		written = p.track.WriteSample(media.Sample{
 			Data:     data,
-			Duration: p.frameInterval,
+			Duration: dur,
 		}) == nil
 	}
 	if written {
 		p.limiter.Charge(len(data))
+		if rxLog {
+			p.txSamples++
+			p.txBytes += len(data)
+			if now := time.Now(); now.Sub(p.txLast) >= 2*time.Second {
+				logger.Infof("vp8channel tx: +%d samples, +%d bytes in %s",
+					p.txSamples, p.txBytes, now.Sub(p.txLast).Round(100*time.Millisecond))
+				p.txLast, p.txSamples, p.txBytes = now, 0, 0
+			}
+		}
 	}
 	return written
 }
@@ -398,14 +428,19 @@ func appendBatchPacket(dst, packet []byte) []byte {
 	return append(dst, packet...)
 }
 
-// maxSampleBytes bounds one published sample to a single RTP packet.
+// maxSampleBytes bounds one published sample to four RTP packets.
 //
-// This is a hard requirement of Telemost's SFU, measured on a live room: the
-// SFU forwards a published frame only when it packetizes into one RTP packet.
-// A sample large enough to need two or more is dropped whole, not thinned -
-// the receiver sees the single-packet frames (keepalives) and nothing else,
-// so a multi-packet message such as a TLS ServerHello never arrives and the
-// tunnel cannot complete a handshake. Batching therefore stops at one KCP
-// segment, which is why kcpMTU is 1000 rather than the 1400 the segment
-// header would allow.
-func (p *streamTransport) maxSampleBytes() int { return maxSampleBytes }
+// Measured on a live Telemost room (October 2026): the SFU drops a stream of
+// multi-packet KEYFRAMES whole, forwards multi-packet INTERFRAMES (the tag
+// writeSampleLocked sets) up to four packets, and drops five or more. Each
+// segment stays at kcpMTU 1000 so four of them fit the cap with framing.
+func (p *streamTransport) maxSampleBytes() int { return sampleCap }
+
+// sampleCap is maxSampleBytes unless VKS_VP8_SAMPLE overrides it (tuning
+// knob for live measurements).
+var sampleCap = func() int {
+	if n, err := strconv.Atoi(os.Getenv("VKS_VP8_SAMPLE")); err == nil && n > 0 {
+		return min(n, defaultMaxPayloadSize)
+	}
+	return maxSampleBytes
+}()

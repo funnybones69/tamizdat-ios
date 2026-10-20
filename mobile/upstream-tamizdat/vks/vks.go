@@ -87,7 +87,15 @@ func (c Config) transportName() string {
 func (c Config) transportOptions() transport.Options {
 	switch c.transportName() {
 	case "vp8channel":
-		return vp8channel.Options{FPS: 30, BatchSize: 64}
+		// 90 fps x four-packet samples is the measured Telemost optimum
+		// (~1.1-1.7 Mbit/s); the SFU caps each video track near 1-2 Mbit/s,
+		// so more fps or bigger samples only adds drops. VKS_VP8_FPS
+		// overrides it (tuning knob).
+		opts := vp8channel.Options{FPS: 90, BatchSize: 64}
+		if n, ok := envInt("VKS_VP8_FPS"); ok {
+			opts.FPS = n
+		}
+		return opts
 	case "seichannel":
 		opts := seichannel.Options{FPS: 30, BatchSize: 64}
 		if n, ok := envInt("VKS_SEI_FPS"); ok {

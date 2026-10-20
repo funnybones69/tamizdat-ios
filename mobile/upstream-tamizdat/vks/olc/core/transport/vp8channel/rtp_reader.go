@@ -1,6 +1,7 @@
 package vp8channel
 
 import (
+	"os"
 	"time"
 
 	"github.com/pion/rtp"
@@ -25,6 +26,9 @@ const reorderWindow = 256
 // delivery for ~25 s per hole — discovery took ~25 s and every TLS flight
 // after it missed its deadline. KCP retransmits whatever a skipped hole
 // carried, so waiting longer than a genuine reorder needs only adds latency.
+// rxLog prints receive counters every 2 s (VKS_RX_LOG; live experiments only).
+var rxLog = os.Getenv("VKS_RX_LOG") != ""
+
 const reorderHoleWait = 100 * time.Millisecond
 
 // Reordered RTP packets normally carry an MTU-sized payload. Larger buffers
@@ -274,6 +278,8 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	reorder := newReorderBuffer()
 	buf := make([]byte, rtpBufSize)
 	var rtpCount, frameCount int
+	rxLast := time.Now()
+	var rxRTP, rxFrames int
 
 	for {
 		n, _, err := track.Read(buf)
@@ -287,6 +293,14 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 		pkt := &rtp.Packet{}
 		if pkt.Unmarshal(buf[:n]) != nil {
 			continue
+		}
+		if rxLog {
+			if now := time.Now(); now.Sub(rxLast) >= 2*time.Second {
+				logger.Infof("vp8channel rx: rtp=%d frames=%d seq=%d (+%d rtp, +%d frames in %s)",
+					rtpCount, frameCount, pkt.SequenceNumber, rtpCount-rxRTP, frameCount-rxFrames,
+					now.Sub(rxLast).Round(100*time.Millisecond))
+				rxLast, rxRTP, rxFrames = now, rtpCount, frameCount
+			}
 		}
 
 		// Restore sequence order before assembly so SFU reordering is not

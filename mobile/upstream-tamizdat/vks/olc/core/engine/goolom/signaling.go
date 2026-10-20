@@ -2,8 +2,10 @@ package goolom
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -128,6 +130,16 @@ func (s *Session) handleSignalingResponses(msg map[string]any, uid string) {
 }
 
 func (s *Session) handleCommonMessages(msg map[string]any, uid string) {
+	if os.Getenv("VKS_SIG_LOG") != "" {
+		for k, v := range msg {
+			if k == keyUID || k == "ping" || k == "pong" || k == "ack" || k == "vadActivity" {
+				continue
+			}
+			if b, err := json.Marshal(v); err == nil {
+				logger.Infof("goolom sig %s: %.1500s", k, b)
+			}
+		}
+	}
 	if _, ok := msg["updateDescription"]; ok {
 		s.sendAck(uid)
 	}
